@@ -2,9 +2,15 @@
 
 > **Let AI persist in its own way.**
 
-Moonbite is a persistent runtime for long-running agents. It gives agents
-durable memory, daily working state, host-triggered autonomous activities,
-heartbeat decisions, runtime controls, and auditable effects.
+**Moonbite helps AI agents stay coherent over time.**
+
+It gives long-running agents memory across sessions, short-lived working state,
+bounded autonomy, and a way to decide when to act—or stay quiet. Moonbite also
+records verified external actions instead of treating a model's claim as proof
+that something happened.
+
+Moonbite runs alongside the host agent rather than replacing it. The host still
+owns models, tools, credentials, scheduling, and delivery.
 
 Moonbite is an experimental project. Its first priority is to communicate a
 design philosophy and explore how that philosophy might work in practice.
@@ -20,19 +26,19 @@ design philosophy and explore how that philosophy might work in practice.
 
 Supported in this preview:
 
-- Hermes Agent as the only supported host adapter
+- Hermes Agent as the only supported host
 - Source installation pinned to an immutable commit SHA
 - Linux, WSL2 on a native Linux filesystem, and macOS
-- Runtime Core, Heartbeat, Autonomy, Daily RAM / Panel, Memory / Diary,
-  controls, effects, and audit
-- Host-owned scheduling, model routes, credentials, network acquisition,
-  gateways, and delivery
+- Runtime Core, Heartbeat, Autonomy, Panel / Daily RAM, Memory / Diary,
+  controls, verified external actions, and audit records
+- Host-owned model routing, credentials, scheduling, network access, gateway
+  execution, and delivery
 
 Not provided in this preview:
 
 - PyPI or other package distribution
 - A stable public Python API guarantee
-- Support for non-Hermes harnesses
+- Support for non-Hermes agent hosts or frameworks
 - Production support or long-term compatibility guarantees
 - An internal scheduler, credential store, network browser, or messaging channel
 
@@ -41,57 +47,71 @@ Hermes and pin an immutable commit SHA.
 
 ## Why long-running agents need Moonbite
 
-Most agent systems optimize for one prompt or one session. An agent that remains
-responsible for a relationship, a system, or a queue needs to carry state
-forward, decide when to act or remain quiet, and preserve evidence across
-sessions and days.
+Most agent systems answer one prompt or work within one session. A long-running
+agent might support a person over time, watch a system, or follow an ongoing
+queue. To do that well, it needs to remember what happened before, keep track
+of what matters now, decide whether something deserves action, and verify that
+requested actions really occurred.
 
-Moonbite adds that time dimension without replacing the host agent. It keeps
-persistence semantics and decision gates explicit, while the host retains
-control of models, tools, credentials, scheduling, and delivery.
+Moonbite provides those continuity mechanisms without becoming the agent or
+the host. The main agent remains responsible for interpretation and final
+decisions. The host remains responsible for execution and delivery.
 
 ## How Moonbite works
 
-```mermaid
-flowchart TD
-    A[Hermes hooks / host events / scheduled ticks] --> B[Moonbite Runtime Core]
-    B --> C[Events / Daily RAM / Memory / Diary]
-    C --> D[Autonomy / Heartbeat]
-    D --> E[Controls / cadence / eligibility / Judge]
-    E -->|Remain quiet| F[Audit the decision]
-    E -->|Request an effect| G[Hermes-owned execution]
-    G --> H[Verified effect receipt]
-    F --> I[Update Moonbite state and audit]
-    H --> I
-    I --> J[Bounded context for a later session]
+```text
+            Main Agent
+                ▲
+                │
+┌────────── Moonbite ──────────┐
+│                              │
+│  Memory       Panel          │
+│  remembers    knows now      │
+│                              │
+│  Heartbeat    Autonomy       │
+│  when to act  what to do     │
+│                              │
+└──────────────┬───────────────┘
+               │
+               ▼
+         Hermes / Host
+  models · tools · schedule · delivery
 ```
 
-- Hermes owns ticks, model routes, credentials, tools, gateways, and delivery.
-- Moonbite owns persistence semantics, decision gates, state transitions, and
-  receipt matching.
-- A model statement is not proof of delivery.
-- Remaining quiet is a valid audited result.
+**What does Moonbite add?**
 
-## Runtime primitives
+It gives a long-running agent:
 
-- **Runtime Core** normalizes events and keeps append-only event, audit,
-  control, and cadence ledgers.
-- **Heartbeat** evaluates whether a host-submitted candidate should act,
-  escalate, or remain quiet. It is a decision pipeline, not a timer.
-- **Autonomy** selects at most one eligible host-triggered activity per tick and
-  records its terminal result without rerolling failures.
-- **Daily RAM / Panel** keeps bounded working state, daily rollover, and
-  verified activity Afterglow.
-- **Memory / Diary** preserves provenance-backed cards, exact evidence access,
-  append-only maintenance history, and grounded daily synthesis.
-- **Controls, effects, and receipts** provide pause, quota, cadence, safety
-  gates, and proof that a requested effect was actually accepted or completed.
+**memory of the past / awareness of the present / judgment about when to act /
+bounded autonomous action**
 
-## Host boundary and inert defaults
+Hermes continues to own models, tools, credentials, scheduling, gateway
+execution, and delivery. The main agent keeps final interpretive authority.
+
+## Core components
+
+- **Memory / Diary** remembers what matters across sessions. Search returns
+  references that can be opened for exact evidence, and maintenance preserves
+  provenance and history.
+- **Panel / Daily RAM** keeps bounded, short-lived working state for what matters
+  now, including daily rollover and verified activity Afterglow.
+- **Heartbeat** decides whether something deserves attention, action, or
+  escalation now. It is a decision pipeline, not a timer.
+- **Autonomy** performs at most one eligible, host-triggered activity per tick.
+  If the selected activity fails, Moonbite records the failure instead of
+  choosing another one in the same tick.
+- **Runtime Core** keeps events, state changes, controls, and decisions
+  consistent in append-only records.
+- **Controls and execution receipts** apply pause, quota, frequency, eligibility,
+  and safety rules, then require a matching host receipt before an external
+  action is considered accepted or completed.
+
+## What Moonbite leaves to the host
 
 Moonbite does not include a scheduler, daemon, credential store, network
-browser, model router, or messaging transport. The Hermes adapter registers
-exactly 10 tools and 5 lifecycle hooks; the exact surfaces are documented in
+browser, model router, or messaging channel. The host owns those capabilities,
+along with raw session history and search. The Hermes adapter registers exactly
+10 tools and 5 lifecycle hooks; their exact interfaces are documented in
 [SETUP.md](SETUP.md) and [plugin.yaml](plugin.yaml).
 
 The hooks are `pre_gateway_dispatch`, `on_session_start`, `pre_llm_call`,
@@ -106,10 +126,10 @@ With the default configuration:
 - installation alone starts no background task, model call, network request, or
   external message.
 
-Every visible effect requires a matching host receipt. Disabling or uninstalling
-Moonbite does not delete its state directory.
+Every visible external action requires a matching execution receipt from the
+host. Disabling or uninstalling Moonbite does not delete its state directory.
 
-## Hermes-only source installation
+## For now, install through Hermes
 
 Install a reviewed full 40-character commit in a disabled state:
 

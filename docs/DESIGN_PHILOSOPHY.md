@@ -2,21 +2,21 @@
 
 > **Let AI persist in its own way.**
 
-Moonbite is a persistent runtime for long-running agents.
+Moonbite is an experimental runtime for long-running agents.
 
-Its goal is not to make an AI imitate a human being. It is to give an agent the runtime primitives needed to remain coherent across turns, sessions, hours, and days: durable memory, daily working state, autonomous activities, heartbeat decisions, runtime controls, and auditable effects.
+Its goal is not to make AI imitate a human being. It helps an agent remain coherent across turns, sessions, hours, and days by providing long-term memory, short-lived working state, bounded autonomous activities, Heartbeat decisions, runtime controls, and verifiable action results.
 
-Companion agents were Moonbite's original design case, but the underlying primitives are not limited to companion semantics. The same runtime model can support any agent that must remain responsible for a relationship, a system, a queue, or an operational domain over time.
+Moonbite began with companion agents as a design case, but it is not limited to them. The same model can support any agent that remains responsible for a person, a system, a queue, or an operational domain over time.
 
 ---
 
 ## Core idea
 
-Most agent systems are optimized for completing one prompt or one session. Long-running agents need something different: a way to carry lived state forward, decide when to act or remain quiet, preserve evidence, and distinguish claimed actions from effects that actually happened.
+Most agent systems are optimized for one prompt or one session. Long-running agents need something different: they must remember what happened, keep track of what matters now, decide when to act or remain quiet, preserve evidence, and distinguish claimed actions from actions that actually happened.
 
 Moonbite adds that time dimension.
 
-> **Moonbite gives long-running agents memory, daily state, autonomous activities, heartbeat decisions, and auditable effects.**
+> **Moonbite gives long-running agents memory, working state, bounded autonomy, Heartbeat decisions, and verifiable action results.**
 
 Human memory is incomplete, biological, and shaped by involuntary forgetting. An AI does not need to reproduce those limitations. Machine-native continuity can be file-backed, searchable, auditable, backed up, migrated, and restored.
 
@@ -28,9 +28,9 @@ Human memory is incomplete, biological, and shaped by involuntary forgetting. An
 
 Continuity is a capability in its own right. Moonbite does not try to manufacture a theatrical imitation of human memory, mood, sleep, or biological rhythm. It gives an agent explicit state and history so that continuity can be inspected and reasoned about.
 
-### 2. Memory is durable lived history
+### 2. Memory preserves lived history
 
-Memory should preserve what the agent has actually lived through: observations, user-explicit facts, inferences, corrections, decisions, and evidence.
+Memory should preserve what the agent has actually encountered: observations, facts explicitly provided by the user, inferences, corrections, decisions, and evidence.
 
 Moonbite does not apply time-driven destructive forgetting by default. It may support explicit correction, deduplication, merging, archival, and user-controlled maintenance, but those operations must preserve provenance and history rather than silently rewriting the past.
 
@@ -48,15 +48,15 @@ The current context determines how deeply the system retrieves. The underlying h
 
 ### 4. Persistence is more than memory
 
-A long-running agent needs more than a memory database. Moonbite treats persistence as a runtime property composed of several cooperating primitives:
+A long-running agent needs more than a memory database. Moonbite combines several parts to keep the agent coherent over time:
 
 - **Events** — normalized facts entering the runtime.
 - **Daily RAM / Panel** — bounded working state for what matters now.
-- **Memory and Diary** — durable lived history and grounded daily synthesis.
-- **Autonomy** — host-triggered self-directed activities.
-- **Heartbeat** — a decision pipeline for whether an event is worth acting on or escalating.
-- **Runtime controls** — pause, quota, cadence, and safety gates.
-- **Effects and receipts** — auditable proof of what the host actually accepted or completed.
+- **Memory and Diary** — long-term history and daily synthesis grounded in evidence.
+- **Autonomy** — bounded self-directed activities triggered by the host.
+- **Heartbeat** — a decision process for whether something is worth acting on or escalating.
+- **Runtime controls** — pause, quota, timing, eligibility, and safety rules.
+- **Effects and receipts** — evidence of what the host actually accepted or completed.
 
 ### 5. Interruption should be decided, not blindly scheduled
 
@@ -68,11 +68,11 @@ Moonbite's Heartbeat asks whether an event is timely, meaningful, permitted, and
 
 Model-generated text is not proof that an email was sent, a ticket was updated, a user was notified, or a tool completed its work.
 
-Moonbite separates intent, execution, and verification. A visible or operational effect becomes verified only when the host returns a matching receipt.
+Moonbite separates intent, execution, and verification. A visible or operational action becomes verified only when the host returns a matching execution receipt.
 
 ### 7. Respect the host boundary
 
-Moonbite provides persistent-agent policy and runtime semantics. It does not replace infrastructure that the host is better positioned to own:
+Moonbite defines how continuity, state, and decisions are carried forward. It does not replace infrastructure that the host is better positioned to own:
 
 - the main agent loop;
 - model routing and provider credentials;
@@ -82,57 +82,48 @@ Moonbite provides persistent-agent policy and runtime semantics. It does not rep
 - the general tool ecosystem;
 - authorization and deployment-specific target resolution.
 
-Hermes Agent is Moonbite's first host adapter. Other harnesses can be supported later through explicit contracts rather than by leaking host-specific assumptions into the runtime core.
+Hermes Agent is Moonbite's first host adapter. Other agent hosts or frameworks can be supported later through explicit contracts rather than by leaking host-specific assumptions into the Runtime Core.
 
 ### 8. Portable identity and continuity
 
-A long-running agent should not belong permanently to one machine or one harness.
+A long-running agent should not belong permanently to one machine or one agent host.
 
 Moonbite's ideal portability equation is:
 
 ```text
-fresh host
+new host
 + Moonbite runtime and adapter
-+ restored lived state
-+ reauthorized secrets
-= the same long-running agent
++ restored state
++ newly authorized credentials
+= continuity preserved
 ```
 
-Secrets are reauthorized, not copied into lived state. The runtime and state can move; credentials remain owned by the new host deployment.
+Credentials are authorized again on the new host rather than copied into agent state. The runtime and state can move; credentials remain owned by the new deployment.
 
 ---
 
 ## Runtime model
 
-```mermaid
-flowchart TD
-    A[Host events, session hooks, and scheduled ticks] --> B[Moonbite Runtime Core]
-
-    B --> C[Event and audit ledgers]
-    B --> D[Daily RAM / Panel]
-    B --> E[Memory and Diary]
-    B --> F[Autonomy]
-    B --> G[Heartbeat]
-
-    F --> H[Controls, eligibility, and Judge]
-    G --> I[Controls, cadence, and Judge]
-
-    H -->|Remain quiet| C
-    I -->|Remain quiet| C
-
-    H -->|Request an effect| J[Host-owned model, tools, gateway, or transport]
-    I -->|Request an effect| J
-
-    J --> K[Effect receipt]
-    K -->|Verified| C
-    K -->|Verified| D
-
-    D --> L[Bounded context for a later session]
-    E --> L
-    L --> M[Host agent loop]
+```text
+            Main Agent
+                ▲
+                │
+┌────────── Moonbite ──────────┐
+│                              │
+│  Memory       Panel          │
+│  remembers    knows now      │
+│                              │
+│  Heartbeat    Autonomy       │
+│  when to act  what to do     │
+│                              │
+└──────────────┬───────────────┘
+               │
+               ▼
+         Hermes / Host
+  models · tools · schedule · delivery
 ```
 
-The host owns when ticks occur and how effects are executed. Moonbite owns the semantics that determine what should happen, what state changes are durable, and what evidence is required before an effect is considered real.
+The host decides when ticks occur and executes external actions. Moonbite decides how state and decisions are recorded, and what evidence is required before an action is considered real.
 
 ---
 
@@ -194,7 +185,7 @@ These use cases share one requirement: the agent is not merely answering a promp
 
 ---
 
-## What Moonbite is not
+## What Moonbite does not provide
 
 Moonbite is not:
 
@@ -213,13 +204,13 @@ Moonbite is not:
 
 > **Let AI persist in its own way.**
 >
-> **Moonbite gives long-running agents memory, daily state, autonomous activities, heartbeat decisions, and auditable effects.**
+> **Moonbite gives long-running agents memory, working state, bounded autonomy, Heartbeat decisions, and verifiable action results.**
 
 Moonbite should be positioned as a **persistent runtime for long-running agents**.
 
 Companion agents are its original and important use case. Operations, SRE, customer support, and service operations demonstrate that the same primitives generalize anywhere an agent must continuously observe, preserve state, act selectively, decide when to interrupt a human, and leave a verifiable history.
 
-**Keywords:** continuity · persistence · autonomy · state · auditable effects · portability · survivability
+**Keywords:** continuity · persistence · autonomy · state · verifiable actions · portability · survivability
 
 ---
 
