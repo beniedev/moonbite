@@ -31,6 +31,16 @@ Engineering invariants:
 - macOS and Linux share one code path unless a demonstrated host boundary
   requires an adapter.
 
+Pull request conventions:
+
+- Name branches for the change, not the author, coding agent, or an internal
+  work item. Prefer purpose-based names such as `feat/<topic>`, `fix/<topic>`,
+  or `docs/<topic>`.
+- Use concise Conventional Commit-style PR titles (`type(scope): summary`),
+  for example `feat(heartbeat): allow urgent kinds to bypass contact guards`.
+- Keep public PR titles, descriptions, branch names, and commit messages
+  self-contained; do not expose internal ticket identifiers.
+
 Required verification:
 
 ```bash
