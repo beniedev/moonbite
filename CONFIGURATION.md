@@ -49,6 +49,30 @@ fail-closed and auditable.
   `targeted_wake_adapter_unavailable`; it does not fall back to the current
   conversation. This is not a direct-message adapter.
 
+## Heartbeat contact guards
+
+`recent_contact` and `active_chat` remain enabled unless a heartbeat kind
+explicitly lists them in `bypass`. Naming a profile `urgent` does not enable a
+bypass by itself.
+
+```yaml
+heartbeat:
+  kinds:
+    urgent_signal:
+      enabled: true
+      profile: urgent
+      judge: required
+      host_only: true
+      bypass: [recent_contact, active_chat]
+```
+
+Urgent policies may select either contact guard independently. The existing
+`automatic_cooldown` and `manual_snooze` bypasses remain supported; unknown
+values are rejected. A bypass only lets the candidate continue to later Judge
+and policy evaluation. The bypass itself neither requests delivery or wake nor
+counts as an effect receipt; any later effect follows the normal receipt
+contract.
+
 Moonbite v0.1 does not expose a third-party provider discovery contract.
 Deployments register activity descriptors explicitly through a host adapter.
 The bundled registry contains `local_reflection`, opt-in `model_reflection`,

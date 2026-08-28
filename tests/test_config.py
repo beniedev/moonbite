@@ -102,9 +102,17 @@ def test_custom_heartbeat_kind_is_normalized_with_safe_defaults():
         ("urgent", [], "required", True),
         ("urgent", ["automatic_cooldown"], "required", True),
         ("urgent", ["manual_snooze"], "required", True),
+        ("urgent", ["recent_contact"], "required", True),
+        ("urgent", ["active_chat"], "required", True),
+        ("urgent", ["recent_contact", "active_chat"], "required", True),
         (
             "urgent",
-            ["automatic_cooldown", "manual_snooze"],
+            [
+                "automatic_cooldown",
+                "manual_snooze",
+                "recent_contact",
+                "active_chat",
+            ],
             "required",
             True,
         ),
@@ -115,20 +123,23 @@ def test_custom_heartbeat_kind_is_normalized_with_safe_defaults():
 def test_heartbeat_kind_profile_boundaries_are_accepted(
     profile, bypass, judge, host_only
 ):
-    config = normalize_config(
-        {
-            "heartbeat": {
-                "kinds": {
-                    "custom_kind": {
-                        "profile": profile,
-                        "bypass": bypass,
-                        "judge": judge,
-                        "host_only": host_only,
-                    }
+    raw = {
+        "heartbeat": {
+            "kinds": {
+                "custom_kind": {
+                    "profile": profile,
+                    "bypass": bypass,
+                    "judge": judge,
+                    "host_only": host_only,
                 }
             }
         }
-    )
+    }
+    schema_path = Path(__file__).parents[1] / "config" / "schema.json"
+    schema = json.loads(schema_path.read_text(encoding="utf-8"))
+
+    assert list(Draft202012Validator(schema).iter_errors(raw)) == []
+    config = normalize_config(raw)
     assert config["heartbeat"]["kinds"]["custom_kind"] == {
         "enabled": False,
         "profile": profile,

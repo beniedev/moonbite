@@ -20,7 +20,9 @@ _AUXILIARY_ALIAS = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _HEARTBEAT_KIND_NAME = re.compile(r"^[a-z][a-z0-9_.-]{0,63}$")
 _HEARTBEAT_PROFILES = frozenset({"routine", "daily_anchor", "urgent", "maintenance"})
 _HEARTBEAT_JUDGES = frozenset({"required", "skip"})
-_HEARTBEAT_BYPASSES = frozenset({"automatic_cooldown", "manual_snooze"})
+_HEARTBEAT_BYPASSES = frozenset(
+    {"automatic_cooldown", "manual_snooze", "recent_contact", "active_chat"}
+)
 _HEARTBEAT_KIND_DEFAULTS = {
     "enabled": False,
     "profile": "routine",

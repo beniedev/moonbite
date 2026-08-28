@@ -447,6 +447,50 @@ def _policy(
     }
 
 
+@pytest.mark.parametrize(
+    "bypass,recent,active,expected_reason,expected_calls",
+    [
+        ([], True, False, "recent_private_inbound", 0),
+        ([], False, True, "active_chat", 0),
+        (["recent_contact"], True, False, "silent", 1),
+        (["active_chat"], False, True, "silent", 1),
+        (["recent_contact"], True, True, "active_chat", 0),
+        (["active_chat"], True, True, "recent_private_inbound", 0),
+        (["recent_contact", "active_chat"], True, True, "silent", 1),
+    ],
+)
+def test_contact_guard_bypass_is_explicit_and_policy_scoped(
+    tmp_path,
+    bypass,
+    recent,
+    active,
+    expected_reason,
+    expected_calls,
+):
+    judge = Judge(JudgeDecision(False, False, "silent"))
+    sink = Sink()
+    runtime, _controls, _bus, _cadence = engine(
+        tmp_path,
+        judge,
+        sink,
+        kind_policies={
+            "urgent_signal": _policy(
+                profile="urgent",
+                host_only=True,
+                bypass=bypass,
+            )
+        },
+    )
+    context = {"events": ["fixture"], "due": True, "active_chat": active}
+    if recent:
+        context["recent_private_inbound_at"] = NOW
+
+    result = runtime.run(HeartbeatCandidate("urgent_signal", context))
+
+    assert (result.reason, judge.calls) == (expected_reason, expected_calls)
+    assert sink.deliveries == sink.wakes == 0
+
+
 def test_daily_anchor_profile_owns_due_state_without_context_flags(tmp_path):
     judge = Judge(JudgeDecision(False, False, "anchor_seen"))
     runtime, _controls, _bus, cadence = engine(

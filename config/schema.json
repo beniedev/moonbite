@@ -177,7 +177,14 @@
         "host_only": {"type": "boolean", "default": true},
         "bypass": {
           "type": "array",
-          "items": {"enum": ["automatic_cooldown", "manual_snooze"]},
+          "items": {
+            "enum": [
+              "automatic_cooldown",
+              "manual_snooze",
+              "recent_contact",
+              "active_chat"
+            ]
+          },
           "uniqueItems": true,
           "default": []
         }

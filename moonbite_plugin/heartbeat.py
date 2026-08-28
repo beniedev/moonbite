@@ -53,7 +53,9 @@ DEFAULT_MANUAL_COOLDOWN = timedelta(hours=1)
 DEFAULT_RECENT_CONTACT_WINDOW = timedelta(minutes=30)
 DEFAULT_EFFECT_TTL = timedelta(hours=1)
 DEFAULT_ANCHOR_HOUR = 6
-HEARTBEAT_BYPASSES = frozenset({"automatic_cooldown", "manual_snooze"})
+HEARTBEAT_BYPASSES = frozenset(
+    {"automatic_cooldown", "manual_snooze", "recent_contact", "active_chat"}
+)
 HEARTBEAT_PROFILES = frozenset({"routine", "daily_anchor", "urgent", "maintenance"})
 HEARTBEAT_JUDGE_TERMINALS = frozenset(
     {"approved", "denied", "failed", "maintenance", "unknown"}
@@ -3651,22 +3653,25 @@ class HeartbeatEngine:
                     code=HeartbeatReasonCode.COOLDOWN,
                     next_judge_at=until or next_due,
                 )
-            contact, _at = self._contact(candidate, now)
-            if contact is not None:
-                return self._result(
-                    "skipped",
-                    contact,
-                    candidate_id,
-                    gate,
-                    code=HeartbeatReasonCode.RECENT_CONTACT,
-                    next_judge_at=now
-                    + getattr(
-                        self.cadence,
-                        "recent_contact_window",
-                        DEFAULT_RECENT_CONTACT_WINDOW,
-                    ),
-                )
-            if self._active_chat(candidate, active_chat):
+            if "recent_contact" not in policy.bypass:
+                contact, _at = self._contact(candidate, now)
+                if contact is not None:
+                    return self._result(
+                        "skipped",
+                        contact,
+                        candidate_id,
+                        gate,
+                        code=HeartbeatReasonCode.RECENT_CONTACT,
+                        next_judge_at=now
+                        + getattr(
+                            self.cadence,
+                            "recent_contact_window",
+                            DEFAULT_RECENT_CONTACT_WINDOW,
+                        ),
+                    )
+            if "active_chat" not in policy.bypass and self._active_chat(
+                candidate, active_chat
+            ):
                 return self._result(
                     "skipped",
                     "active_chat",

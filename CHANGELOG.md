@@ -12,6 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Runtime core:** normalized events, append-only JSONL ledgers for events, audit, controls, and cadence, atomic JSON state writes, and POSIX `fcntl` file locks.
 - **Controls engine:** priority-based runtime control intents (`pause`, `resume`, `quota_save`, `play_next`) and manual/automatic cadence snoozing with distinct release rules.
 - **Heartbeat pipeline:** fail-closed execution order (`ControlGate → cadence → Judge → delivery/wake → terminal audit`), separating accepted, unverified, and verified effects.
+- **Heartbeat contact guards:** explicitly configured urgent kinds may bypass `recent_contact` and/or `active_chat`; defaults remain guarded, and candidates still pass through Judge and normal effect/receipt handling.
 - **Autonomy engine:** weighted single-choice provider selection, terminal failure handling per tick (no same-tick rerolls), and one-shot `play_next` consumption only after completed execution.
 - **Activity providers:** built-in `local_reflection`, opt-in `model_reflection` via Hermes auxiliary routing, and disabled host-fed `paper_browse` / `x_browse` read-only examples.
 - **Panel (Daily RAM):** typed values with source, confidence, TTL, daily epoch rollover at configurable anchor hour, sensor observations (`chat_rhythm`), consume-once lifecycles, and bounded autonomy afterglow pointers.
