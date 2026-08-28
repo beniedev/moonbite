@@ -5,8 +5,8 @@ persistent runtime plugin for [Hermes Agent](https://github.com/NousResearch/her
 as well as how to set up a local development and testing environment.
 
 > [!NOTE]
-> **Pre-alpha public source preview:**
-> No Moonbite package is published for this preview. Install from source through
+> **0.1.0 Alpha 1 source preview:**
+> Moonbite is not published to a package registry. Install from source through
 > Hermes, pin a full 40-character Git commit SHA, and validate within an isolated
 > `HERMES_HOME` before touching a live profile. Do not use floating `main` as a
 > stable target.
@@ -231,7 +231,7 @@ To revert configuration changes, restore the previous Moonbite entry, restart an
 long-running Hermes process, and run `hermes moonbite doctor`. To return to an
 earlier plugin revision, reinstall its reviewed full SHA with `--force --ref`,
 then repeat the same restart and diagnostic steps. Keep the previous SHA and
-configuration backup before each pre-alpha upgrade.
+configuration backup before each preview upgrade.
 
 ### 5.2 Disabling or removing the plugin
 

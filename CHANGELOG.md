@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.0a1] - 2026-08-28
+
 ### Added
 
 - **Runtime core:** normalized events, append-only JSONL ledgers for events, audit, controls, and cadence, atomic JSON state writes, and POSIX `fcntl` file locks.

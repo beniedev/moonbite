@@ -1,6 +1,6 @@
 # Security policy
 
-Moonbite is a pre-alpha and has no supported stable release yet. Do not
+Moonbite is an alpha preview and has no supported stable release yet. Do not
 open a public issue containing credentials, private messages, personal memory,
 session identifiers, platform targets, coordinates, state files, or logs.
 Report a suspected vulnerability privately to the repository owner through

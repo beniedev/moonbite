@@ -58,7 +58,7 @@ wheels = [
 
 [[package]]
 name = "moonbite-plugin"
-version = "0.1.0.dev0"
+version = "0.1.0a1"
 source = { editable = "." }
 
 [package.optional-dependencies]

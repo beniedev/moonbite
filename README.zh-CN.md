@@ -16,6 +16,7 @@ Moonbite 不取代宿主 Agent。模型、工具、凭据、调度和消息投�
 Moonbite 是一项实验性作品：首要目标是传达设计理念，并探索这些理念在
 实践中的可能性。
 
+[![CI](https://github.com/beniedev/moonbite/actions/workflows/ci.yml/badge.svg)](https://github.com/beniedev/moonbite/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python: 3.11–3.14](https://img.shields.io/badge/Python-3.11%20%7C%203.12%20%7C%203.13%20%7C%203.14-blue.svg)](pyproject.toml)
 [![Platform: Linux / WSL2 / macOS](https://img.shields.io/badge/Platform-Linux%20%7C%20WSL2%20%7C%20macOS-informational.svg)](COMPATIBILITY.md)
@@ -36,14 +37,14 @@ Moonbite 是一项实验性作品：首要目标是传达设计理念，并探�
 
 本次预览不提供：
 
-- PyPI 或其他软件包分发
+- 发布到 PyPI 或其他软件包仓库
 - 稳定的公开 Python API 保证
 - 非 Hermes Agent 宿主框架支持
 - 生产支持或长期兼容性保证
 - 内置调度器、凭据存储、网络浏览器或消息渠道
 
-本次预览没有发布 Moonbite 软件包。请通过 Hermes 从源码安装，并锁定
-不可变的 Commit SHA。
+Moonbite 尚未发布到软件包仓库。预览版本仅以源码提供；请通过 Hermes
+使用 GitHub Release 标签安装，或锁定对应的不可变 Commit SHA。
 
 ## 为什么长期运行的 Agent 需要 Moonbite
 
@@ -185,9 +186,9 @@ API 保证。
 ## 项目状态
 
 ```text
-Status: pre-alpha public source preview
+Status: 0.1.0 Alpha 1 public preview
 Supported host: Hermes Agent only
-Distribution: source install from pinned SHA
+Distribution: source-only GitHub prerelease
 Support: best effort
 API stability: not guaranteed
 ```

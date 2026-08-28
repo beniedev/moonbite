@@ -15,6 +15,7 @@ owns models, tools, credentials, scheduling, and delivery.
 Moonbite is an experimental project. Its first priority is to communicate a
 design philosophy and explore how that philosophy might work in practice.
 
+[![CI](https://github.com/beniedev/moonbite/actions/workflows/ci.yml/badge.svg)](https://github.com/beniedev/moonbite/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python: 3.11–3.14](https://img.shields.io/badge/Python-3.11%20%7C%203.12%20%7C%203.13%20%7C%203.14-blue.svg)](pyproject.toml)
 [![Platform: Linux / WSL2 / macOS](https://img.shields.io/badge/Platform-Linux%20%7C%20WSL2%20%7C%20macOS-informational.svg)](COMPATIBILITY.md)
@@ -36,14 +37,15 @@ Supported in this preview:
 
 Not provided in this preview:
 
-- PyPI or other package distribution
+- Publication to PyPI or another package registry
 - A stable public Python API guarantee
 - Support for non-Hermes agent hosts or frameworks
 - Production support or long-term compatibility guarantees
 - An internal scheduler, credential store, network browser, or messaging channel
 
-No Moonbite package is published for this preview. Install from source through
-Hermes and pin an immutable commit SHA.
+Moonbite is not published to a package registry. Preview releases are
+source-only; install through Hermes from a GitHub release tag or pin an
+immutable commit SHA.
 
 ## Why long-running agents need Moonbite
 
@@ -195,9 +197,9 @@ See [docs/features/PANEL.md](docs/features/PANEL.md).
 ## Project status
 
 ```text
-Status: pre-alpha public source preview
+Status: 0.1.0 Alpha 1 public preview
 Supported host: Hermes Agent only
-Distribution: source install from pinned SHA
+Distribution: source-only GitHub prerelease
 Support: best effort
 API stability: not guaranteed
 ```

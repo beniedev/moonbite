@@ -1,7 +1,7 @@
 manifest_version: 1
 name: moonbite
-version: 0.1.0.dev0
-description: "Persistent runtime primitives for long-running agents on Hermes Agent."
+version: 0.1.0a1
+description: "Memory, working state, heartbeat, and bounded autonomy for long-running AI agents."
 author: "Bénie Studio"
 kind: standalone
 provides_tools:

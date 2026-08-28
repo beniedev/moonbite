@@ -4,14 +4,14 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "moonbite-plugin"
-version = "0.1.0.dev0"
-description = "A persistent runtime for long-running agents on Hermes Agent"
+version = "0.1.0a1"
+description = "Memory, working state, heartbeat, and bounded autonomy for long-running AI agents"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.11,<3.15"
 authors = [{name = "Bénie Studio"}]
 classifiers = [
-  "Development Status :: 2 - Pre-Alpha",
+  "Development Status :: 3 - Alpha",
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",

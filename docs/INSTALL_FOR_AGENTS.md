@@ -136,7 +136,7 @@ hermes plugins install beniedev/moonbite \
   --no-enable
 ```
 
-No Moonbite package is published for this preview. Install from source through
+Moonbite is not published to a package registry. Install from source through
 Hermes, and do not substitute a floating branch or historical baseline for the
 owner-approved commit.
 
