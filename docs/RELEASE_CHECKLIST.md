@@ -97,11 +97,11 @@ This checklist is an authoritative guide for repository owners preparing a publi
 ## 5. Tagging, Artifact Hashing & GitHub Release
 
 - [ ] **Tagging Release Commit:**
-  After explicit owner authorization, create an immutable signed tag for the
-  approved release commit. Replace both placeholders; do not execute these as
-  written:
+  After explicit owner authorization, create an immutable annotated tag for
+  the approved release commit. Replace both placeholders; do not execute these
+  as written:
   ```bash
-  git tag -s <version-tag> <approved-release-commit> -m "Release <version-tag>"
+  git tag -a <version-tag> <approved-release-commit> -m "Release <version-tag>"
   git push origin <version-tag>
   ```
 
