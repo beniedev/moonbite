@@ -6,8 +6,8 @@ Moonbite is a persistent runtime for long-running agents. It gives agents
 durable memory, daily working state, host-triggered autonomous activities,
 heartbeat decisions, runtime controls, and auditable effects.
 
-Companion agents are Moonbite's original use case, but the runtime primitives
-are not limited to companion semantics.
+Moonbite is an experimental project. Its first priority is to communicate a
+design philosophy and explore how that philosophy might work in practice.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python: 3.11–3.14](https://img.shields.io/badge/Python-3.11%20%7C%203.12%20%7C%203.13%20%7C%203.14-blue.svg)](pyproject.toml)
@@ -54,30 +54,16 @@ control of models, tools, credentials, scheduling, and delivery.
 
 ```mermaid
 flowchart TD
-    A[Hermes session hooks, host events, and scheduled ticks] --> B[Moonbite Runtime Core]
-
-    B --> C[Event and audit ledgers]
-    B --> D[Daily RAM / Panel]
-    B --> E[Memory and Diary]
-    B --> F[Autonomy]
-    B --> G[Heartbeat]
-
-    F --> H[Controls, eligibility, and Judge]
-    G --> I[Controls, cadence, and Judge]
-
-    H -->|Remain quiet| C
-    I -->|Remain quiet| C
-
-    H -->|Request an effect| J[Hermes-owned model, tools, gateway, or transport]
-    I -->|Request an effect| J
-
-    J --> K[Effect receipt]
-    K -->|Verified| C
-    K -->|Verified| D
-
-    D --> L[Bounded context for a later session]
-    E --> L
-    L --> M[Hermes agent loop]
+    A[Hermes hooks / host events / scheduled ticks] --> B[Moonbite Runtime Core]
+    B --> C[Events / Daily RAM / Memory / Diary]
+    C --> D[Autonomy / Heartbeat]
+    D --> E[Controls / cadence / eligibility / Judge]
+    E -->|Remain quiet| F[Audit the decision]
+    E -->|Request an effect| G[Hermes-owned execution]
+    G --> H[Verified effect receipt]
+    F --> I[Update Moonbite state and audit]
+    H --> I
+    I --> J[Bounded context for a later session]
 ```
 
 - Hermes owns ticks, model routes, credentials, tools, gateways, and delivery.

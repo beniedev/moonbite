@@ -8,8 +8,8 @@ Moonbite 是一个面向 long-running agents 的持续性运行时。它为 Agen
 提供耐久记忆、每日工作状态、由宿主触发的自主活动、Heartbeat 决策、
 运行时控制，以及可审计的真实副作用。
 
-陪伴型 Agent 是 Moonbite 最初的使用场景，但这些运行时原语并不依赖
-“陪伴”语义。
+Moonbite 是一项实验性作品：首要目标是传达设计理念，并探索这些理念在
+实践中的可能性。
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python: 3.11–3.14](https://img.shields.io/badge/Python-3.11%20%7C%203.12%20%7C%203.13%20%7C%203.14-blue.svg)](pyproject.toml)
@@ -53,30 +53,16 @@ Moonbite 为 Agent 加入这个时间维度，但不取代宿主。Moonbite 明�
 
 ```mermaid
 flowchart TD
-    A[Hermes Session Hooks、宿主事件与定时 Tick] --> B[Moonbite Runtime Core]
-
-    B --> C[Event 与 Audit Ledgers]
-    B --> D[Daily RAM / Panel]
-    B --> E[Memory 与 Diary]
-    B --> F[Autonomy]
-    B --> G[Heartbeat]
-
-    F --> H[Controls、Eligibility 与 Judge]
-    G --> I[Controls、Cadence 与 Judge]
-
-    H -->|保持安静| C
-    I -->|保持安静| C
-
-    H -->|请求副作用| J[Hermes 拥有的模型、工具、Gateway 或 Transport]
-    I -->|请求副作用| J
-
-    J --> K[Effect Receipt]
-    K -->|已验证| C
-    K -->|已验证| D
-
-    D --> L[后续 Session 的有界上下文]
-    E --> L
-    L --> M[Hermes Agent Loop]
+    A[Hermes Hooks / 宿主事件 / 定时 Tick] --> B[Moonbite Runtime Core]
+    B --> C[Events / Daily RAM / Memory / Diary]
+    C --> D[Autonomy / Heartbeat]
+    D --> E[Controls / Cadence / Eligibility / Judge]
+    E -->|保持安静| F[审计本次决定]
+    E -->|请求副作用| G[Hermes 负责执行]
+    G --> H[已验证的 Effect Receipt]
+    F --> I[更新状态与审计]
+    H --> I
+    I --> J[后续 Session 的有界上下文]
 ```
 
 - Hermes 拥有 Tick、模型路由、凭据、工具、Gateway 与 Delivery。
