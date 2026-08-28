@@ -1,0 +1,121 @@
+{
+  "schema_version": "moonbite.parity.observer_contract.v1",
+  "purpose": "Freeze read-only operational observation, incident classification, recovery history, and degraded reporting.",
+  "owner_boundary": {
+    "portable": ["Moonbite-owned health signals", "current versus recovered classification", "degraded report shape", "read-only probe"],
+    "host": ["machine health", "scheduler state", "provider credentials", "transport status", "private operator context"]
+  },
+  "portable_invariants": [
+    "A healthy empty observation is neutral rather than an incident.",
+    "An unresolved failure is current; a later verified recovery remains history.",
+    "A corrupt ledger yields degraded evidence and does not become healthy by omission.",
+    "Observer probes never write state, trigger effects, or change cadence."
+  ],
+  "scenarios": [
+    {
+      "id": "neutral_observation",
+      "given": {
+        "ledger": "valid",
+        "unresolved_incidents": [],
+        "recovered_incidents": [],
+        "probe_mode": "read_only"
+      },
+      "when": {
+        "operation": "observe"
+      },
+      "expected": {
+        "terminal": "neutral",
+        "health": "ok",
+        "current_count": 0,
+        "history_count": 0,
+        "writes": 0,
+        "effects": 0
+      }
+    },
+    {
+      "id": "current_incident",
+      "given": {
+        "ledger": "valid",
+        "unresolved_incidents": ["fixture-incident-current-001"],
+        "recovered_incidents": [],
+        "probe_mode": "read_only"
+      },
+      "when": {
+        "operation": "observe"
+      },
+      "expected": {
+        "terminal": "current",
+        "health": "attention",
+        "current_incident_ids": ["fixture-incident-current-001"],
+        "history_incident_ids": [],
+        "writes": 0,
+        "effects": 0
+      }
+    },
+    {
+      "id": "recovered_history",
+      "given": {
+        "ledger": "valid",
+        "unresolved_incidents": [],
+        "recovered_incidents": ["fixture-incident-recovered-001"],
+        "recovery_evidence": "fixture-recovery-receipt-001",
+        "probe_mode": "read_only"
+      },
+      "when": {
+        "operation": "observe"
+      },
+      "expected": {
+        "terminal": "recovered_history",
+        "health": "ok",
+        "current_incident_ids": [],
+        "history_incident_ids": ["fixture-incident-recovered-001"],
+        "recovery_evidence_required": true,
+        "writes": 0,
+        "effects": 0
+      }
+    },
+    {
+      "id": "corrupt_ledger_degraded",
+      "given": {
+        "ledger": "corrupt",
+        "unresolved_incidents": null,
+        "recovered_incidents": null,
+        "probe_mode": "read_only"
+      },
+      "when": {
+        "operation": "observe"
+      },
+      "expected": {
+        "terminal": "degraded",
+        "health": "degraded",
+        "reason": "ledger_unreadable",
+        "current_count": null,
+        "history_count": null,
+        "fail_closed": true,
+        "writes": 0,
+        "effects": 0
+      }
+    },
+    {
+      "id": "probe_is_read_only",
+      "given": {
+        "ledger": "valid",
+        "probe_mode": "read_only",
+        "before_state_digest": "fixture-digest-before-001",
+        "before_cadence_digest": "fixture-digest-cadence-before-001"
+      },
+      "when": {
+        "operation": "doctor_and_status"
+      },
+      "expected": {
+        "terminal": "observed",
+        "after_state_digest": "fixture-digest-before-001",
+        "after_cadence_digest": "fixture-digest-cadence-before-001",
+        "writes": 0,
+        "effects": 0,
+        "model_calls": 0,
+        "side_effects": 0
+      }
+    }
+  ]
+}

@@ -1,0 +1,109 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: "17 9 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            python-version: "3.11"
+          - os: ubuntu-latest
+            python-version: "3.12"
+          - os: ubuntu-latest
+            python-version: "3.13"
+          - os: ubuntu-latest
+            python-version: "3.14"
+          - os: macos-latest
+            python-version: "3.11"
+          - os: macos-latest
+            python-version: "3.12"
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: python -m pip install --disable-pip-version-check -e '.[dev]'
+      - run: python -m compileall -q moonbite_plugin tests
+      - run: ruff check moonbite_plugin tests scripts/check-hermes-contract.py --select F,E9
+      - run: ruff format --check moonbite_plugin tests scripts/check-hermes-contract.py
+      - run: pytest
+      - run: python -m pip wheel --disable-pip-version-check --no-deps --wheel-dir "$RUNNER_TEMP/wheels" .
+
+  hermes-pinned:
+    runs-on: ubuntu-latest
+    env:
+      HERMES_PINNED_COMMIT: 987064caa4f8845f605ac7346fed5b72fddfb21c
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.12"
+      - run: python -m pip install --disable-pip-version-check 'uv==0.11.7'
+      - run: |
+          git init "$RUNNER_TEMP/hermes-agent"
+          git -C "$RUNNER_TEMP/hermes-agent" remote add origin https://github.com/NousResearch/hermes-agent.git
+          git -C "$RUNNER_TEMP/hermes-agent" fetch --depth 1 origin "$HERMES_PINNED_COMMIT"
+          git -C "$RUNNER_TEMP/hermes-agent" checkout --detach FETCH_HEAD
+      - run: HERMES_REPO="$RUNNER_TEMP/hermes-agent" HERMES_EXPECTED_COMMIT="$HERMES_PINNED_COMMIT" MOONBITE_TEST_HOME="$RUNNER_TEMP/hermes-home" ./scripts/test-hermes-contract.sh
+      - run: HERMES_REPO="$RUNNER_TEMP/hermes-agent" HERMES_EXPECTED_COMMIT="$HERMES_PINNED_COMMIT" MOONBITE_TEST_HOME="$RUNNER_TEMP/clean-install-home" ./scripts/test-clean-install.sh
+      - run: HERMES_REPO="$RUNNER_TEMP/hermes-agent" HERMES_EXPECTED_COMMIT="$HERMES_PINNED_COMMIT" ./scripts/test-clean-wheel.sh
+
+  hermes-pinned-macos:
+    runs-on: macos-latest
+    env:
+      HERMES_PINNED_COMMIT: 987064caa4f8845f605ac7346fed5b72fddfb21c
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.12"
+      - run: python -m pip install --disable-pip-version-check 'uv==0.11.7'
+      - run: |
+          git init "$RUNNER_TEMP/hermes-agent"
+          git -C "$RUNNER_TEMP/hermes-agent" remote add origin https://github.com/NousResearch/hermes-agent.git
+          git -C "$RUNNER_TEMP/hermes-agent" fetch --depth 1 origin "$HERMES_PINNED_COMMIT"
+          git -C "$RUNNER_TEMP/hermes-agent" checkout --detach FETCH_HEAD
+      - run: HERMES_REPO="$RUNNER_TEMP/hermes-agent" HERMES_EXPECTED_COMMIT="$HERMES_PINNED_COMMIT" MOONBITE_TEST_HOME="$RUNNER_TEMP/clean-install-home" ./scripts/test-clean-install.sh
+      - run: HERMES_REPO="$RUNNER_TEMP/hermes-agent" HERMES_EXPECTED_COMMIT="$HERMES_PINNED_COMMIT" ./scripts/test-clean-wheel.sh
+
+  hermes-latest-drift:
+    if: github.event_name == 'schedule'
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.12"
+      - run: python -m pip install --disable-pip-version-check 'uv==0.11.7'
+      - run: |
+          git clone --depth 1 --no-tags https://github.com/NousResearch/hermes-agent.git "$RUNNER_TEMP/hermes-agent"
+          git -C "$RUNNER_TEMP/hermes-agent" rev-parse HEAD
+      - run: HERMES_REPO="$RUNNER_TEMP/hermes-agent" MOONBITE_TEST_HOME="$RUNNER_TEMP/hermes-home" ./scripts/test-hermes-contract.sh
+
+  hermes-latest-rc:
+    if: github.event_name == 'workflow_dispatch'
+    continue-on-error: false
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.12"
+      - run: python -m pip install --disable-pip-version-check 'uv==0.11.7'
+      - run: |
+          git clone --depth 1 --no-tags https://github.com/NousResearch/hermes-agent.git "$RUNNER_TEMP/hermes-agent"
+          git -C "$RUNNER_TEMP/hermes-agent" rev-parse HEAD
+      - run: HERMES_REPO="$RUNNER_TEMP/hermes-agent" MOONBITE_TEST_HOME="$RUNNER_TEMP/hermes-home" ./scripts/test-hermes-contract.sh

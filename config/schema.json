@@ -1,0 +1,268 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/beniedev/moonbite/blob/main/config/schema.json",
+  "title": "Moonbite config v1",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "config_version": {"const": 1},
+    "timezone": {"type": "string", "minLength": 1, "default": "UTC"},
+    "state": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "directory": {
+          "oneOf": [
+            {"type": "null"},
+            {"type": "string", "minLength": 1, "pattern": "\\S"}
+          ],
+          "default": null
+        }
+      }
+    },
+    "modules": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "runtime_core": {"const": true},
+        "heartbeat": {"type": "boolean", "default": false},
+        "autonomy": {"type": "boolean", "default": false},
+        "panel": {"type": "boolean", "default": false},
+        "memory": {"type": "boolean", "default": false}
+      }
+    },
+    "heartbeat": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "default_snooze_minutes": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1440,
+          "default": 120
+        },
+        "silence_backoff": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {"type": "boolean", "default": false},
+            "first_minutes": {"type": "integer", "minimum": 1, "maximum": 1440, "default": 120},
+            "repeat_minutes": {"type": "integer", "minimum": 1, "maximum": 1440, "default": 240},
+            "max_minutes": {"type": "integer", "minimum": 1, "maximum": 1440, "default": 240}
+          },
+          "default": {
+            "enabled": false,
+            "first_minutes": 120,
+            "repeat_minutes": 240,
+            "max_minutes": 240
+          }
+        },
+        "kinds": {
+          "type": "object",
+          "propertyNames": {"pattern": "^[a-z][a-z0-9_.-]{0,63}$"},
+          "additionalProperties": {"$ref": "#/$defs/heartbeatKind"},
+          "default": {
+            "day_close": {
+              "enabled": false,
+              "profile": "daily_anchor",
+              "judge": "required",
+              "host_only": true,
+              "bypass": []
+            },
+            "day_open": {
+              "enabled": false,
+              "profile": "daily_anchor",
+              "judge": "required",
+              "host_only": true,
+              "bypass": []
+            },
+            "urgent_care": {
+              "enabled": false,
+              "profile": "urgent",
+              "judge": "required",
+              "host_only": true,
+              "bypass": []
+            }
+          }
+        }
+      }
+    },
+    "delivery": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "adapter": {"enum": ["noop", "hermes_session"], "default": "noop"},
+        "target": {"type": ["string", "null"], "default": null}
+      },
+      "allOf": [
+        {
+          "if": {
+            "required": ["adapter"],
+            "properties": {"adapter": {"const": "hermes_session"}}
+          },
+          "then": {
+            "required": ["target"],
+            "properties": {
+              "target": {"type": "string", "minLength": 1, "pattern": "\\S"}
+            }
+          }
+        }
+      ]
+    },
+    "model_routes": {
+      "oneOf": [
+        {"type": "null"},
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["schema_version", "main", "heartbeat", "hippocampus"],
+          "properties": {
+            "schema_version": {"const": "moon.model_route_bindings.v1"},
+            "main": {"$ref": "#/$defs/route"},
+            "heartbeat": {"$ref": "#/$defs/route"},
+            "hippocampus": {"$ref": "#/$defs/route"}
+          }
+        }
+      ],
+      "default": null
+    },
+    "autonomy": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "providers": {
+          "type": "object",
+          "propertyNames": {"pattern": "^[a-z][a-z0-9_-]{0,63}$"},
+          "additionalProperties": {"$ref": "#/$defs/activityProvider"}
+        }
+      }
+    },
+    "panel": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "anchor_hour": {"type": "integer", "minimum": 0, "maximum": 23, "default": 6},
+        "activity_afterglow_minutes": {"type": "integer", "minimum": 1, "maximum": 1440, "default": 180}
+      }
+    },
+    "memory": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "search_limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 8},
+        "recall_enabled": {"type": "boolean", "default": false},
+        "recall_limit": {"type": "integer", "minimum": 1, "maximum": 20, "default": 4},
+        "resurfacing_enabled": {"type": "boolean", "default": false},
+        "resurfacing_limit": {"type": "integer", "minimum": 1, "maximum": 8, "default": 1},
+        "resurfacing_ttl_minutes": {"type": "integer", "minimum": 1, "maximum": 1440, "default": 180},
+        "resurfacing_cooldown_minutes": {"type": "integer", "minimum": 1, "maximum": 10080, "default": 1440},
+        "maintenance_enabled": {"type": "boolean", "default": false}
+      }
+    }
+  },
+  "$defs": {
+    "heartbeatKind": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {"type": "boolean", "default": false},
+        "profile": {
+          "enum": ["routine", "daily_anchor", "urgent", "maintenance"],
+          "default": "routine"
+        },
+        "judge": {
+          "enum": ["required", "skip"],
+          "default": "required"
+        },
+        "host_only": {"type": "boolean", "default": true},
+        "bypass": {
+          "type": "array",
+          "items": {"enum": ["automatic_cooldown", "manual_snooze"]},
+          "uniqueItems": true,
+          "default": []
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "not": {"required": ["profile"]}
+          },
+          "then": {
+            "properties": {
+              "judge": {"const": "required"},
+              "bypass": {"maxItems": 0}
+            }
+          }
+        },
+        {
+          "if": {
+            "required": ["profile"],
+            "properties": {"profile": {"const": "routine"}}
+          },
+          "then": {
+            "properties": {
+              "judge": {"const": "required"},
+              "bypass": {"maxItems": 0}
+            }
+          }
+        },
+        {
+          "if": {
+            "required": ["profile"],
+            "properties": {"profile": {"const": "daily_anchor"}}
+          },
+          "then": {
+            "properties": {
+              "judge": {"const": "required"},
+              "host_only": {"const": true},
+              "bypass": {
+                "maxItems": 1,
+                "items": {"const": "automatic_cooldown"}
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "required": ["profile"],
+            "properties": {"profile": {"const": "urgent"}}
+          },
+          "then": {
+            "properties": {
+              "judge": {"const": "required"},
+              "host_only": {"const": true}
+            }
+          }
+        },
+        {
+          "if": {
+            "required": ["profile"],
+            "properties": {"profile": {"const": "maintenance"}}
+          },
+          "then": {
+            "properties": {
+              "host_only": {"const": true},
+              "bypass": {"maxItems": 0}
+            }
+          }
+        }
+      ]
+    },
+    "route": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["alias"],
+      "properties": {
+        "alias": {"type": "string", "pattern": "^[a-z][a-z0-9_]{0,63}$"}
+      }
+    },
+    "activityProvider": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {"type": "boolean", "default": false},
+        "weight": {"type": "integer", "minimum": 1, "maximum": 100, "default": 1}
+      }
+    }
+  }
+}

@@ -1,0 +1,13 @@
+include README.md
+include README.zh-CN.md
+include AGENTS.md
+include SETUP.md
+include CHANGELOG.md
+include COMPATIBILITY.md
+include CONFIGURATION.md
+include DEPLOYMENT_COMPATIBILITY.md
+include DESIGN.md
+include SECURITY.md
+include plugin.yaml
+recursive-include config *.json *.yaml
+recursive-include docs *.md

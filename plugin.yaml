@@ -1,0 +1,23 @@
+manifest_version: 1
+name: moonbite
+version: 0.1.0.dev0
+description: "Persistent runtime primitives for long-running agents on Hermes Agent."
+author: "Bénie Studio"
+kind: standalone
+provides_tools:
+  - moonbite_status
+  - control_moonbite_runtime
+  - record_moonbite_event
+  - run_moonbite_heartbeat
+  - run_moonbite_autonomy
+  - get_moonbite_panel
+  - search_moonbite_memory
+  - open_moonbite_memory
+  - capture_moonbite_memory_card
+  - synthesize_moonbite_diary
+provides_hooks:
+  - pre_gateway_dispatch
+  - on_session_start
+  - pre_llm_call
+  - post_llm_call
+  - on_session_finalize

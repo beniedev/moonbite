@@ -1,0 +1,263 @@
+{
+  "schema_version": "moonbite.parity.effect_receipt_contract.v1",
+  "purpose": "Freeze effect intent, pending delivery, observable evidence, expiry, retry, and replay rejection.",
+  "owner_boundary": {
+    "portable": ["effect ledger", "state transitions", "receipt validation", "idempotency and replay rules"],
+    "host": ["delivery transport", "visible observation", "credential handling", "retry scheduling"]
+  },
+  "portable_invariants": [
+    "An intent is recorded before an effect is queued.",
+    "Queue acceptance is not visible execution and is never a verified receipt.",
+    "Every intent and pending path carries an idempotency key and source event reference.",
+    "Verified requires a non-empty receipt, source event, observation time, content hash, and content length.",
+    "Missing pending records and stale replays cannot become successful effects."
+  ],
+  "scenarios": [
+    {
+      "id": "intent_to_pending",
+      "given": {
+        "state": "intent",
+        "effect_id": "fixture-effect-001",
+        "idempotency_key": "fixture-idempotency-001",
+        "source_event_id": "fixture-event-effect-001"
+      },
+      "when": {
+        "operation": "enqueue_effect"
+      },
+      "expected": {
+        "terminal": "pending",
+        "state_path": ["intent", "pending"],
+        "pending_id": "fixture-pending-001",
+        "idempotency_key": "fixture-idempotency-001",
+        "source_event_id": "fixture-event-effect-001",
+        "queue_accepted": true,
+        "verified": false,
+        "evidence": {
+          "verified": false,
+          "kind": "delivery_receipt",
+          "receipt_id": null,
+          "event_id": null,
+          "observed_at": null,
+          "content_sha256": null,
+          "content_length": null
+        }
+      }
+    },
+    {
+      "id": "queue_accepted_is_unverified",
+      "given": {
+        "state": "pending",
+        "effect_id": "fixture-effect-002",
+        "idempotency_key": "fixture-idempotency-002",
+        "queue_result": "accepted",
+        "source_event_id": "fixture-event-effect-002"
+      },
+      "when": {
+        "operation": "record_queue_result"
+      },
+      "expected": {
+        "terminal": "executed_unverified",
+        "state_path": ["intent", "pending", "executed_unverified"],
+        "queue_accepted": true,
+        "idempotency_key": "fixture-idempotency-002",
+        "source_event_id": "fixture-event-effect-002",
+        "verified": false,
+        "evidence": {
+          "verified": false,
+          "kind": "delivery_receipt",
+          "receipt_id": null,
+          "event_id": null,
+          "observed_at": null,
+          "content_sha256": null,
+          "content_length": null
+        }
+      }
+    },
+    {
+      "id": "verified_receipt",
+      "given": {
+        "state": "executed_unverified",
+        "effect_id": "fixture-effect-003",
+        "idempotency_key": "fixture-idempotency-003",
+        "source_event_id": "fixture-event-effect-003"
+      },
+      "when": {
+        "operation": "accept_visible_receipt",
+        "receipt_id": "fixture-receipt-003"
+      },
+      "expected": {
+        "terminal": "verified",
+        "state_path": ["intent", "pending", "executed_unverified", "verified"],
+        "verified": true,
+        "idempotency_key": "fixture-idempotency-003",
+        "source_event_id": "fixture-event-effect-003",
+        "evidence": {
+          "verified": true,
+          "kind": "delivery_receipt",
+          "receipt_id": "fixture-receipt-003",
+          "event_id": "fixture-event-effect-003",
+          "observed_at": "2026-01-15T03:04:05Z",
+          "content_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "content_length": 128
+        }
+      }
+    },
+    {
+      "id": "failed_effect",
+      "given": {
+        "state": "pending",
+        "effect_id": "fixture-effect-004",
+        "idempotency_key": "fixture-idempotency-004",
+        "source_event_id": "fixture-event-effect-004",
+        "delivery_result": "permanent_error"
+      },
+      "when": {
+        "operation": "record_delivery_failure"
+      },
+      "expected": {
+        "terminal": "failed",
+        "state_path": ["intent", "pending", "failed"],
+        "idempotency_key": "fixture-idempotency-004",
+        "source_event_id": "fixture-event-effect-004",
+        "verified": false,
+        "retryable": false,
+        "fail_closed": true,
+        "evidence": {
+          "verified": false,
+          "kind": "delivery_receipt",
+          "receipt_id": null,
+          "event_id": null,
+          "observed_at": null,
+          "content_sha256": null,
+          "content_length": null
+        }
+      }
+    },
+    {
+      "id": "expired_pending",
+      "given": {
+        "state": "pending",
+        "effect_id": "fixture-effect-005",
+        "idempotency_key": "fixture-idempotency-005",
+        "source_event_id": "fixture-event-effect-005",
+        "expires_at": "2026-01-15T02:00:00Z"
+      },
+      "when": {
+        "operation": "expire_effect",
+        "observed_at": "2026-01-15T03:00:00Z"
+      },
+      "expected": {
+        "terminal": "expired",
+        "state_path": ["intent", "pending", "expired"],
+        "idempotency_key": "fixture-idempotency-005",
+        "source_event_id": "fixture-event-effect-005",
+        "verified": false,
+        "retryable": true,
+        "evidence": {
+          "verified": false,
+          "kind": "delivery_receipt",
+          "receipt_id": null,
+          "event_id": null,
+          "observed_at": null,
+          "content_sha256": null,
+          "content_length": null
+        }
+      }
+    },
+    {
+      "id": "expired_effect_requeued",
+      "given": {
+        "state": "expired",
+        "effect_id": "fixture-effect-006",
+        "idempotency_key": "fixture-idempotency-006",
+        "source_event_id": "fixture-event-effect-006"
+      },
+      "when": {
+        "operation": "requeue_effect",
+        "same_effect_id": true
+      },
+      "expected": {
+        "terminal": "requeued",
+        "state_path": ["expired", "requeued", "pending"],
+        "new_pending_id": "fixture-pending-006",
+        "idempotency_key": "fixture-idempotency-006",
+        "source_event_id": "fixture-event-effect-006",
+        "verified": false,
+        "idempotent": true,
+        "evidence": {
+          "verified": false,
+          "kind": "delivery_receipt",
+          "receipt_id": null,
+          "event_id": null,
+          "observed_at": null,
+          "content_sha256": null,
+          "content_length": null
+        }
+      }
+    },
+    {
+      "id": "missing_pending_reject",
+      "given": {
+        "state": "unknown",
+        "effect_id": "fixture-effect-007",
+        "idempotency_key": "fixture-idempotency-007",
+        "source_event_id": "fixture-event-effect-007",
+        "receipt_id": "fixture-receipt-007"
+      },
+      "when": {
+        "operation": "accept_visible_receipt"
+      },
+      "expected": {
+        "terminal": "rejected",
+        "reason": "missing_pending_record",
+        "idempotency_key": "fixture-idempotency-007",
+        "source_event_id": "fixture-event-effect-007",
+        "verified": false,
+        "synthetic_success": false,
+        "side_effect_count": 0,
+        "evidence": {
+          "verified": false,
+          "kind": "delivery_receipt",
+          "receipt_id": null,
+          "event_id": null,
+          "observed_at": null,
+          "content_sha256": null,
+          "content_length": null
+        }
+      }
+    },
+    {
+      "id": "stale_replay_reject",
+      "given": {
+        "state": "verified",
+        "effect_id": "fixture-effect-008",
+        "idempotency_key": "fixture-idempotency-008",
+        "source_event_id": "fixture-event-effect-008",
+        "receipt_id": "fixture-receipt-old-008",
+        "current_epoch": "fixture-epoch-new"
+      },
+      "when": {
+        "operation": "replay_receipt",
+        "receipt_epoch": "fixture-epoch-old"
+      },
+      "expected": {
+        "terminal": "rejected",
+        "reason": "stale_replay",
+        "idempotency_key": "fixture-idempotency-008",
+        "source_event_id": "fixture-event-effect-008",
+        "verified": false,
+        "synthetic_success": false,
+        "side_effect_count": 0,
+        "evidence": {
+          "verified": false,
+          "kind": "delivery_receipt",
+          "receipt_id": null,
+          "event_id": null,
+          "observed_at": null,
+          "content_sha256": null,
+          "content_length": null
+        }
+      }
+    }
+  ]
+}

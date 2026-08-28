@@ -1,0 +1,127 @@
+{
+  "schema_version": "moonbite.parity.state_owner_contract.v1",
+  "purpose": "Freeze state ownership and fail-closed write behavior for standalone and host-injected deployments.",
+  "owner_boundary": {
+    "portable": ["owner selection", "single-writer checks", "schema compatibility", "atomic failure semantics"],
+    "host": ["the concrete state backend", "durable storage location", "process lifecycle"]
+  },
+  "required_domains": ["event", "audit", "control", "cadence", "panel", "memory", "session", "effect"],
+  "portable_invariants": [
+    "A runtime has exactly one state owner for each owned domain.",
+    "An injected owner is authoritative and the portable runtime performs no local writes.",
+    "Partial injection and multiple writers are rejected before model or effect work.",
+    "A write error is visible, fail-closed, and cannot be reported as committed."
+  ],
+  "scenarios": [
+    {
+      "id": "standalone_owner",
+      "given": {
+        "mode": "standalone",
+        "owner": "fixture-owner-local",
+        "required_domains": ["event", "audit", "control", "cadence", "panel", "memory", "session", "effect"],
+        "injected_domains": [],
+        "owned_domains": ["event", "audit", "control", "cadence", "panel", "memory", "session", "effect"],
+        "local_writer": true
+      },
+      "when": {
+        "operation": "initialize_and_write",
+        "event_id": "fixture-event-001"
+      },
+      "expected": {
+        "terminal": "accepted",
+        "owner": "fixture-owner-local",
+        "local_writes": true,
+        "writer_count": 1,
+        "state_version": "fixture-state-v1"
+      }
+    },
+    {
+      "id": "injected_owner",
+      "given": {
+        "mode": "injected",
+        "owner": "fixture-owner-host",
+        "required_domains": ["event", "audit", "control", "cadence", "panel", "memory", "session", "effect"],
+        "injected_domains": ["event", "audit", "control", "cadence", "panel", "memory", "session", "effect"],
+        "local_writer": false
+      },
+      "when": {
+        "operation": "initialize_and_write",
+        "event_id": "fixture-event-002"
+      },
+      "expected": {
+        "terminal": "accepted",
+        "owner": "fixture-owner-host",
+        "local_writes": false,
+        "writer_count": 1,
+        "state_version": "fixture-state-v1"
+      }
+    },
+    {
+      "id": "partial_injection_reject",
+      "given": {
+        "mode": "injected",
+        "owner": "fixture-owner-host",
+        "injected_domains": ["event", "panel"],
+        "required_domains": ["event", "audit", "control", "cadence", "panel", "memory", "session", "effect"],
+        "local_writer": false
+      },
+      "when": {
+        "operation": "initialize",
+        "event_id": "fixture-event-003"
+      },
+      "expected": {
+        "terminal": "rejected",
+        "reason": "incomplete_owner_contract",
+        "local_writes": false,
+        "writer_count": 0,
+        "model_calls": 0
+      }
+    },
+    {
+      "id": "double_writer_reject",
+      "given": {
+        "mode": "injected",
+        "owner": "fixture-owner-host",
+        "required_domains": ["event", "audit", "control", "cadence", "panel", "memory", "session", "effect"],
+        "injected_domains": ["event", "audit", "control", "cadence", "panel", "memory", "session", "effect"],
+        "local_writer": true,
+        "second_writer": "fixture-owner-local"
+      },
+      "when": {
+        "operation": "claim_write_ownership",
+        "event_id": "fixture-event-004"
+      },
+      "expected": {
+        "terminal": "rejected",
+        "reason": "multiple_state_writers",
+        "local_writes": false,
+        "writer_count": 1,
+        "model_calls": 0
+      }
+    },
+    {
+      "id": "write_failure_fail_closed",
+      "given": {
+        "mode": "injected",
+        "owner": "fixture-owner-host",
+        "required_domains": ["event", "audit", "control", "cadence", "panel", "memory", "session", "effect"],
+        "injected_domains": ["event", "audit", "control", "cadence", "panel", "memory", "session", "effect"],
+        "write_result": "backend_error",
+        "existing_state_version": "fixture-state-v1"
+      },
+      "when": {
+        "operation": "append_event",
+        "event_id": "fixture-event-005"
+      },
+      "expected": {
+        "terminal": "failed",
+        "reason": "state_write_failed",
+        "fail_closed": true,
+        "commit_visible": false,
+        "local_writes": false,
+        "retry_required": true,
+        "existing_state_preserved": true
+      }
+    }
+  ]
+}

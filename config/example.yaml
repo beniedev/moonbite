@@ -1,0 +1,65 @@
+# Merge this settings-only fragment into the host's config.yaml. It is
+# deliberately inert and does not enable the plugin.
+plugins:
+  entries:
+    moonbite:
+      # Required only when delivery.adapter=hermes_session.
+      allow_gateway_injection: false
+      settings:
+        config:
+          config_version: 1
+          timezone: UTC
+          state:
+            directory: null
+          modules:
+            runtime_core: true
+            heartbeat: false
+            autonomy: false
+            panel: false
+            memory: false
+          heartbeat:
+            default_snooze_minutes: 120
+          delivery:
+            adapter: noop
+            target: null
+          model_routes:
+            schema_version: moon.model_route_bindings.v1
+            main:
+              alias: moon_main
+            heartbeat:
+              alias: moon_support
+            hippocampus:
+              alias: moon_support
+          autonomy:
+            providers:
+              local_reflection:
+                enabled: false
+                weight: 1
+              model_reflection:
+                enabled: false
+                weight: 1
+              # Host-fed, read-only examples. Neither performs network access.
+              paper_browse:
+                enabled: false
+                weight: 3
+              x_browse:
+                enabled: false
+                weight: 2
+          panel:
+            anchor_hour: 6
+            activity_afterglow_minutes: 180
+          memory:
+            search_limit: 8
+            recall_enabled: false
+            recall_limit: 4
+            resurfacing_enabled: false
+            resurfacing_limit: 1
+            resurfacing_ttl_minutes: 180
+            resurfacing_cooldown_minutes: 1440
+            maintenance_enabled: false
+
+# Moonbite registers these task keys; the host owns their actual routes.
+# Configure them with `hermes model` after enabling the plugin, or under:
+# auxiliary:
+#   moon_main: {provider: auto, model: ""}
+#   moon_support: {provider: auto, model: ""}

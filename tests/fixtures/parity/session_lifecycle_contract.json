@@ -1,0 +1,160 @@
+{
+  "schema_version": "moonbite.parity.session_lifecycle_contract.v1",
+  "purpose": "Freeze session source classification, hook idempotency, and persistence failure handling.",
+  "owner_boundary": {
+    "portable": ["source classification", "session lifecycle ordering", "deduplication", "failure visibility"],
+    "host": ["gateway payload mapping", "session storage", "transport-specific identity"]
+  },
+  "portable_invariants": [
+    "Only a fresh private inbound user source can establish contact.",
+    "Session start, assistant output, cron, workroom, system, and tool material are not private contact.",
+    "Repeated hooks for one source are idempotent.",
+    "Finalize persistence failures remain visible and preserve retryable source material."
+  ],
+  "scenarios": [
+    {
+      "id": "fresh_private_inbound",
+      "given": {
+        "source_kind": "private_inbound",
+        "fresh": true,
+        "session_id": "fixture-session-001",
+        "source_id": "fixture-source-001"
+      },
+      "when": {
+        "hook": "pre_llm",
+        "operation": "classify_source"
+      },
+      "expected": {
+        "terminal": "accepted",
+        "counts_as_private_contact": true,
+        "source_id": "fixture-source-001",
+        "assistant_output_contact": false,
+        "session_start_contact": false
+      }
+    },
+    {
+      "id": "cron_workroom_system_isolation",
+      "given": {
+        "sources": ["cron", "workroom", "system", "tool", "assistant_response", "session_start"],
+        "fresh": true,
+        "session_id": "fixture-session-002"
+      },
+      "when": {
+        "hook": "pre_llm_and_post_llm",
+        "operation": "classify_sources"
+      },
+      "expected": {
+        "terminal": "isolated",
+        "counts_as_private_contact": false,
+        "private_contact_count": 0,
+        "source_decisions": {
+          "cron": "isolated",
+          "workroom": "isolated",
+          "system": "isolated",
+          "tool": "isolated",
+          "assistant_response": "isolated",
+          "session_start": "isolated"
+        }
+      }
+    },
+    {
+      "id": "duplicate_hook",
+      "given": {
+        "source_kind": "private_inbound",
+        "fresh": true,
+        "session_id": "fixture-session-003",
+        "source_id": "fixture-source-003",
+        "hook_count": 2
+      },
+      "when": {
+        "hook": "pre_llm",
+        "operation": "record_source"
+      },
+      "expected": {
+        "terminal": "deduplicated",
+        "counts_as_private_contact": true,
+        "persisted_source_count": 1,
+        "side_effect_count": 1,
+        "duplicate_ignored": true
+      }
+    },
+    {
+      "id": "stale_source",
+      "given": {
+        "source_kind": "private_inbound",
+        "fresh": false,
+        "session_id": "fixture-session-004",
+        "source_id": "fixture-source-old-004",
+        "latest_source_id": "fixture-source-new-004"
+      },
+      "when": {
+        "hook": "pre_llm",
+        "operation": "classify_source"
+      },
+      "expected": {
+        "terminal": "rejected",
+        "reason": "stale_source",
+        "counts_as_private_contact": false,
+        "pending_source": false,
+        "model_calls": 0
+      }
+    },
+    {
+      "id": "finalize_persistence_failure",
+      "given": {
+        "source_kind": "private_inbound",
+        "fresh": true,
+        "session_id": "fixture-session-005",
+        "raw_material": "fixture-raw-material-005",
+        "writer_result": "backend_error"
+      },
+      "when": {
+        "hook": "on_session_finalize",
+        "operation": "flush_session"
+      },
+      "expected": {
+        "terminal": "failed",
+        "reason": "session_persistence_failed",
+        "fail_closed": true,
+        "raw_material_preserved": true,
+        "retry_required": true,
+        "session_state_cleared": false
+      }
+    },
+    {
+      "id": "ordered_hook_lifecycle",
+      "given": {
+        "source_kind": "private_inbound",
+        "fresh": true,
+        "session_id": "fixture-session-006",
+        "settled": true,
+        "hooks": [
+          "pre_gateway_dispatch",
+          "on_session_start",
+          "pre_llm_call",
+          "post_llm_call",
+          "on_session_finalize"
+        ]
+      },
+      "when": {
+        "operation": "run_session_lifecycle"
+      },
+      "expected": {
+        "terminal": "accepted",
+        "hook_order": [
+          "pre_gateway_dispatch",
+          "on_session_start",
+          "pre_llm_call",
+          "post_llm_call",
+          "on_session_finalize"
+        ],
+        "settled_before_finalize": true,
+        "invalid_variants": [
+          {"name": "duplicate_hook", "terminal": "rejected", "reason": "duplicate_hook"},
+          {"name": "missing_hook", "terminal": "rejected", "reason": "missing_hook"},
+          {"name": "out_of_order", "terminal": "rejected", "reason": "hook_order_violation"}
+        ]
+      }
+    }
+  ]
+}

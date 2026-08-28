@@ -1,0 +1,381 @@
+{
+  "valid": [
+    {"id": "defaults", "config": {}},
+    {
+      "id": "relative_state_path",
+      "config": {"state": {"directory": "moonbite-private"}}
+    },
+    {
+      "id": "targeted_session_adapter",
+      "config": {
+        "delivery": {"adapter": "hermes_session", "target": "main-session"}
+      }
+    },
+    {
+      "id": "complete_routes",
+      "config": {
+        "model_routes": {
+          "schema_version": "moon.model_route_bindings.v1",
+          "main": {"alias": "moon_main"},
+          "heartbeat": {"alias": "moon_support"},
+          "hippocampus": {"alias": "moon_support"}
+        }
+      }
+    },
+    {
+      "id": "heartbeat_custom_kind_with_defaults",
+      "config": {
+        "heartbeat": {
+          "kinds": {
+            "scene.v1-foo": {}
+          }
+        }
+      }
+    },
+    {
+      "id": "heartbeat_routine_custom_kind",
+      "config": {
+        "heartbeat": {
+          "kinds": {
+            "routine_probe": {
+              "enabled": true,
+              "profile": "routine",
+              "judge": "required",
+              "host_only": false,
+              "bypass": []
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "heartbeat_daily_anchor_automatic_bypass",
+      "config": {
+        "heartbeat": {
+          "kinds": {
+            "anchor_probe": {
+              "profile": "daily_anchor",
+              "judge": "required",
+              "host_only": true,
+              "bypass": ["automatic_cooldown"]
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "heartbeat_urgent_both_bypasses",
+      "config": {
+        "heartbeat": {
+          "kinds": {
+            "urgent_probe": {
+              "profile": "urgent",
+              "judge": "required",
+              "host_only": true,
+              "bypass": ["automatic_cooldown", "manual_snooze"]
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "heartbeat_maintenance_skip_judge",
+      "config": {
+        "heartbeat": {
+          "kinds": {
+            "maintenance_probe": {
+              "profile": "maintenance",
+              "judge": "skip",
+              "host_only": true,
+              "bypass": []
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "memory_boundary_values",
+      "config": {
+        "memory": {
+          "search_limit": 1,
+          "recall_enabled": true,
+          "recall_limit": 20,
+          "resurfacing_enabled": true,
+          "resurfacing_limit": 8,
+          "resurfacing_ttl_minutes": 1440,
+          "resurfacing_cooldown_minutes": 10080,
+          "maintenance_enabled": true
+        }
+      }
+    }
+  ],
+  "invalid": [
+    {"id": "empty_state_path", "config": {"state": {"directory": ""}}},
+    {"id": "blank_state_path", "config": {"state": {"directory": "   "}}},
+    {
+      "id": "session_target_missing",
+      "config": {"delivery": {"adapter": "hermes_session"}}
+    },
+    {
+      "id": "session_target_null",
+      "config": {"delivery": {"adapter": "hermes_session", "target": null}}
+    },
+    {
+      "id": "session_target_blank",
+      "config": {"delivery": {"adapter": "hermes_session", "target": " "}}
+    },
+    {"id": "unknown_top_level", "config": {"mystery_switch": true}},
+    {
+      "id": "inline_route_provider",
+      "config": {
+        "model_routes": {
+          "schema_version": "moon.model_route_bindings.v1",
+          "main": {"alias": "moon_main", "provider": "forbidden"},
+          "heartbeat": {"alias": "moon_support"},
+          "hippocampus": {"alias": "moon_support"}
+        }
+      }
+    },
+    {
+      "id": "memory_unknown_field",
+      "config": {"memory": {"unknown": true}}
+    },
+    {
+      "id": "memory_recall_limit_low",
+      "config": {"memory": {"recall_limit": 0}}
+    },
+    {
+      "id": "memory_resurfacing_cooldown_high",
+      "config": {"memory": {"resurfacing_cooldown_minutes": 10081}}
+    },
+    {
+      "id": "memory_enabled_wrong_type",
+      "config": {"memory": {"recall_enabled": 1}}
+    },
+    {
+      "id": "heartbeat_kind_name_invalid",
+      "config": {
+        "heartbeat": {
+          "kinds": {
+            "BadKind": {}
+          }
+        }
+      }
+    },
+    {
+      "id": "heartbeat_kind_unknown_field",
+      "config": {
+        "heartbeat": {
+          "kinds": {
+            "custom_kind": {"unknown": true}
+          }
+        }
+      }
+    },
+    {
+      "id": "heartbeat_kind_bad_enabled_type",
+      "config": {
+        "heartbeat": {
+          "kinds": {
+            "custom_kind": {"enabled": 1}
+          }
+        }
+      }
+    },
+    {
+      "id": "heartbeat_kind_bad_profile",
+      "config": {
+        "heartbeat": {
+          "kinds": {
+            "custom_kind": {"profile": "critical"}
+          }
+        }
+      }
+    },
+    {
+      "id": "heartbeat_kind_profile_bad_type",
+      "config": {
+        "heartbeat": {
+          "kinds": {
+            "custom_kind": {"profile": ["routine"]}
+          }
+        }
+      }
+    },
+    {
+      "id": "heartbeat_kind_bad_judge",
+      "config": {
+        "heartbeat": {
+          "kinds": {
+            "custom_kind": {"judge": "optional"}
+          }
+        }
+      }
+    },
+    {
+      "id": "heartbeat_kind_judge_bad_type",
+      "config": {
+        "heartbeat": {
+          "kinds": {
+            "custom_kind": {"judge": ["required"]}
+          }
+        }
+      }
+    },
+    {
+      "id": "heartbeat_kind_bypass_not_list",
+      "config": {
+        "heartbeat": {
+          "kinds": {
+            "custom_kind": {"bypass": "manual_snooze"}
+          }
+        }
+      }
+    },
+    {
+      "id": "heartbeat_kind_bypass_unknown",
+      "config": {
+        "heartbeat": {
+          "kinds": {
+            "custom_kind": {"bypass": ["unknown"]}
+          }
+        }
+      }
+    },
+    {
+      "id": "heartbeat_kind_bypass_item_bad_type",
+      "config": {
+        "heartbeat": {
+          "kinds": {
+            "custom_kind": {"bypass": [1]}
+          }
+        }
+      }
+    },
+    {
+      "id": "heartbeat_kind_bypass_duplicate",
+      "config": {
+        "heartbeat": {
+          "kinds": {
+            "custom_kind": {
+              "profile": "urgent",
+              "host_only": true,
+              "bypass": ["manual_snooze", "manual_snooze"]
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "heartbeat_kind_omitted_profile_bypass_forbidden",
+      "config": {
+        "heartbeat": {
+          "kinds": {
+            "custom_kind": {"bypass": ["manual_snooze"]}
+          }
+        }
+      }
+    },
+    {
+      "id": "heartbeat_kind_omitted_profile_judge_skip_forbidden",
+      "config": {
+        "heartbeat": {
+          "kinds": {
+            "custom_kind": {"judge": "skip"}
+          }
+        }
+      }
+    },
+    {
+      "id": "heartbeat_routine_bypass_forbidden",
+      "config": {
+        "heartbeat": {
+          "kinds": {
+            "routine_probe": {"profile": "routine", "bypass": ["manual_snooze"]}
+          }
+        }
+      }
+    },
+    {
+      "id": "heartbeat_routine_judge_skip_forbidden",
+      "config": {
+        "heartbeat": {
+          "kinds": {
+            "routine_probe": {"profile": "routine", "judge": "skip"}
+          }
+        }
+      }
+    },
+    {
+      "id": "heartbeat_daily_anchor_manual_bypass_forbidden",
+      "config": {
+        "heartbeat": {
+          "kinds": {
+            "anchor_probe": {
+              "profile": "daily_anchor",
+              "host_only": true,
+              "bypass": ["manual_snooze"]
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "heartbeat_daily_anchor_host_only_required",
+      "config": {
+        "heartbeat": {
+          "kinds": {
+            "anchor_probe": {
+              "profile": "daily_anchor",
+              "host_only": false
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "heartbeat_urgent_judge_required",
+      "config": {
+        "heartbeat": {
+          "kinds": {
+            "urgent_probe": {"profile": "urgent", "judge": "skip"}
+          }
+        }
+      }
+    },
+    {
+      "id": "heartbeat_urgent_host_only_required",
+      "config": {
+        "heartbeat": {
+          "kinds": {
+            "urgent_probe": {"profile": "urgent", "host_only": false}
+          }
+        }
+      }
+    },
+    {
+      "id": "heartbeat_maintenance_bypass_forbidden",
+      "config": {
+        "heartbeat": {
+          "kinds": {
+            "maintenance_probe": {
+              "profile": "maintenance",
+              "host_only": true,
+              "bypass": ["automatic_cooldown"]
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "heartbeat_maintenance_host_only_required",
+      "config": {
+        "heartbeat": {
+          "kinds": {
+            "maintenance_probe": {"profile": "maintenance", "host_only": false}
+          }
+        }
+      }
+    }
+  ]
+}

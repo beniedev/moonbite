@@ -1,0 +1,23 @@
+config_version: 1
+timezone: UTC
+state:
+  directory: null
+modules:
+  runtime_core: true
+  heartbeat: false
+  autonomy: false
+  panel: false
+  memory: true
+delivery:
+  adapter: noop
+  target: null
+model_routes: null
+memory:
+  search_limit: 8
+  recall_enabled: false
+  recall_limit: 4
+  resurfacing_enabled: false
+  resurfacing_limit: 1
+  resurfacing_ttl_minutes: 180
+  resurfacing_cooldown_minutes: 1440
+  maintenance_enabled: false

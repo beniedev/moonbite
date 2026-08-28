@@ -1,0 +1,372 @@
+{
+  "schema_version": "moonbite.heartbeat_contract.v2",
+  "reference_now": "2025-01-15T03:00:00Z",
+  "kind_policies": {
+    "routine": {
+      "enabled": true,
+      "profile": "routine",
+      "judge": "required",
+      "host_only": false,
+      "bypass": []
+    },
+    "daily_anchor": {
+      "enabled": true,
+      "profile": "daily_anchor",
+      "judge": "required",
+      "host_only": true,
+      "bypass": ["automatic_cooldown"]
+    },
+    "urgent": {
+      "enabled": true,
+      "profile": "urgent",
+      "judge": "required",
+      "host_only": true,
+      "bypass": ["automatic_cooldown", "manual_snooze"]
+    },
+    "connector_failure_normalized": {
+      "enabled": true,
+      "profile": "urgent",
+      "judge": "required",
+      "host_only": true,
+      "bypass": ["automatic_cooldown", "manual_snooze"]
+    }
+  },
+  "scenarios": [
+    {
+      "id": "manual_snooze_blocks_silence_check",
+      "events": [
+        {
+          "id": "silence-check",
+          "type": "silence_check_candidate",
+          "priority": 40,
+          "urgency": "medium",
+          "payload": {
+            "candidate_key": "silence_check",
+            "reasons": ["activity=idle_2m;status=fresh;age=1m"]
+          }
+        }
+      ],
+      "seed": {
+        "judge_hints": [
+          {
+            "kind": "manual_snooze",
+            "event_id": "snooze_manual_001",
+            "created_at": "2025-01-15T01:00:00Z",
+            "expires_at": "2025-01-15T07:00:00Z"
+          }
+        ],
+        "private_user_message_at": "2025-01-15T01:30:00Z"
+      },
+      "expected": {
+        "action": "skip",
+        "consult_reason_mode": "snoozed_prefix",
+        "consulted_model": false,
+        "decision": {
+          "reason_code": "not_due",
+          "wake_main": false,
+          "dm_user": false,
+          "should_poke": false,
+          "allow_autonomy": false,
+          "run_maintenance": false
+        }
+      }
+    },
+    {
+      "id": "fresh_input_keeps_manual_snooze",
+      "events": [
+        {
+          "id": "silence-check-2",
+          "type": "silence_check_candidate",
+          "priority": 40,
+          "urgency": "medium",
+          "payload": {
+            "candidate_key": "silence_check",
+            "reasons": ["activity=idle_2m;status=fresh;age=1m"]
+          }
+        }
+      ],
+      "seed": {
+        "judge_hints": [
+          {
+            "kind": "manual_snooze",
+            "event_id": "snooze_manual_001",
+            "created_at": "2025-01-15T01:00:00Z",
+            "expires_at": "2025-01-15T07:00:00Z"
+          }
+        ],
+        "private_user_message_at": "2025-01-15T02:30:00Z"
+      },
+      "expected": {
+        "action": "skip",
+        "consult_reason_mode": "snoozed_prefix",
+        "consulted_model": false,
+        "decision": {
+          "reason_code": "not_due",
+          "wake_main": false,
+          "dm_user": false,
+          "should_poke": false,
+          "allow_autonomy": false,
+          "run_maintenance": false
+        }
+      }
+    },
+    {
+      "id": "daily_anchor_manual_snooze_blocked",
+      "events": [
+        {
+          "id": "day-open-1",
+          "type": "day_open_candidate"
+        }
+      ],
+      "seed": {
+        "judge_hints": [
+          {
+            "kind": "manual_snooze",
+            "event_id": "snooze_manual_001",
+            "created_at": "2025-01-15T01:00:00Z",
+            "expires_at": "2025-01-15T07:00:00Z"
+          }
+        ],
+        "private_user_message_at": "2025-01-15T02:30:00Z"
+      },
+      "expected": {
+        "action": "skip",
+        "consult_reason_mode": "exact",
+        "consult_reason": "manual_snooze",
+        "consulted_model": false,
+        "decision": {
+          "reason_code": "manual_snooze",
+          "wake_main": false,
+          "dm_user": false,
+          "should_poke": false,
+          "allow_autonomy": false,
+          "run_maintenance": false
+        }
+      }
+    },
+    {
+      "id": "urgent_explicit_bypass",
+      "events": [
+        {
+          "id": "urgent-1",
+          "type": "urgent_care_hint"
+        }
+      ],
+      "seed": {
+        "judge_hints": [
+          {
+            "kind": "manual_snooze",
+            "event_id": "snooze_manual_001",
+            "created_at": "2025-01-15T01:00:00Z",
+            "expires_at": "2025-01-15T07:00:00Z"
+          },
+          {
+            "kind": "urgent_care",
+            "created_at": "2025-01-15T01:00:00Z",
+            "expires_at": "2025-01-15T07:00:00Z"
+          }
+        ],
+        "private_user_message_at": "2025-01-15T02:30:00Z"
+      },
+      "expected": {
+        "action": "judge",
+        "consult_reason_mode": "exact",
+        "consult_reason": "urgent_care_hint",
+        "consulted_model": false,
+        "decision": {
+          "reason_code": "urgent_care_due",
+          "wake_main": true,
+          "dm_user": true,
+          "should_poke": true,
+          "allow_autonomy": false,
+          "run_maintenance": false
+        }
+      }
+    },
+    {
+      "id": "emotional_repair_unconfigured_blocks",
+      "events": [
+        {
+          "id": "repair-1",
+          "type": "emotional_repair_candidate",
+          "priority": 20
+        }
+      ],
+      "seed": {
+        "judge_hints": [
+          {
+            "kind": "manual_snooze",
+            "event_id": "snooze_manual_001",
+            "created_at": "2025-01-15T01:00:00Z",
+            "expires_at": "2025-01-15T07:00:00Z"
+          }
+        ],
+        "private_user_message_at": "2025-01-15T02:30:00Z"
+      },
+      "expected": {
+        "action": "skip",
+        "consult_reason_mode": "exact",
+        "consult_reason": "manual_snooze",
+        "consulted_model": false,
+        "decision": {
+          "reason_code": "no_model_dry_run",
+          "wake_main": false,
+          "dm_user": false,
+          "should_poke": false,
+          "allow_autonomy": false,
+          "run_maintenance": false
+        }
+      }
+    },
+    {
+      "id": "critical_ops_unconfigured_blocks",
+      "events": [
+        {
+          "id": "critical-1",
+          "type": "critical_ops"
+        }
+      ],
+      "seed": {
+        "judge_hints": [
+          {
+            "kind": "manual_snooze",
+            "event_id": "snooze_manual_001",
+            "created_at": "2025-01-15T01:00:00Z",
+            "expires_at": "2025-01-15T07:00:00Z"
+          }
+        ],
+        "private_user_message_at": "2025-01-15T02:30:00Z"
+      },
+      "expected": {
+        "action": "skip",
+        "consult_reason_mode": "exact",
+        "consult_reason": "manual_snooze",
+        "consulted_model": false,
+        "decision": {
+          "reason_code": "no_model_dry_run",
+          "wake_main": false,
+          "dm_user": false,
+          "should_poke": false,
+          "allow_autonomy": false,
+          "run_maintenance": false
+        }
+      }
+    },
+    {
+      "id": "expired_snooze_no_longer_blocks",
+      "events": [
+        {
+          "id": "care-1",
+          "type": "silence_check_candidate",
+          "priority": 20,
+          "payload": {
+            "candidate_key": "extended_silence_check"
+          }
+        }
+      ],
+      "seed": {
+        "judge_hints": [
+          {
+            "kind": "expired_snooze",
+            "created_at": "2026-07-18T23:00:00Z",
+            "expires_at": "2025-01-15T00:00:00Z"
+          }
+        ],
+        "private_user_message_at": "2025-01-15T02:30:00Z"
+      },
+      "expected": {
+        "action": "judge",
+        "consult_reason_mode": "exact",
+        "consult_reason": "soft_event_immediate",
+        "consulted_model": false,
+        "decision": {
+          "reason_code": "no_model_dry_run",
+          "wake_main": false,
+          "dm_user": false,
+          "should_poke": false,
+          "allow_autonomy": false,
+          "run_maintenance": false
+        }
+      }
+    },
+    {
+      "id": "resumed_snooze_no_longer_blocks",
+      "events": [
+        {
+          "id": "care-2",
+          "type": "silence_check_candidate",
+          "priority": 20,
+          "payload": {
+            "candidate_key": "extended_silence_check"
+          }
+        }
+      ],
+      "seed": {
+        "judge_hints": [
+          {
+            "kind": "manual_snooze",
+            "event_id": "snooze_manual_001",
+            "created_at": "2025-01-15T01:00:00Z",
+            "expires_at": "2025-01-15T07:00:00Z"
+          },
+          {
+            "kind": "resume_clear",
+            "event_id": "snooze_resume_001",
+            "target_event_id": "snooze_manual_001",
+            "created_at": "2025-01-15T02:00:00Z",
+            "expires_at": "2025-01-15T08:00:00Z"
+          }
+        ],
+        "private_user_message_at": "2025-01-15T02:30:00Z"
+      },
+      "expected": {
+        "action": "judge",
+        "consult_reason_mode": "exact",
+        "consult_reason": "soft_event_immediate",
+        "consulted_model": false,
+        "decision": {
+          "reason_code": "no_model_dry_run",
+          "wake_main": false,
+          "dm_user": false,
+          "should_poke": false,
+          "allow_autonomy": false,
+          "run_maintenance": false
+        }
+      }
+    },
+    {
+      "id": "connector_failed_suffix_unconfigured_blocks",
+      "events": [
+        {
+          "id": "connector-fail-1",
+          "type": "connector.failed"
+        }
+      ],
+      "seed": {
+        "judge_hints": [
+          {
+            "kind": "manual_snooze",
+            "event_id": "snooze_manual_001",
+            "created_at": "2025-01-15T01:00:00Z",
+            "expires_at": "2025-01-15T07:00:00Z"
+          }
+        ],
+        "private_user_message_at": "2025-01-15T02:30:00Z"
+      },
+      "expected": {
+        "action": "skip",
+        "consult_reason_mode": "exact",
+        "consult_reason": "manual_snooze",
+        "consulted_model": false,
+        "decision": {
+          "reason_code": "no_model_dry_run",
+          "wake_main": false,
+          "dm_user": false,
+          "should_poke": false,
+          "allow_autonomy": false,
+          "run_maintenance": false
+        }
+      }
+    }
+  ]
+}

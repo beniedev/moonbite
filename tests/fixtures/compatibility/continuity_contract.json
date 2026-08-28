@@ -1,0 +1,119 @@
+{
+  "schema_version": "moonbite.continuity_contract.v1",
+  "bridge_state": {
+    "dirty": true,
+    "latest_platform": "sample_transport",
+    "latest_chat_type": "direct",
+    "latest_user_id": "fixture-user-001",
+    "latest_user_message_at": "2025-01-15T01:00:00-07:00",
+    "latest_user_excerpt": "Please review this synthetic sample later."
+  },
+  "turn_source": {
+    "session_id": "direct-session",
+    "user_message": "Please review this synthetic sample later.",
+    "kwargs": {
+      "platform": "sample_transport",
+      "sender_id": "fixture-user-001",
+      "is_cron_session": false
+    },
+    "expected_source_prefix": "turn_",
+    "rejected_message": "[internal:wake] scheduler probe",
+    "expected_pending_absent": true
+  },
+  "auto_hint": {
+    "source_id": "turn_20250115T010000000Z_current",
+    "session_id": "direct-session",
+    "summary": "future idea",
+    "hint": {
+      "topic": "future idea",
+      "hint_type": "exploration",
+      "prefer_activity": ["repo_explore"]
+    },
+    "confidence": 0.78,
+    "ttl_seconds": 7200,
+    "expected_emit": {
+      "source_ids": ["turn_20250115T010000000Z_current"],
+      "audience": ["autonomy"],
+      "ttl_seconds": 7200,
+      "notify_system_audit": false,
+      "producer_prefix": "continuity_adapter:auto_turn_hint:",
+      "hint_type": "exploration",
+      "target": "autonomy_tick",
+      "lifecycle_action": "created",
+      "topic": "future idea",
+      "prefer_activity": ["repo_explore"]
+    },
+    "expected_dedupe": {
+      "status": "deduped",
+      "created": false,
+      "reason": "source_turn_already_used",
+      "event_id": "hint_auto_001"
+    }
+  },
+  "no_fresh_source": {
+    "expected_reason": "no_fresh_user_turn_source",
+    "emit_calls": 0
+  },
+  "pre_llm": {
+    "kwargs": {
+      "user_message": "Please review this synthetic sample later.",
+      "is_first_turn": true,
+      "session_id": "direct-session",
+      "platform": "sample_transport",
+      "sender_id": "fixture-user-001",
+      "is_cron_session": false
+    },
+    "expected": {
+      "result": null,
+      "token_prefix": "turn_",
+      "injection_calls": 0
+    }
+  },
+  "post_llm": {
+    "kwargs": {
+      "user_message": "Please review this synthetic sample later.",
+      "assistant_response": "fixture reply",
+      "session_id": "direct-session",
+      "platform": "sample_transport",
+      "chat_id": "fixture-direct-001",
+      "is_cron_session": false,
+      "model": "fixture-model"
+    },
+    "expected_ledger": [
+      {
+        "name": "bridge_mark_dirty",
+        "chat_type": "direct",
+        "platform": "sample_transport"
+      },
+      {
+        "name": "bridge_auto_complete",
+        "decision_reason": ""
+      },
+      {
+        "name": "executor_submit"
+      },
+      {
+        "name": "bridge_complete_from_poke",
+        "session_id": "direct-session",
+        "decision_reason": ""
+      },
+      {
+        "name": "complete_main_wake",
+        "session_id": "direct-session",
+        "decision_reason": "",
+        "explicit_delivery": false
+      }
+    ],
+    "rejecting": ["_bridge_db_connect", "_get_service"]
+  },
+  "finalize": {
+    "session_id": "direct-session",
+    "last_raw_date": "2025-01-15",
+    "expected": {
+      "flush_calls": 1,
+      "consolidate_calls": 0,
+      "session_cleared": true,
+      "pending_post_llm_cleared": true
+    }
+  }
+}

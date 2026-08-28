@@ -1,0 +1,158 @@
+{
+  "schema_version": "moonbite.parity.memory_orchestration_contract.v1",
+  "purpose": "Freeze source reference, exact open, exposure and use evidence, writer gates, and archive-only retention.",
+  "owner_boundary": {
+    "portable": ["source references", "exact-open requests", "exposure and consumption evidence", "writer approval and archive policy"],
+    "host": ["memory backend", "private source content", "retrieval indexes", "scheduler and model route"]
+  },
+  "portable_invariants": [
+    "A source reference resolves to an exact item before content is used.",
+    "Exposure is not use and use is not consumption without reply-use evidence.",
+    "Writer failure preserves source material and is visible to the caller.",
+    "Approval-required writes remain pending until approved.",
+    "Automation may archive but may not perform removal; removal is outside this contract.",
+    "Historical material is framed by event date rather than creation time."
+  ],
+  "scenarios": [
+    {
+      "id": "source_ref_to_exact_open",
+      "given": {
+        "source_ref": "fixture-source-memory-001",
+        "candidate_id": "fixture-candidate-001",
+        "index_match": true,
+        "exact_item_id": "fixture-memory-item-001"
+      },
+      "when": {
+        "operation": "resolve_and_open"
+      },
+      "expected": {
+        "terminal": "opened",
+        "source_ref": "fixture-source-memory-001",
+        "exact_item_id": "fixture-memory-item-001",
+        "content_used": true,
+        "source_missing": false
+      }
+    },
+    {
+      "id": "exposed_not_used",
+      "given": {
+        "source_ref": "fixture-source-memory-002",
+        "candidate_id": "fixture-candidate-002",
+        "exact_item_id": "fixture-memory-item-002",
+        "exposure_count": 1,
+        "reply_use_evidence": false
+      },
+      "when": {
+        "operation": "record_context_exposure"
+      },
+      "expected": {
+        "terminal": "exposed",
+        "exposed": true,
+        "used": false,
+        "consumed": false,
+        "consumption_reason": null
+      }
+    },
+    {
+      "id": "reply_use_marks_consumed",
+      "given": {
+        "source_ref": "fixture-source-memory-003",
+        "candidate_id": "fixture-candidate-003",
+        "exact_item_id": "fixture-memory-item-003",
+        "exposed": true,
+        "reply_use_evidence": true,
+        "reply_id": "fixture-reply-003"
+      },
+      "when": {
+        "operation": "record_reply_use"
+      },
+      "expected": {
+        "terminal": "consumed",
+        "exposed": true,
+        "used": true,
+        "consumed": true,
+        "consumption_reason": "reply_use",
+        "reply_id": "fixture-reply-003"
+      }
+    },
+    {
+      "id": "writer_failure",
+      "given": {
+        "source_ref": "fixture-source-memory-004",
+        "candidate_id": "fixture-candidate-004",
+        "writer_result": "backend_error",
+        "source_preserved": true
+      },
+      "when": {
+        "operation": "write_memory_item"
+      },
+      "expected": {
+        "terminal": "failed",
+        "reason": "memory_writer_failed",
+        "fail_closed": true,
+        "source_preserved": true,
+        "item_visible_as_committed": false,
+        "retry_required": true
+      }
+    },
+    {
+      "id": "approval_required",
+      "given": {
+        "source_ref": "fixture-source-memory-005",
+        "candidate_id": "fixture-candidate-005",
+        "sensitivity": "approval_required",
+        "approval": "missing"
+      },
+      "when": {
+        "operation": "propose_memory_write"
+      },
+      "expected": {
+        "terminal": "pending",
+        "reason": "approval_required",
+        "write_performed": false,
+        "approval_requested": true,
+        "source_preserved": true
+      }
+    },
+    {
+      "id": "archive_only_retention",
+      "given": {
+        "source_ref": "fixture-source-memory-006",
+        "candidate_id": "fixture-candidate-006",
+        "lifecycle": "active",
+        "retention_mode": "archive_only"
+      },
+      "when": {
+        "operation": "archive_memory_item"
+      },
+      "expected": {
+        "terminal": "archived",
+        "lifecycle": "archived",
+        "retention_mode": "archive_only",
+        "active": false,
+        "removal_operation": "outside_contract",
+        "source_preserved": true
+      }
+    },
+    {
+      "id": "historical_date_framing",
+      "given": {
+        "source_ref": "fixture-source-memory-007",
+        "candidate_id": "fixture-candidate-007",
+        "event_date": "2024-05-01",
+        "created_at": "2026-01-15T03:00:00Z",
+        "current_epoch": "2026-01-15"
+      },
+      "when": {
+        "operation": "open_for_context"
+      },
+      "expected": {
+        "terminal": "opened",
+        "framing": "historical",
+        "framing_date_field": "event_date",
+        "presented_as_current": false,
+        "exact_item_id": "fixture-candidate-007"
+      }
+    }
+  ]
+}

@@ -1,0 +1,23 @@
+# Example final loader state after `hermes plugins enable moonbite`.
+plugins:
+  enabled:
+    - moonbite
+  entries:
+    moonbite:
+      allow_gateway_injection: false
+      settings:
+        config:
+          config_version: 1
+          timezone: UTC
+          state:
+            directory: null
+          modules:
+            runtime_core: true
+            heartbeat: false
+            autonomy: false
+            panel: false
+            memory: false
+          delivery:
+            adapter: noop
+            target: null
+          model_routes: null

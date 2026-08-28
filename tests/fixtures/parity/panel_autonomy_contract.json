@@ -1,0 +1,202 @@
+{
+  "schema_version": "moonbite.parity.panel_autonomy_contract.v1",
+  "purpose": "Freeze owner-scoped panel lifecycle and evidence-gated autonomy completion.",
+  "owner_boundary": {
+    "portable": ["panel field ownership", "epoch reset", "afterglow idempotency", "provider eligibility and evidence gates"],
+    "host": ["activity provider implementation", "tool evidence", "calendar or sensor sources", "durable panel backend"]
+  },
+  "portable_invariants": [
+    "A reset changes only fields owned by the requesting owner and epoch.",
+    "A consumed afterglow is consumed once for its canonical source event.",
+    "The same source event cannot refresh its afterglow expiry.",
+    "A provider return without evidence is unverified and cannot project completion or consume a one-shot.",
+    "A selected provider failure is terminal for the tick and is not rerolled."
+  ],
+  "scenarios": [
+    {
+      "id": "owner_scoped_reset",
+      "given": {
+        "epoch": "fixture-epoch-new",
+        "fields": [
+          {"owner": "fixture-owner-a", "name": "daily_focus", "daily": true, "value": "fixture-value-a"},
+          {"owner": "fixture-owner-a", "name": "sensor_state", "daily": false, "value": "fixture-value-b"},
+          {"owner": "fixture-owner-b", "name": "daily_focus", "daily": true, "value": "fixture-value-c"}
+        ]
+      },
+      "when": {
+        "operation": "reset_epoch_fields",
+        "owner": "fixture-owner-a"
+      },
+      "expected": {
+        "terminal": "accepted",
+        "reset_fields": ["daily_focus"],
+        "preserved_fields": ["fixture-owner-a/sensor_state", "fixture-owner-b/daily_focus"],
+        "owner_scope": "fixture-owner-a",
+        "other_owner_changed": false
+      }
+    },
+    {
+      "id": "consume_once_same_source",
+      "given": {
+        "source_event_id": "fixture-event-panel-001",
+        "afterglow_state": "projected",
+        "consumed": false
+      },
+      "when": {
+        "operation": "consume_afterglow",
+        "attempts": 2,
+        "same_source_event": true
+      },
+      "expected": {
+        "terminal": "consumed",
+        "source_event_id": "fixture-event-panel-001",
+        "consume_count": 1,
+        "second_attempt": "no_op",
+        "idempotent": true
+      }
+    },
+    {
+      "id": "same_event_afterglow_no_ttl_refresh",
+      "given": {
+        "source_event_id": "fixture-event-panel-002",
+        "afterglow_state": "projected",
+        "expires_at": "2026-01-15T05:00:00Z",
+        "now": "2026-01-15T04:00:00Z"
+      },
+      "when": {
+        "operation": "project_afterglow",
+        "same_source_event": true,
+        "new_expiry": "2026-01-15T06:00:00Z"
+      },
+      "expected": {
+        "terminal": "no_op",
+        "source_event_id": "fixture-event-panel-002",
+        "expires_at": "2026-01-15T05:00:00Z",
+        "ttl_refreshed": false,
+        "recreated": false
+      }
+    },
+    {
+      "id": "provider_return_without_evidence_unverified",
+      "given": {
+        "provider_id": "fixture-provider-001",
+        "eligibility": "eligible",
+        "provider_return": "completed",
+        "evidence": {
+          "verified": false,
+          "kind": "activity_execution_receipt",
+          "receipt_id": null,
+          "event_id": null,
+          "observed_at": null,
+          "content_sha256": null,
+          "content_length": null
+        }
+      },
+      "when": {
+        "operation": "record_provider_result"
+      },
+      "expected": {
+        "terminal": "executed_unverified",
+        "verified": false,
+        "projection_written": false,
+        "one_shot_consumed": false,
+        "afterglow_written": false
+      }
+    },
+    {
+      "id": "verified_completion_projection",
+      "given": {
+        "provider_id": "fixture-provider-002",
+        "eligibility": "eligible",
+        "provider_return": "completed",
+        "evidence": {
+          "verified": true,
+          "kind": "activity_execution_receipt",
+          "receipt_id": "fixture-receipt-panel-002",
+          "event_id": "fixture-event-panel-003",
+          "observed_at": "2026-01-15T04:05:00Z",
+          "content_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "content_length": 256
+        }
+      },
+      "when": {
+        "operation": "project_verified_completion"
+      },
+      "expected": {
+        "terminal": "projected",
+        "verified": true,
+        "projection_written": true,
+        "source_event_id": "fixture-event-panel-003",
+        "afterglow_written": true,
+        "one_shot_consumed": false
+      }
+    },
+    {
+      "id": "one_shot_only_verified_completion_consume",
+      "given": {
+        "provider_id": "fixture-provider-003",
+        "one_shot": "fixture-one-shot-001",
+        "unverified_result": true,
+        "verified_result": true,
+        "evidence": {
+          "verified": true,
+          "kind": "activity_execution_receipt",
+          "receipt_id": "fixture-receipt-panel-003",
+          "event_id": "fixture-event-panel-004",
+          "observed_at": "2026-01-15T04:06:00Z",
+          "content_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+          "content_length": 512
+        }
+      },
+      "when": {
+        "operation": "consume_one_shot_after_completion"
+      },
+      "expected": {
+        "terminal": "consumed",
+        "state_path": ["unverified", "verified", "consumed"],
+        "unverified_consume": false,
+        "verified_consume": true,
+        "consume_count": 1,
+        "receipt_id": "fixture-receipt-panel-003"
+      }
+    },
+    {
+      "id": "ineligible_provider_fallback",
+      "given": {
+        "providers": [
+          {"id": "fixture-provider-004", "eligibility": "ineligible", "reason": "cooldown"},
+          {"id": "fixture-provider-005", "eligibility": "eligible"}
+        ],
+        "selected_provider": "fixture-provider-004"
+      },
+      "when": {
+        "operation": "select_provider"
+      },
+      "expected": {
+        "terminal": "fallback_selected",
+        "selected_provider": "fixture-provider-005",
+        "fallback_count": 1,
+        "ineligible_run_count": 0
+      }
+    },
+    {
+      "id": "selected_failure_no_reroll",
+      "given": {
+        "provider_id": "fixture-provider-006",
+        "eligibility": "eligible",
+        "run_result": "failed",
+        "fallback_available": true
+      },
+      "when": {
+        "operation": "run_selected_provider"
+      },
+      "expected": {
+        "terminal": "failed",
+        "provider_id": "fixture-provider-006",
+        "rerolled": false,
+        "fallback_run_count": 0,
+        "one_shot_consumed": false
+      }
+    }
+  ]
+}

@@ -1,0 +1,89 @@
+{
+  "schema_version": "moonbite.parity.observation_contract.v1",
+  "purpose": "Freeze topology-neutral observation evidence, replay ordering, freshness, and projection safety.",
+  "owner_boundary": {
+    "portable": [
+      "logical source and capability identity",
+      "timestamps and expiry",
+      "availability and freshness classification",
+      "cursor-based replay and order decisions",
+      "content-free projection metadata"
+    ],
+    "host": [
+      "source transport and authentication",
+      "durable cursor storage",
+      "private values and artifacts",
+      "event and panel delivery"
+    ]
+  },
+  "portable_invariants": [
+    "Only available fresh evidence with positive confidence becomes a candidate.",
+    "Disabled and not-configured evidence is neutral; configured offline, error, unknown, delayed, stale, or zero-confidence evidence is degraded.",
+    "Ordered degraded evidence advances the durable cursor but never becomes a user-state candidate.",
+    "A duplicate or out-of-order event never creates a new candidate.",
+    "Clock skew, expiry, and sender clock jumps fail closed without projection.",
+    "Projection metadata contains no transport, OS, endpoint, or source material."
+  ],
+  "scenarios": [
+    {
+      "id": "fresh_candidate",
+      "given": {"availability": "available", "freshness": "fresh", "confidence": 1.0},
+      "when": {"operation": "decide", "cursor": "empty"},
+      "expected": {"status": "candidate", "projectable": true}
+    },
+    {
+      "id": "disabled_neutral",
+      "given": {"availability": "disabled", "freshness": "unknown"},
+      "when": {"operation": "decide"},
+      "expected": {"status": "neutral", "reason_code": "disabled", "projectable": false}
+    },
+    {
+      "id": "offline_degraded",
+      "given": {"availability": "offline", "freshness": "unknown"},
+      "when": {"operation": "decide"},
+      "expected": {"status": "degraded", "reason_code": "offline", "projectable": false, "health_projectable": true, "advances_cursor": true}
+    },
+    {
+      "id": "stale_degraded",
+      "given": {"availability": "available", "freshness": "stale"},
+      "when": {"operation": "decide"},
+      "expected": {"status": "degraded", "reason_code": "stale", "projectable": false, "health_projectable": true, "advances_cursor": true}
+    },
+    {
+      "id": "duplicate_replay",
+      "given": {"cursor": "contains_event_id", "same_event_id": true},
+      "when": {"operation": "decide"},
+      "expected": {"status": "duplicate", "projectable": false}
+    },
+    {
+      "id": "out_of_order",
+      "given": {"cursor": {"last_source_sequence": 5}, "source_sequence": 4},
+      "when": {"operation": "decide"},
+      "expected": {"status": "out_of_order", "projectable": false}
+    },
+    {
+      "id": "clock_skew",
+      "given": {"observed_at": "future_beyond_tolerance"},
+      "when": {"operation": "decide"},
+      "expected": {"status": "clock_skew", "projectable": false}
+    },
+    {
+      "id": "expired",
+      "given": {"expires_at": "before_now"},
+      "when": {"operation": "decide"},
+      "expected": {"status": "expired", "projectable": false}
+    },
+    {
+      "id": "long_interval_recovery",
+      "given": {"previous_observed_delta": "25h", "previous_received_delta": "25h"},
+      "when": {"operation": "decide", "cursor": "previous_event"},
+      "expected": {"status": "candidate", "projectable": true}
+    },
+    {
+      "id": "sender_clock_jump",
+      "given": {"cursor": {"last_observed_at": "fixture-time-old", "last_received_at": "fixture-receive-old"}, "observed_at": "fixture-time-jump", "received_at": "fixture-receive-jump", "elapsed_delta_mismatch": ">24h"},
+      "when": {"operation": "decide"},
+      "expected": {"status": "sender_clock_jump", "projectable": false}
+    }
+  ]
+}

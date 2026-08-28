@@ -1,0 +1,244 @@
+{
+  "schema_version": "moonbite.parity.heartbeat_contract.v1",
+  "purpose": "Freeze fail-closed heartbeat gates, contact signals, daily anchors, and pending-effect reconciliation.",
+  "owner_boundary": {
+    "portable": ["gate ordering", "cadence decisions", "neutral skip", "effect reconciliation contract"],
+    "host": ["clock and scheduler", "inbound signal adapters", "visible delivery observation"]
+  },
+  "portable_invariants": [
+    "No candidate is a due heartbeat without a qualifying event or anchor.",
+    "Neutral skip has no model call, write, wake, or delivery side effect.",
+    "Recent private inbound, recent verified visible contact, and active chat are distinct signals.",
+    "Pending effects are reconciled before a new effect is selected.",
+    "Every non-terminal cadence decision exposes the next judge time."
+  ],
+  "scenarios": [
+    {
+      "id": "no_event_neutral_skip",
+      "given": {
+        "events": [],
+        "now": "2026-01-15T03:00:00Z",
+        "last_judge_at": "2026-01-15T02:00:00Z",
+        "due": false
+      },
+      "when": {
+        "operation": "evaluate_heartbeat"
+      },
+      "expected": {
+        "terminal": "neutral",
+        "reason": "no_event",
+        "model_calls": 0,
+        "writes": 0,
+        "wake_effects": 0,
+        "delivery_effects": 0,
+        "next_judge_at": "2026-01-15T04:00:00Z"
+      }
+    },
+    {
+      "id": "not_due_skip",
+      "given": {
+        "events": ["routine_check"],
+        "now": "2026-01-15T03:00:00Z",
+        "last_judge_at": "2026-01-15T02:45:00Z",
+        "due": false,
+        "cooldown": false
+      },
+      "when": {
+        "operation": "evaluate_heartbeat"
+      },
+      "expected": {
+        "terminal": "not_due",
+        "reason": "cadence_not_due",
+        "model_calls": 0,
+        "writes": 0,
+        "wake_effects": 0,
+        "next_judge_at": "2026-01-15T03:45:00Z"
+      }
+    },
+    {
+      "id": "cooldown_skip",
+      "given": {
+        "events": ["routine_check"],
+        "now": "2026-01-15T03:00:00Z",
+        "last_effect_at": "2026-01-15T02:50:00Z",
+        "due": true,
+        "cooldown": true
+      },
+      "when": {
+        "operation": "evaluate_heartbeat"
+      },
+      "expected": {
+        "terminal": "cooldown",
+        "reason": "effect_cooldown",
+        "model_calls": 0,
+        "writes": 0,
+        "wake_effects": 0,
+        "next_judge_at": "2026-01-15T03:50:00Z"
+      }
+    },
+    {
+      "id": "recent_private_inbound_blocks",
+      "given": {
+        "events": ["routine_check"],
+        "recent_private_inbound_at": "2026-01-15T02:59:00Z",
+        "now": "2026-01-15T03:00:00Z",
+        "due": true,
+        "cooldown": false,
+        "active_chat": false
+      },
+      "when": {
+        "operation": "evaluate_heartbeat"
+      },
+      "expected": {
+        "terminal": "skipped",
+        "reason": "recent_private_inbound",
+        "model_calls": 0,
+        "writes": 0,
+        "wake_effects": 0,
+        "next_judge_at": "2026-01-15T03:30:00Z"
+      }
+    },
+    {
+      "id": "recent_verified_visible_contact_blocks",
+      "given": {
+        "events": ["routine_check"],
+        "recent_verified_visible_at": "2026-01-15T02:59:00Z",
+        "recent_private_inbound_at": null,
+        "now": "2026-01-15T03:00:00Z",
+        "due": true,
+        "cooldown": false,
+        "active_chat": false
+      },
+      "when": {
+        "operation": "evaluate_heartbeat"
+      },
+      "expected": {
+        "terminal": "skipped",
+        "reason": "recent_verified_visible_contact",
+        "requires_verified_receipt": true,
+        "model_calls": 0,
+        "writes": 0,
+        "wake_effects": 0,
+        "next_judge_at": "2026-01-15T03:30:00Z"
+      }
+    },
+    {
+      "id": "active_chat_gate",
+      "given": {
+        "events": ["routine_check"],
+        "recent_private_inbound_at": null,
+        "recent_verified_visible_at": null,
+        "now": "2026-01-15T03:00:00Z",
+        "due": true,
+        "cooldown": false,
+        "active_chat": true
+      },
+      "when": {
+        "operation": "evaluate_heartbeat"
+      },
+      "expected": {
+        "terminal": "skipped",
+        "reason": "active_chat",
+        "model_calls": 0,
+        "writes": 0,
+        "wake_effects": 0,
+        "next_judge_at": "2026-01-15T03:30:00Z"
+      }
+    },
+    {
+      "id": "daily_anchor_due",
+      "given": {
+        "events": [],
+        "daily_anchor": true,
+        "anchor_completed_for_epoch": false,
+        "now": "2026-01-15T06:00:00Z",
+        "due": true,
+        "cooldown": false,
+        "active_chat": false
+      },
+      "when": {
+        "operation": "evaluate_heartbeat"
+      },
+      "expected": {
+        "terminal": "due",
+        "reason": "daily_anchor",
+        "judge_required": true,
+        "model_calls": 1,
+        "next_judge_at": "2026-01-16T06:00:00Z"
+      }
+    },
+    {
+      "id": "pending_effect_awaits_receipt",
+      "given": {
+        "events": ["routine_check"],
+        "pending_effect_id": "fixture-effect-heartbeat-001",
+        "pending_effect_state": "executed_unverified",
+        "receipt": null,
+        "expires_at": "2026-01-15T04:00:00Z",
+        "now": "2026-01-15T03:00:00Z",
+        "due": true,
+        "active_chat": false
+      },
+      "when": {
+        "operation": "reconcile_pending_effects"
+      },
+      "expected": {
+        "terminal": "pending",
+        "reason": "awaiting_receipt",
+        "new_effect_selection": false,
+        "pending_effect_id": "fixture-effect-heartbeat-001",
+        "requeue_count": 0,
+        "next_judge_at": "2026-01-15T03:30:00Z"
+      }
+    },
+    {
+      "id": "expired_effect_reconciliation",
+      "given": {
+        "events": ["routine_check"],
+        "pending_effect_id": "fixture-effect-heartbeat-002",
+        "pending_effect_state": "executed_unverified",
+        "receipt": null,
+        "expires_at": "2026-01-15T02:00:00Z",
+        "now": "2026-01-15T03:00:00Z",
+        "due": true,
+        "active_chat": false
+      },
+      "when": {
+        "operation": "reconcile_pending_effects"
+      },
+      "expected": {
+        "terminal": "requeued",
+        "reason": "expired_effect",
+        "new_effect_selection": false,
+        "pending_effect_id": "fixture-effect-heartbeat-002",
+        "requeue_count": 1,
+        "next_judge_at": "2026-01-15T03:30:00Z"
+      }
+    },
+    {
+      "id": "queued_unverified_not_contact",
+      "given": {
+        "events": ["routine_check"],
+        "pending_effect_id": "fixture-effect-heartbeat-003",
+        "pending_effect_state": "executed_unverified",
+        "queue_accepted": true,
+        "receipt": null,
+        "recent_private_inbound_at": null,
+        "now": "2026-01-15T03:00:00Z",
+        "due": true,
+        "active_chat": false
+      },
+      "when": {
+        "operation": "derive_recent_visible_contact"
+      },
+      "expected": {
+        "terminal": "skipped",
+        "reason": "queued_unverified_not_contact",
+        "recent_visible_contact": false,
+        "requires_verified_receipt": true,
+        "new_effect_selection": false,
+        "requeue_count": 0
+      }
+    }
+  ]
+}

@@ -1,0 +1,119 @@
+{
+  "schema_version": "moonbite.parity.conversation_bridge_contract.v1",
+  "purpose": "Freeze the bridge from a conversation turn to a durable checkpoint without fabricating progress.",
+  "owner_boundary": {
+    "portable": ["dirty state", "quiet and overdue gates", "checkpoint idempotency", "source requirements"],
+    "host": ["conversation transport", "session transcript", "checkpoint backend", "scheduler timing"]
+  },
+  "portable_invariants": [
+    "A new eligible turn marks the bridge dirty before checkpoint evaluation.",
+    "Quiet and overdue are timing states, not proof that a checkpoint was written.",
+    "Unsettled or active-chat gates skip checkpoint side effects.",
+    "A retry may complete one logical checkpoint only once and requires a source reference."
+  ],
+  "scenarios": [
+    {
+      "id": "dirty_to_quiet_or_overdue_to_checkpoint",
+      "given": {
+        "source_id": "fixture-source-bridge-001",
+        "initial_state": "clean",
+        "settled": true,
+        "active_chat": false
+      },
+      "when": {
+        "operation": "evaluate_and_checkpoint",
+        "elapsed_states": ["dirty", "quiet", "overdue"]
+      },
+      "expected": {
+        "terminal": "checkpointed",
+        "state_paths": [
+          ["clean", "dirty", "quiet", "checkpointed"],
+          ["clean", "dirty", "overdue", "checkpointed"]
+        ],
+        "source_id": "fixture-source-bridge-001",
+        "checkpoint_count": 1,
+        "checkpoint_id": "fixture-checkpoint-001"
+      }
+    },
+    {
+      "id": "unsettled_skip",
+      "given": {
+        "source_id": "fixture-source-bridge-002",
+        "initial_state": "dirty",
+        "settled": false,
+        "active_chat": false
+      },
+      "when": {
+        "operation": "evaluate_and_checkpoint"
+      },
+      "expected": {
+        "terminal": "skipped",
+        "reason": "unsettled",
+        "checkpoint_written": false,
+        "side_effect_count": 0,
+        "state": "dirty"
+      }
+    },
+    {
+      "id": "active_chat_gate",
+      "given": {
+        "source_id": "fixture-source-bridge-003",
+        "initial_state": "dirty",
+        "settled": true,
+        "active_chat": true
+      },
+      "when": {
+        "operation": "evaluate_and_checkpoint"
+      },
+      "expected": {
+        "terminal": "skipped",
+        "reason": "active_chat",
+        "checkpoint_written": false,
+        "side_effect_count": 0,
+        "state": "dirty"
+      }
+    },
+    {
+      "id": "checkpoint_retry_idempotency",
+      "given": {
+        "source_id": "fixture-source-bridge-004",
+        "initial_state": "overdue",
+        "settled": true,
+        "active_chat": false,
+        "first_write_result": "transient_error",
+        "retry_write_result": "accepted"
+      },
+      "when": {
+        "operation": "retry_checkpoint",
+        "attempts": 2
+      },
+      "expected": {
+        "terminal": "checkpointed",
+        "checkpoint_written": true,
+        "checkpoint_count": 1,
+        "source_id": "fixture-source-bridge-004",
+        "idempotent": true,
+        "retry_required": false
+      }
+    },
+    {
+      "id": "missing_source_failure",
+      "given": {
+        "source_id": null,
+        "initial_state": "overdue",
+        "settled": true,
+        "active_chat": false
+      },
+      "when": {
+        "operation": "write_checkpoint"
+      },
+      "expected": {
+        "terminal": "failed",
+        "reason": "missing_source",
+        "checkpoint_written": false,
+        "fail_closed": true,
+        "side_effect_count": 0
+      }
+    }
+  ]
+}

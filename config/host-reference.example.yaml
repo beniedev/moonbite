@@ -1,0 +1,94 @@
+schema_version: moonbite.host_delivery_reference.v1
+kind: host_deployment_template
+scope:
+  normalized_by_moonbite: false
+  runtime_config: false
+  transport_config: false
+transport_owner: hermes_official_platform_plugin
+topology:
+  private_chat_to_main_session:
+    source: PRIVATE_CHAT_REF
+    target: MAIN_SESSION_REF
+    direction: host_internal
+    role: private_chat_route
+    permission: host_owned_routing
+  system_channel:
+    ref: SYSTEM_CHANNEL_ID
+    direction: host_internal
+    role: system_channel_reference
+    permission: host_owned_no_moonbite_write
+  agent_mailbox_channel:
+    ref: AGENT_MAILBOX_CHANNEL_ID
+    direction: host_internal
+    role: agent_mailbox_channel_reference
+    permission: host_owned_no_moonbite_write
+ports:
+  target:
+    ref: PRIVATE_CHAT_REF
+    direction: host_to_moonbite
+    role: target_reference
+    permission: host_owned_read_only
+  session:
+    ref: MAIN_SESSION_REF
+    direction: host_to_moonbite
+    role: session_reference
+    permission: host_owned_read_only
+  effect_receipt:
+    ref: EFFECT_RECEIPT_REF
+    direction: host_to_moonbite
+    role: effect_receipt
+    permission: host_owned_read_only
+boundary:
+  moonbite_consumes_ports:
+    - target
+    - session
+    - effect_receipt
+  moonbite_owns:
+    - lifecycle_semantics
+    - effect_semantics
+    - receipt_matching
+  host_owns:
+    - transport
+    - target_resolution
+    - session_resolution
+    - effect_delivery
+    - effect_receipt
+    - injected_state_storage
+    - injected_state_writer
+  state_ownership:
+    standalone:
+      owner: moonbite
+      storage: moonbite_owned
+      writer: moonbite_owned
+    injected:
+      owner: host
+      storage: host_owned
+      writer: host_owned
+  effect_receipt_rule: only_matching_effect_receipt_can_mark_verified
+  permission_rule: host_owned_ports_are_read_only_to_moonbite
+failure_outcomes:
+  contract: host_failure_outcome_not_verified_effect_receipt
+  examples:
+    - code: permission_denied
+      ref: EFFECT_RECEIPT_REF
+      retryable: false
+      state: failed
+      content: null
+    - code: transport_unavailable
+      ref: EFFECT_RECEIPT_REF
+      retryable: true
+      state: requeued
+      content: null
+    - code: receipt_mismatch
+      ref: EFFECT_RECEIPT_REF
+      retryable: false
+      state: failed
+      content: null
+interaction_capabilities:
+  owner: separate_interaction_plugin_or_host_capability
+  not_moonbite_capabilities:
+    - choices
+    - sticker
+    - callback
+    - reaction
+  statement: choices, sticker, callback, and reaction belong to a separate interaction plugin or host capability

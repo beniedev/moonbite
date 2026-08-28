@@ -1,0 +1,584 @@
+{
+  "schema_version": "moonbite.autonomy_contract.v1",
+  "channel_ok_activities": [
+    "feed_browse",
+    "article_review",
+    "repo_explore",
+    "community_feed_browse",
+    "short_post_browse",
+    "reading_session",
+    "study_note_review",
+    "archive_reflection",
+    "system_review",
+    "idle_review"
+  ],
+  "planning": [
+    {
+      "id": "normal_exploration",
+      "judge_result": {
+        "ok": true,
+        "action": "judge",
+        "mode": "tick",
+        "consulted_model": false,
+        "unified_decision": {
+          "allow_autonomy": true,
+          "run_maintenance": false,
+          "tendencies": {
+            "exploration": 0.7,
+            "reflection": 0.0,
+            "memory_maintenance": 0.0,
+            "ops": 0.0,
+            "idle": 0.0,
+            "poke": 0.0
+          },
+          "summary_for_agent": "fixture summary",
+          "attention_items": [],
+          "judge_hints": []
+        }
+      },
+      "autonomy_state": {},
+      "rng_draw": 0.0,
+      "expected_decision": {
+        "activity": "feed_browse",
+        "selection_mode": "weighted_random",
+        "score": 6.1,
+        "top_tendency": "exploration",
+        "top_preferred_activity": "",
+        "next_fallback_activity": "article_review"
+      },
+      "selected_adjustments_contains": [],
+      "eligible_contains": [],
+      "rejecting_effects": ["pick_repo_explore_candidate"]
+    },
+    {
+      "id": "judge_hint_strong_prefer_github",
+      "judge_result": {
+        "ok": true,
+        "action": "judge",
+        "mode": "tick",
+        "consulted_model": false,
+        "unified_decision": {
+          "allow_autonomy": true,
+          "run_maintenance": false,
+          "tendencies": {
+            "exploration": 0.0,
+            "reflection": 0.8,
+            "memory_maintenance": 0.0,
+            "ops": 0.0,
+            "idle": 0.0,
+            "poke": 0.0
+          },
+          "summary_for_agent": "fixture summary",
+          "attention_items": [],
+          "judge_hints": [
+            {
+              "event_id": "hint_prefer_001",
+              "hint_type": "exploration",
+              "target": "autonomy_tick",
+              "weight": 1.0,
+              "strength": "strong",
+              "prefer_activity": ["repo_explore"],
+              "topic": "fixture topic",
+              "reason": "fixture"
+            }
+          ]
+        }
+      },
+      "autonomy_state": {},
+      "rng_draw": 0.0,
+      "expected_decision": {
+        "activity": "repo_explore",
+        "selection_mode": "strong_hint_preferred",
+        "score": 4.2,
+        "top_tendency": "reflection",
+        "top_preferred_activity": "repo_explore",
+        "next_fallback_activity": "archive_reflection"
+      },
+      "selected_adjustments_contains": ["judge_hint_prefer:1.0"],
+      "eligible_contains": [],
+      "rejecting_effects": ["pick_repo_explore_candidate"]
+    },
+    {
+      "id": "judge_hint_avoid_downranks_reflection",
+      "judge_result": {
+        "ok": true,
+        "action": "judge",
+        "mode": "tick",
+        "consulted_model": false,
+        "unified_decision": {
+          "allow_autonomy": true,
+          "run_maintenance": false,
+          "tendencies": {
+            "exploration": 0.0,
+            "reflection": 0.8,
+            "memory_maintenance": 0.0,
+            "ops": 0.0,
+            "idle": 0.0,
+            "poke": 0.0
+          },
+          "summary_for_agent": "fixture summary",
+          "attention_items": [],
+          "judge_hints": [
+            {
+              "event_id": "hint_avoid_001",
+              "hint_type": "exploration",
+              "target": "autonomy_tick",
+              "weight": 1.0,
+              "strength": "normal",
+              "avoid_activity": ["archive_reflection"],
+              "reason": "fixture"
+            }
+          ]
+        }
+      },
+      "autonomy_state": {},
+      "rng_draw": 0.0,
+      "expected_decision": {
+        "activity": "feed_browse",
+        "selection_mode": "weighted_random",
+        "score": 4.0,
+        "top_tendency": "reflection",
+        "top_preferred_activity": "",
+        "next_fallback_activity": "article_review"
+      },
+      "selected_adjustments_contains": [],
+      "eligible_contains": [
+        {
+          "activity": "archive_reflection",
+          "score": 2.86,
+          "adjustments_contains": ["judge_hint_avoid:1.0"]
+        }
+      ],
+      "rejecting_effects": ["pick_repo_explore_candidate"]
+    },
+    {
+      "id": "judge_denied_quiet_idle",
+      "judge_result": {
+        "ok": true,
+        "action": "judge",
+        "mode": "tick",
+        "consulted_model": false,
+        "unified_decision": {
+          "allow_autonomy": false,
+          "run_maintenance": false,
+          "tendencies": {
+            "exploration": 0.0,
+            "reflection": 0.0,
+            "memory_maintenance": 0.0,
+            "ops": 0.0,
+            "idle": 0.0,
+            "poke": 0.0
+          },
+          "summary_for_agent": "fixture summary",
+          "attention_items": [],
+          "judge_hints": []
+        }
+      },
+      "autonomy_state": {},
+      "rng_draw": 0.0,
+      "expected_decision": {
+        "activity": "idle_review",
+        "selection_mode": "quiet_idle",
+        "score": 0.0,
+        "top_tendency": "idle",
+        "top_preferred_activity": "",
+        "next_fallback_activity": null
+      },
+      "selected_adjustments_contains": [],
+      "eligible_contains": [],
+      "rejecting_effects": ["pick_repo_explore_candidate"]
+    }
+  ],
+  "ticks": [
+    {
+      "id": "active_chat_blocks_autonomy",
+      "active_chat_state": {
+        "schema_version": "deployment.active_chat_state.v1",
+        "active": true,
+        "afterglow": false,
+        "expires_at": "2030-01-01T00:00:00Z",
+        "afterglow_expires_at": "",
+        "observed_at": "2025-01-15T01:00:00Z",
+        "last_user_turn_at": "2025-01-15T01:00:00Z"
+      },
+      "judge_result": null,
+      "expected": {
+        "ok": true,
+        "action": "skip_autonomy",
+        "reason": "active_chat",
+        "selected": null,
+        "allowed_by_judge": null,
+        "completion_required": null,
+        "fallback_plan": false,
+        "judge_tick_calls": 0,
+        "pick_calls": 0
+      }
+    },
+    {
+      "id": "judge_denied_skips_quiet",
+      "judge_result": {
+        "ok": true,
+        "action": "judge",
+        "mode": "tick",
+        "consulted_model": false,
+        "unified_decision": {
+          "allow_autonomy": false,
+          "run_maintenance": false,
+          "tendencies": {
+            "exploration": 0.0,
+            "reflection": 0.0,
+            "memory_maintenance": 0.0,
+            "ops": 0.0,
+            "idle": 0.0,
+            "poke": 0.0
+          },
+          "summary_for_agent": "fixture summary",
+          "attention_items": [],
+          "judge_hints": []
+        }
+      },
+      "expected": {
+        "ok": true,
+        "action": "skip_autonomy",
+        "reason": "quiet_idle",
+        "selected": "idle_review",
+        "allowed_by_judge": false,
+        "completion_required": null,
+        "fallback_plan": false,
+        "judge_tick_calls": 1,
+        "pick_calls": 0
+      }
+    },
+    {
+      "id": "normal_allowed_selects_activity",
+      "judge_result": {
+        "ok": true,
+        "action": "judge",
+        "mode": "tick",
+        "consulted_model": false,
+        "unified_decision": {
+          "allow_autonomy": true,
+          "run_maintenance": false,
+          "tendencies": {
+            "exploration": 0.7,
+            "reflection": 0.0,
+            "memory_maintenance": 0.0,
+            "ops": 0.0,
+            "idle": 0.0,
+            "poke": 0.0
+          },
+          "summary_for_agent": "fixture summary",
+          "attention_items": [],
+          "judge_hints": []
+        }
+      },
+      "expected": {
+        "ok": true,
+        "action": "autonomy_decision",
+        "reason": "scheduled_half_hour_tick",
+        "selected": "feed_browse",
+        "allowed_by_judge": true,
+        "completion_required": true,
+        "fallback_plan": true,
+        "judge_tick_calls": 1,
+        "pick_calls": 0,
+        "run_id_pattern": "^autonomy_\\d{8}T\\d{6}_[0-9a-f]{8}$"
+      }
+    }
+  ],
+  "terminals": [
+    {
+      "id": "completed_dry_run",
+      "dry_run": true,
+      "state": {
+        "last_activity_status": "started",
+        "last_activity_run_id": "fixture-run-001",
+        "last_activity_selected_type": "feed_browse",
+        "last_activity_type": "feed_browse",
+        "last_activity_fallback_required": false,
+        "last_activity_fallback_activity": "",
+        "last_activity_requires_tool_evidence": true,
+        "last_activity_started_at": "2025-01-15T01:00:00Z"
+      },
+      "tool_rows": [
+        {
+          "schema_version": "deployment.autonomy_tool_result.v1",
+          "job_id": "fixture-job-001",
+          "success": true,
+          "ts": "2025-01-15T01:30:00Z",
+          "tool_name": "feed_browse"
+        }
+      ],
+      "kwargs": {
+        "status": "completed",
+        "run_id": "fixture-run-001",
+        "note": "fixture contract note",
+        "report_channel": "board",
+        "delivery_status": "delivery_pending",
+        "memory_summary": "fixture summary",
+        "source_pointers": ["https://example.com/fixture-source"],
+        "execution_evidence": {
+          "run_id": "fixture-run-001",
+          "tool_result_id": "fixture-run-001:feed_browse",
+          "source_pointers": ["https://example.com/fixture-source"]
+        },
+        "dry_run": true
+      },
+      "expected": {
+        "ok": true,
+        "action": "complete_autonomy",
+        "would_status": "completed",
+        "previous_status": "started",
+        "run_id": "fixture-run-001",
+        "activity": "feed_browse",
+        "selected_activity": "feed_browse",
+        "effective_activity": "feed_browse",
+        "attempts": [
+          {
+            "activity": "feed_browse",
+            "status": "completed",
+            "reason": ""
+          }
+        ]
+      },
+      "no_state_write": true
+    },
+    {
+      "id": "failed_dry_run",
+      "dry_run": true,
+      "state": {
+        "last_activity_status": "started",
+        "last_activity_run_id": "fixture-run-001",
+        "last_activity_selected_type": "feed_browse",
+        "last_activity_type": "feed_browse",
+        "last_activity_fallback_required": false,
+        "last_activity_fallback_activity": "",
+        "last_activity_requires_tool_evidence": true,
+        "last_activity_started_at": "2025-01-15T01:00:00Z"
+      },
+      "kwargs": {
+        "status": "failed",
+        "run_id": "fixture-run-001",
+        "note": "fixture failure",
+        "report_channel": "board",
+        "delivery_status": "delivery_pending",
+        "memory_summary": "",
+        "source_pointers": ["https://example.com/fixture-source"],
+        "dry_run": true
+      },
+      "expected": {
+        "ok": true,
+        "action": "complete_autonomy",
+        "would_status": "failed",
+        "previous_status": "started",
+        "run_id": "fixture-run-001",
+        "activity": "feed_browse",
+        "selected_activity": "feed_browse",
+        "effective_activity": "",
+        "attempts": [
+          {
+            "activity": "feed_browse",
+            "status": "failed",
+            "reason": ""
+          }
+        ]
+      },
+      "no_state_write": true
+    },
+    {
+      "id": "invalid_status_rejected",
+      "dry_run": true,
+      "state": {},
+      "kwargs": {
+        "status": "blocked",
+        "run_id": "fixture-run-001",
+        "note": "x",
+        "report_channel": "board",
+        "delivery_status": "delivery_pending",
+        "memory_summary": "",
+        "source_pointers": ["https://example.com/fixture-source"],
+        "dry_run": true
+      },
+      "expected": {
+        "ok": false,
+        "action": "complete_autonomy",
+        "reason": "invalid_status"
+      },
+      "no_state_write": true
+    },
+    {
+      "id": "run_id_required",
+      "dry_run": true,
+      "state": {},
+      "kwargs": {
+        "status": "completed",
+        "run_id": "",
+        "note": "fixture note",
+        "report_channel": "board",
+        "delivery_status": "delivery_pending",
+        "memory_summary": "fixture summary",
+        "source_pointers": ["https://example.com/fixture-source"],
+        "dry_run": true
+      },
+      "expected": {
+        "ok": false,
+        "action": "complete_autonomy",
+        "reason": "run_id_required"
+      },
+      "no_state_write": true
+    },
+    {
+      "id": "run_id_mismatch",
+      "dry_run": true,
+      "state": {
+        "last_activity_status": "started",
+        "last_activity_run_id": "run_other"
+      },
+      "kwargs": {
+        "status": "completed",
+        "run_id": "run_wrong",
+        "note": "fixture note",
+        "report_channel": "board",
+        "delivery_status": "delivery_pending",
+        "memory_summary": "fixture summary",
+        "source_pointers": ["https://example.com/fixture-source"],
+        "dry_run": true
+      },
+      "expected": {
+        "ok": false,
+        "action": "complete_autonomy",
+        "reason": "run_id_mismatch",
+        "run_id": "run_wrong",
+        "previous_status": "started"
+      },
+      "no_state_write": true
+    },
+    {
+      "id": "no_open_activity",
+      "dry_run": true,
+      "state": {
+        "last_activity_status": "completed",
+        "last_activity_run_id": "fixture-run-001"
+      },
+      "kwargs": {
+        "status": "completed",
+        "run_id": "fixture-run-001",
+        "note": "fixture note",
+        "report_channel": "board",
+        "delivery_status": "delivery_pending",
+        "memory_summary": "fixture summary",
+        "source_pointers": ["https://example.com/fixture-source"],
+        "dry_run": true
+      },
+      "expected": {
+        "ok": false,
+        "action": "complete_autonomy",
+        "reason": "no_open_activity",
+        "previous_status": "completed"
+      },
+      "no_state_write": true
+    },
+    {
+      "id": "fallback_attempt_required",
+      "dry_run": true,
+      "state": {
+        "last_activity_status": "started",
+        "last_activity_run_id": "fixture-run-001",
+        "last_activity_selected_type": "feed_browse",
+        "last_activity_type": "feed_browse",
+        "last_activity_fallback_required": true,
+        "last_activity_fallback_activity": "article_review"
+      },
+      "kwargs": {
+        "status": "failed",
+        "run_id": "fixture-run-001",
+        "note": "fixture failure",
+        "report_channel": "board",
+        "delivery_status": "delivery_pending",
+        "memory_summary": "",
+        "source_pointers": ["https://example.com/fixture-source"],
+        "dry_run": true
+      },
+      "expected": {
+        "ok": false,
+        "action": "complete_autonomy",
+        "reason": "fallback_attempt_required",
+        "run_id": "fixture-run-001",
+        "activity": "feed_browse"
+      },
+      "no_state_write": true
+    },
+    {
+      "id": "invalid_source_pointer",
+      "dry_run": true,
+      "state": {
+        "last_activity_status": "started",
+        "last_activity_run_id": "fixture-run-001"
+      },
+      "kwargs": {
+        "status": "completed",
+        "run_id": "fixture-run-001",
+        "note": "fixture note",
+        "report_channel": "board",
+        "delivery_status": "delivery_pending",
+        "memory_summary": "fixture summary",
+        "source_pointers": ["Wiki/nonexistent-fixture.md"],
+        "dry_run": true
+      },
+      "expected": {
+        "ok": false,
+        "action": "complete_autonomy",
+        "reason": "invalid_source_pointers"
+      },
+      "no_state_write": true
+    },
+    {
+      "id": "board_report_required",
+      "dry_run": false,
+      "state": {
+        "last_activity_status": "started",
+        "last_activity_run_id": "fixture-run-001"
+      },
+      "kwargs": {
+        "status": "completed",
+        "run_id": "fixture-run-001",
+        "note": "fixture note",
+        "report_channel": "private_dm",
+        "delivery_status": "delivery_pending",
+        "memory_summary": "fixture summary",
+        "source_pointers": ["https://example.com/fixture-source"],
+        "dry_run": false
+      },
+      "expected": {
+        "ok": false,
+        "action": "complete_autonomy",
+        "reason": "board_report_required_for_terminal_status"
+      },
+      "no_state_write": true
+    },
+    {
+      "id": "delivery_status_required",
+      "dry_run": false,
+      "state": {
+        "last_activity_status": "started",
+        "last_activity_run_id": "fixture-run-001"
+      },
+      "kwargs": {
+        "status": "completed",
+        "run_id": "fixture-run-001",
+        "note": "fixture note",
+        "report_channel": "board",
+        "delivery_status": "queued",
+        "memory_summary": "fixture summary",
+        "source_pointers": ["https://example.com/fixture-source"],
+        "dry_run": false
+      },
+      "expected": {
+        "ok": false,
+        "action": "complete_autonomy",
+        "reason": "board_report_delivery_status_required"
+      },
+      "no_state_write": true
+    }
+  ]
+}
