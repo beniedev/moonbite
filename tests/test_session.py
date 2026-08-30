@@ -11,6 +11,7 @@ from moonbite_plugin.runtime_core import StateError
 from moonbite_plugin.session import (
     HOOK_ORDER,
     SESSION_LIFECYCLE_SCHEMA,
+    SESSION_TURN_TERMINAL_SCHEMA,
     SOURCE_KINDS,
     SessionContext,
     SessionLifecycleError,
@@ -19,6 +20,7 @@ from moonbite_plugin.session import (
 
 NOW = datetime(2026, 8, 24, 19, 0, tzinfo=UTC)
 ALL_HOOKS = frozenset(HOOK_ORDER)
+TURN_HOOKS = frozenset({"pre_llm_call", "post_llm_call"})
 
 
 def context(
@@ -336,6 +338,376 @@ def test_finalize_rejects_unsettled_turn(tmp_path) -> None:
             context("finalize", source_kind="system"), "on_session_finalize"
         )
     assert len(store.ledger.rows()) == 3
+
+
+def test_successor_pre_abandons_missing_post_without_settling(tmp_path) -> None:
+    store = SessionLifecycleStore(tmp_path)
+    store.record_hook(context("gateway"), "pre_gateway_dispatch")
+    store.record_hook(
+        context("start", source_kind="session_start"),
+        "on_session_start",
+    )
+    store.record_hook(context("pre-a", turn_id="turn-a"), "pre_llm_call")
+
+    successor = store.record_hook(
+        context(
+            "pre-b",
+            turn_id="turn-b",
+            observed_at=NOW + timedelta(minutes=1),
+        ),
+        "pre_llm_call",
+    )
+
+    assert successor.snapshot.open_turn_id == "turn-b"
+    assert successor.snapshot.settled_turn_ids == ()
+    assert successor.snapshot.terminal_turn_ids == ("turn-a",)
+    assert successor.snapshot.abandoned_turn_ids == ("turn-a",)
+    rows = store.ledger.rows()
+    terminal = rows[3]
+    assert terminal["schema_version"] == SESSION_TURN_TERMINAL_SCHEMA
+    assert terminal["kind"] == "turn_terminal"
+    assert terminal["outcome"] == "abandoned"
+    assert terminal["reason"] == "superseded_by_new_pre"
+    assert terminal["superseded_by_turn_id"] == "turn-b"
+
+    completed = store.record_hook(
+        context(
+            "post-b",
+            source_kind="assistant_response",
+            turn_id="turn-b",
+            fresh=False,
+            observed_at=NOW + timedelta(minutes=2),
+        ),
+        "post_llm_call",
+        settled=True,
+    )
+    assert completed.snapshot.open_turn_id is None
+    assert completed.snapshot.settled_turn_ids == ("turn-b",)
+    assert completed.snapshot.terminal_turn_ids == ("turn-a", "turn-b")
+
+
+def test_late_post_cannot_replace_abandoned_turn(tmp_path) -> None:
+    store = SessionLifecycleStore(tmp_path)
+    store.record_hook(
+        context("pre-a", turn_id="turn-a", supported_hooks=TURN_HOOKS),
+        "pre_llm_call",
+    )
+    store.record_hook(
+        context(
+            "pre-b",
+            turn_id="turn-b",
+            supported_hooks=TURN_HOOKS,
+            observed_at=NOW + timedelta(minutes=1),
+        ),
+        "pre_llm_call",
+    )
+    before = list(store.ledger.rows())
+
+    with pytest.raises(SessionLifecycleError, match="already terminal"):
+        store.record_hook(
+            context(
+                "post-a",
+                source_kind="assistant_response",
+                turn_id="turn-a",
+                fresh=False,
+                supported_hooks=TURN_HOOKS,
+                observed_at=NOW + timedelta(minutes=2),
+            ),
+            "post_llm_call",
+            settled=True,
+        )
+
+    assert store.ledger.rows() == before
+    assert store.snapshot("lifecycle-1").open_turn_id == "turn-b"
+
+
+def test_operator_repair_is_exact_non_success_and_idempotent(tmp_path) -> None:
+    store = SessionLifecycleStore(tmp_path)
+    store.record_hook(
+        context("pre-a", turn_id="turn-a", supported_hooks=TURN_HOOKS),
+        "pre_llm_call",
+    )
+
+    first = store.abandon_open_turn(
+        "lifecycle-1",
+        "turn-a",
+        observed_at=NOW + timedelta(minutes=1),
+    )
+    second = store.abandon_open_turn(
+        "lifecycle-1",
+        "turn-a",
+        observed_at=NOW + timedelta(minutes=2),
+    )
+
+    assert first.deduplicated is False
+    assert second.deduplicated is True
+    assert second.reason == "operator_repair"
+    assert second.outcome == "abandoned"
+    assert second.snapshot.settled_turn_ids == ()
+    assert second.snapshot.open_turn_id is None
+    assert len(store.ledger.rows()) == 2
+
+    with pytest.raises(SessionLifecycleError, match="not found"):
+        store.abandon_open_turn("lifecycle-1", "unknown")
+
+
+def test_repair_compare_and_set_rejects_changed_or_completed_turn(tmp_path) -> None:
+    store = SessionLifecycleStore(tmp_path)
+    store.record_hook(
+        context("pre-a", turn_id="turn-a", supported_hooks=TURN_HOOKS),
+        "pre_llm_call",
+    )
+    store.record_hook(
+        context(
+            "post-a",
+            source_kind="assistant_response",
+            turn_id="turn-a",
+            fresh=False,
+            supported_hooks=TURN_HOOKS,
+            observed_at=NOW + timedelta(minutes=1),
+        ),
+        "post_llm_call",
+        settled=True,
+    )
+    store.record_hook(
+        context(
+            "pre-b",
+            turn_id="turn-b",
+            supported_hooks=TURN_HOOKS,
+            observed_at=NOW + timedelta(minutes=2),
+        ),
+        "pre_llm_call",
+    )
+    with pytest.raises(SessionLifecycleError, match="already terminal"):
+        store.abandon_open_turn("lifecycle-1", "turn-a")
+
+
+def test_finalize_accepts_completed_and_abandoned_terminal_mix(tmp_path) -> None:
+    store = SessionLifecycleStore(tmp_path)
+    store.record_hook(context("gateway"), "pre_gateway_dispatch")
+    store.record_hook(
+        context("start", source_kind="session_start"),
+        "on_session_start",
+    )
+    store.record_hook(context("pre-a", turn_id="turn-a"), "pre_llm_call")
+    store.record_hook(
+        context(
+            "post-a", source_kind="assistant_response", turn_id="turn-a", fresh=False
+        ),
+        "post_llm_call",
+        settled=True,
+    )
+    store.record_hook(
+        context(
+            "pre-b",
+            turn_id="turn-b",
+            observed_at=NOW + timedelta(minutes=1),
+        ),
+        "pre_llm_call",
+    )
+    store.abandon_open_turn(
+        "lifecycle-1",
+        "turn-b",
+        observed_at=NOW + timedelta(minutes=2),
+    )
+    finalized = store.record_hook(
+        context("finalize", source_kind="system", fresh=False),
+        "on_session_finalize",
+    )
+    assert finalized.snapshot.finalized is True
+    assert finalized.snapshot.settled_turn_ids == ("turn-a",)
+    assert finalized.snapshot.abandoned_turn_ids == ("turn-b",)
+
+
+def test_terminal_append_failure_does_not_open_successor(tmp_path, monkeypatch) -> None:
+    store = SessionLifecycleStore(tmp_path)
+    store.record_hook(
+        context("pre-a", turn_id="turn-a", supported_hooks=TURN_HOOKS),
+        "pre_llm_call",
+    )
+    original_append = store.ledger.append
+
+    def fail_terminal(row):
+        if row["kind"] == "turn_terminal":
+            raise OSError("terminal append fixture")
+        return original_append(row)
+
+    monkeypatch.setattr(store.ledger, "append", fail_terminal)
+    with pytest.raises(OSError, match="terminal append fixture"):
+        store.record_hook(
+            context(
+                "pre-b",
+                turn_id="turn-b",
+                supported_hooks=TURN_HOOKS,
+                observed_at=NOW + timedelta(minutes=1),
+            ),
+            "pre_llm_call",
+        )
+    assert store.ledger.rows()[0]["turn_id"] == "turn-a"
+    monkeypatch.setattr(store.ledger, "append", original_append)
+    assert (
+        store.record_hook(
+            context(
+                "pre-b",
+                turn_id="turn-b",
+                supported_hooks=TURN_HOOKS,
+                observed_at=NOW + timedelta(minutes=1),
+            ),
+            "pre_llm_call",
+        ).snapshot.open_turn_id
+        == "turn-b"
+    )
+
+
+def test_successor_append_failure_leaves_terminal_for_retry(
+    tmp_path, monkeypatch
+) -> None:
+    store = SessionLifecycleStore(tmp_path)
+    store.record_hook(
+        context("pre-a", turn_id="turn-a", supported_hooks=TURN_HOOKS),
+        "pre_llm_call",
+    )
+    original_append = store.ledger.append
+    failed = {"value": True}
+
+    def fail_successor(row):
+        if failed["value"] and row["kind"] == "hook" and row["turn_id"] == "turn-b":
+            failed["value"] = False
+            raise OSError("successor append fixture")
+        return original_append(row)
+
+    monkeypatch.setattr(store.ledger, "append", fail_successor)
+    with pytest.raises(OSError, match="successor append fixture"):
+        store.record_hook(
+            context(
+                "pre-b",
+                turn_id="turn-b",
+                supported_hooks=TURN_HOOKS,
+                observed_at=NOW + timedelta(minutes=1),
+            ),
+            "pre_llm_call",
+        )
+    assert [row["kind"] for row in store.ledger.rows()] == ["hook", "turn_terminal"]
+    monkeypatch.setattr(store.ledger, "append", original_append)
+    retry = store.record_hook(
+        context(
+            "pre-b",
+            turn_id="turn-b",
+            supported_hooks=TURN_HOOKS,
+            observed_at=NOW + timedelta(minutes=1),
+        ),
+        "pre_llm_call",
+    )
+    assert retry.deduplicated is False
+    assert retry.snapshot.abandoned_turn_ids == ("turn-a",)
+    assert len(store.ledger.rows()) == 3
+
+
+def test_mixed_ledger_replays_old_hook_rows_and_new_terminal_rows(tmp_path) -> None:
+    store = SessionLifecycleStore(tmp_path)
+    store.record_hook(
+        context("pre-a", turn_id="turn-a", supported_hooks=TURN_HOOKS),
+        "pre_llm_call",
+    )
+    repaired = store.abandon_open_turn("lifecycle-1", "turn-a", NOW)
+    assert repaired.deduplicated is False
+
+    reopened = SessionLifecycleStore(tmp_path)
+    snapshot = reopened.replay()[0]
+    assert snapshot.open_turn_id is None
+    assert snapshot.terminal_turn_ids == ("turn-a",)
+    assert snapshot.abandoned_turn_ids == ("turn-a",)
+    assert snapshot.settled_turn_ids == ()
+
+
+def test_concurrent_successors_and_repairs_have_one_terminal_per_turn(tmp_path) -> None:
+    store = SessionLifecycleStore(tmp_path)
+    store.record_hook(
+        context("pre-a", turn_id="turn-a", supported_hooks=TURN_HOOKS),
+        "pre_llm_call",
+    )
+
+    def successor(turn_id: str):
+        return store.record_hook(
+            context(
+                f"pre-{turn_id}",
+                turn_id=turn_id,
+                supported_hooks=TURN_HOOKS,
+            ),
+            "pre_llm_call",
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        receipts = list(pool.map(successor, ("turn-b", "turn-c")))
+    assert all(receipt.snapshot.open_turn_id for receipt in receipts)
+    terminal_rows = [
+        row for row in store.ledger.rows() if row["kind"] == "turn_terminal"
+    ]
+    assert len(terminal_rows) == 2
+    assert len({row["turn_id"] for row in terminal_rows}) == 2
+    assert store.snapshot("lifecycle-1").open_turn_id in {"turn-b", "turn-c"}
+
+    duplicate_store = SessionLifecycleStore(tmp_path / "duplicate-successor")
+    duplicate_store.record_hook(
+        context("pre-a", turn_id="turn-a", supported_hooks=TURN_HOOKS),
+        "pre_llm_call",
+    )
+
+    def duplicate_successor(_index: int):
+        return duplicate_store.record_hook(
+            context("pre-b", turn_id="turn-b", supported_hooks=TURN_HOOKS),
+            "pre_llm_call",
+        )
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        duplicate_receipts = list(pool.map(duplicate_successor, range(16)))
+    assert sum(not receipt.deduplicated for receipt in duplicate_receipts) == 1
+    assert duplicate_store.snapshot("lifecycle-1").open_turn_id == "turn-b"
+    assert [
+        row["turn_id"]
+        for row in duplicate_store.ledger.rows()
+        if row["kind"] == "turn_terminal"
+    ] == ["turn-a"]
+
+    repair_store = SessionLifecycleStore(tmp_path / "repair")
+    repair_store.record_hook(
+        context("pre", turn_id="turn", supported_hooks=TURN_HOOKS),
+        "pre_llm_call",
+    )
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        repairs = list(
+            pool.map(
+                lambda _: repair_store.abandon_open_turn("lifecycle-1", "turn"),
+                range(16),
+            )
+        )
+    assert sum(not repair.deduplicated for repair in repairs) == 1
+    assert len(repair_store.ledger.rows()) == 2
+
+    race_store = SessionLifecycleStore(tmp_path / "repair-vs-pre")
+    race_store.record_hook(
+        context("pre-a", turn_id="turn-a", supported_hooks=TURN_HOOKS),
+        "pre_llm_call",
+    )
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        successor_future = pool.submit(
+            race_store.record_hook,
+            context("pre-b", turn_id="turn-b", supported_hooks=TURN_HOOKS),
+            "pre_llm_call",
+        )
+        repair_future = pool.submit(
+            race_store.abandon_open_turn,
+            "lifecycle-1",
+            "turn-a",
+        )
+        successor_future.result()
+        repair_future.result()
+    assert race_store.snapshot("lifecycle-1").open_turn_id == "turn-b"
+    assert [
+        row["turn_id"]
+        for row in race_store.ledger.rows()
+        if row["kind"] == "turn_terminal"
+    ] == ["turn-a"]
 
 
 def test_append_failure_is_fail_closed_and_retryable(tmp_path, monkeypatch) -> None:

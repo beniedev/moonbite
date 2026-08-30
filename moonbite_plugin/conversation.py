@@ -1155,6 +1155,8 @@ class ConversationBridge:
         if session_snapshot is None:
             open_turn_id = None
             settled_turn_ids: tuple[str, ...] = ()
+            terminal_turn_ids: tuple[str, ...] = ()
+            abandoned_turn_ids: tuple[str, ...] = ()
             session_evidence = False
         else:
             raw_open_turn = session_snapshot.open_turn_id
@@ -1169,6 +1171,46 @@ class ConversationBridge:
             settled_turn_ids = tuple(
                 _reference(item, "turn_id") for item in raw_settled
             )
+            terminal_field_present = hasattr(session_snapshot, "terminal_turn_ids")
+            abandoned_field_present = hasattr(session_snapshot, "abandoned_turn_ids")
+            raw_terminal = getattr(session_snapshot, "terminal_turn_ids", ())
+            raw_abandoned = getattr(session_snapshot, "abandoned_turn_ids", ())
+            if not isinstance(raw_terminal, (tuple, list)):
+                raise StateError("session terminal_turn_ids are invalid")
+            if not isinstance(raw_abandoned, (tuple, list)):
+                raise StateError("session abandoned_turn_ids are invalid")
+            try:
+                terminal_turn_ids = tuple(
+                    _reference(item, "turn_id") for item in raw_terminal
+                )
+                abandoned_turn_ids = tuple(
+                    _reference(item, "turn_id") for item in raw_abandoned
+                )
+            except (TypeError, ValueError) as exc:
+                raise StateError("session terminal turn evidence is invalid") from exc
+            if len(terminal_turn_ids) != len(set(terminal_turn_ids)):
+                raise StateError("session terminal_turn_ids are duplicated")
+            if len(abandoned_turn_ids) != len(set(abandoned_turn_ids)):
+                raise StateError("session abandoned_turn_ids are duplicated")
+            terminal_set = set(terminal_turn_ids)
+            if terminal_field_present and not set(settled_turn_ids).issubset(
+                terminal_set
+            ):
+                raise StateError("session settled turns are missing terminal evidence")
+            if abandoned_field_present and not set(abandoned_turn_ids).issubset(
+                terminal_set
+            ):
+                raise StateError(
+                    "session abandoned turns are missing terminal evidence"
+                )
+            if (
+                terminal_field_present
+                and abandoned_field_present
+                and (set(settled_turn_ids) & set(abandoned_turn_ids))
+            ):
+                raise StateError("session turn has conflicting terminal outcomes")
+            if open_turn_id is not None and open_turn_id in terminal_set:
+                raise StateError("session open turn has terminal evidence")
             session_evidence = True
 
         dirty = cycle is not None and bool(cycle.dirty_event_ids)
@@ -1189,7 +1231,14 @@ class ConversationBridge:
         settled = (
             cycle is not None and cycle.last_settled_at is not None and not unsettled
         )
-        active_chat = open_turn_id is not None or unsettled
+        latest_terminal_turn_id = terminal_turn_ids[-1] if terminal_turn_ids else None
+        latest_terminal_is_abandoned = (
+            latest_terminal_turn_id is not None
+            and latest_terminal_turn_id in abandoned_turn_ids
+        )
+        active_chat = open_turn_id is not None or (
+            unsettled and not latest_terminal_is_abandoned
+        )
         quiet_until = (
             None
             if cycle is None or cycle.last_settled_at is None

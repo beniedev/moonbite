@@ -181,6 +181,19 @@ def _setup_cli(parser: argparse.ArgumentParser) -> None:
     commands.add_parser("status", help="Show effective runtime status")
     commands.add_parser("doctor", help="Validate configuration without model calls")
 
+    session = commands.add_parser(
+        "session", help="Inspect or repair session lifecycle turn ownership"
+    )
+    session_commands = session.add_subparsers(dest="session_command")
+    session_commands.add_parser(
+        "status", help="List exact identifiers for currently open turns"
+    )
+    repair = session_commands.add_parser(
+        "repair", help="Abandon one exact open turn as non-success"
+    )
+    repair.add_argument("--lifecycle-id", required=True)
+    repair.add_argument("--turn-id", required=True)
+
     control = commands.add_parser("control", help="Inspect or change runtime controls")
     control.add_argument("action", choices=("status", "pause", "resume", "quota_save"))
     control.add_argument(
@@ -289,6 +302,20 @@ def _cli_handler(
         result = runtime.status(include_private_paths=True)
     elif command == "doctor":
         result = doctor_report(raw_config, runtime=runtime)
+    elif command == "session":
+        if args.session_command == "status":
+            result = runtime.session_status()
+        elif args.session_command == "repair":
+            result = runtime.repair_session_turn(
+                args.lifecycle_id,
+                args.turn_id,
+            )
+        else:
+            print(
+                "usage: hermes moonbite session {status,repair "
+                "--lifecycle-id ID --turn-id ID}"
+            )
+            return 2
     elif command == "control":
         result = runtime.control(
             args.action,
@@ -373,7 +400,11 @@ def _cli_handler(
         )
     else:
         print(
-            "usage: hermes moonbite {status,doctor,control,event,heartbeat,autonomy,panel,memory-search,memory-recall,memory-resurface,memory-maintenance-propose,memory-maintenance-apply,memory-open,memory-add,diary-synthesize}"
+            "usage: hermes moonbite "
+            "{status,doctor,session,control,event,heartbeat,autonomy,panel,"
+            "memory-search,memory-recall,memory-resurface,"
+            "memory-maintenance-propose,memory-maintenance-apply,memory-open,"
+            "memory-add,diary-synthesize}"
         )
         return 2
     print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True, default=str))

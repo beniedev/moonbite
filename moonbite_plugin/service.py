@@ -671,6 +671,43 @@ class MoonbiteRuntime:
             )
         return result
 
+    def session_status(self) -> dict[str, Any]:
+        """Return exact identifiers for currently open session turns.
+
+        This deliberately reports ownership, not an orphan classification:
+        an open turn may still be making progress.
+        """
+
+        open_turns = [
+            {
+                "session_id": snapshot.session_id,
+                "lifecycle_id": snapshot.lifecycle_id,
+                "turn_id": snapshot.open_turn_id,
+            }
+            for snapshot in self.session_store.snapshots()
+            if snapshot.open_turn_id is not None
+        ]
+        return {"ok": True, "open_turns": open_turns}
+
+    def repair_session_turn(
+        self,
+        lifecycle_id: str,
+        turn_id: str,
+    ) -> dict[str, Any]:
+        """Abandon one exact open turn without claiming successful completion."""
+
+        receipt = self.session_store.abandon_open_turn(lifecycle_id, turn_id)
+        return {
+            "ok": True,
+            "status": ("already_repaired" if receipt.deduplicated else "repaired"),
+            "session_id": receipt.session_id,
+            "lifecycle_id": receipt.lifecycle_id,
+            "turn_id": receipt.turn_id,
+            "outcome": receipt.outcome,
+            "reason": receipt.reason,
+            "superseded_by_turn_id": receipt.superseded_by_turn_id,
+        }
+
     def control(
         self,
         action: str,

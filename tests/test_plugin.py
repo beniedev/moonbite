@@ -782,6 +782,75 @@ def test_cli_parser_and_handler_round_trip(capsys, monkeypatch, tmp_path):
     assert json.loads(capsys.readouterr().out)["ok"] is True
 
 
+def test_session_status_and_exact_repair_cli(capsys, monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
+    state_root = tmp_path / "state"
+    ctx = FakeContext({"state": {"directory": str(state_root)}})
+    register(ctx)
+    ctx.hooks["on_session_start"](session_id="session-cli")
+    ctx.hooks["pre_llm_call"](
+        session_id="session-cli",
+        turn_id="turn-cli",
+    )
+
+    parser = argparse.ArgumentParser()
+    ctx.cli["setup_fn"](parser)
+    assert ctx.cli["handler_fn"](parser.parse_args(["session", "status"])) == 0
+    status = json.loads(capsys.readouterr().out)
+    assert status == {
+        "ok": True,
+        "open_turns": [
+            {
+                "lifecycle_id": "session-cli",
+                "session_id": "session-cli",
+                "turn_id": "turn-cli",
+            }
+        ],
+    }
+
+    assert (
+        ctx.cli["handler_fn"](
+            parser.parse_args(
+                [
+                    "session",
+                    "repair",
+                    "--lifecycle-id",
+                    "session-cli",
+                    "--turn-id",
+                    "turn-cli",
+                ]
+            )
+        )
+        == 0
+    )
+    repaired = json.loads(capsys.readouterr().out)
+    assert repaired["ok"] is True
+    assert repaired["status"] == "repaired"
+    assert repaired["outcome"] == "abandoned"
+    assert repaired["reason"] == "operator_repair"
+    assert repaired["turn_id"] == "turn-cli"
+    assert "settled" not in repaired
+
+    assert (
+        ctx.cli["handler_fn"](
+            parser.parse_args(
+                [
+                    "session",
+                    "repair",
+                    "--lifecycle-id",
+                    "session-cli",
+                    "--turn-id",
+                    "turn-cli",
+                ]
+            )
+        )
+        == 0
+    )
+    already = json.loads(capsys.readouterr().out)
+    assert already["status"] == "already_repaired"
+    assert already["outcome"] == "abandoned"
+
+
 def test_cli_and_slash_doctor_receive_registered_runtime(capsys, monkeypatch, tmp_path):
     import moonbite_plugin.plugin as plugin_module
 

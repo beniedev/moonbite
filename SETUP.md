@@ -136,10 +136,36 @@ Moonbite registers exactly 5 lifecycle hooks in Hermes (in actual `HOOK_ORDER`):
 1. `pre_gateway_dispatch`: Runs before message authorization; provides a pre-authorization host context seam. Without an explicit typed host resolver, it acts as a no-op and never reads or records unauthorized message content.
 2. `on_session_start`: Fires when a session starts; records normalized session-start lifecycle telemetry when resolvable context is available.
 3. `pre_llm_call`: Fires before an LLM call; records the lifecycle step and may attach fresh Panel Afterglow or enabled Memory recall as bounded, untrusted context (never as instructions).
-4. `post_llm_call`: Fires after an LLM call; records the settled post-model lifecycle state.
+4. `post_llm_call`: Fires only when Hermes has a non-empty final response and the turn was not interrupted; records a completed post-model turn.
 5. `on_session_finalize`: Fires when a session finishes; records normalized session finalization.
 
-### 2.8 Enabling optional modules incrementally
+### 2.8 Recover an orphaned turn
+
+Hermes may omit `post_llm_call` for an interrupted or empty-final-response
+turn. Moonbite does not treat the missing callback as success. When the next
+`pre_llm_call` arrives for the same lifecycle, Moonbite first appends an
+`abandoned` terminal for the old turn, then opens the new turn.
+
+For a session that has no new traffic, inspect the exact current IDs before
+repairing it:
+
+```bash
+hermes moonbite session status
+hermes moonbite session repair \
+  --lifecycle-id "<lifecycle-id>" \
+  --turn-id "<open-turn-id>"
+```
+
+`session status` reports open turns; it cannot determine whether a turn is
+still running. The repair command uses both IDs as a compare-and-set guard and
+appends an `abandoned` terminal. It never writes a synthetic successful
+`post_llm_call`, never marks the turn settled, and is safe to repeat. Do not
+edit `session_lifecycle.jsonl` by hand.
+
+An abandoned terminal releases the active-chat liveness gate for that turn,
+but it does not satisfy checkpoint or successful-response requirements.
+
+### 2.9 Enabling optional modules incrementally
 
 Once the inert baseline is verified:
 1. Choose exactly one optional module (for example, `modules.panel: true`).
@@ -232,6 +258,12 @@ long-running Hermes process, and run `hermes moonbite doctor`. To return to an
 earlier plugin revision, reinstall its reviewed full SHA with `--force --ref`,
 then repeat the same restart and diagnostic steps. Keep the previous SHA and
 configuration backup before each preview upgrade.
+
+This change adds `moon.session.turn_terminal.v1` rows to the existing session
+lifecycle ledger. Moonbite `0.1.0a1` cannot read those rows. Take a state
+snapshot before upgrading, and do not run an older binary against state that
+contains the new terminal schema. A code rollback must either retain the new
+reader or restore the pre-upgrade state snapshot.
 
 ### 5.2 Disabling or removing the plugin
 

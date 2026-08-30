@@ -202,6 +202,128 @@ def test_schema_dirty_settled_and_non_private_receipts(tmp_path):
     assert settled.snapshot.active_chat is False
 
 
+def test_abandoned_turn_releases_active_gate_without_settling(tmp_path):
+    sessions, _effects, bridge = stores(tmp_path)
+    private_lifecycle(sessions, bridge)
+    sessions.abandon_open_turn(
+        "lifecycle-1",
+        "turn-1",
+        observed_at=NOW + timedelta(minutes=1),
+    )
+
+    snapshot = bridge.snapshot("lifecycle-1", now=NOW + timedelta(minutes=2))
+    assert snapshot.active_chat is False
+    assert snapshot.unsettled is True
+    assert snapshot.settled is False
+    assert snapshot.can_checkpoint is False
+    assert snapshot.blocked_reason == "unsettled"
+
+
+def test_abandoned_turn_releases_gate_when_dirty_event_has_no_turn_id(tmp_path):
+    sessions, _effects, bridge = stores(tmp_path)
+    gateway = sessions.record_hook(context("gateway"), "pre_gateway_dispatch")
+    bridge.observe(gateway)
+    start = sessions.record_hook(
+        context("start", source_kind="session_start"),
+        "on_session_start",
+    )
+    bridge.observe(start)
+    pre = sessions.record_hook(
+        context(
+            "pre",
+            source_kind="system",
+            turn_id="turn-1",
+            fresh=False,
+        ),
+        "pre_llm_call",
+    )
+    bridge.observe(pre)
+
+    sessions.abandon_open_turn(
+        "lifecycle-1",
+        "turn-1",
+        observed_at=NOW + timedelta(minutes=1),
+    )
+
+    snapshot = bridge.snapshot("lifecycle-1", now=NOW + timedelta(minutes=2))
+    assert snapshot.active_chat is False
+    assert snapshot.unsettled is True
+    assert snapshot.settled is False
+    assert snapshot.can_checkpoint is False
+    assert snapshot.blocked_reason == "unsettled"
+
+
+def test_successor_turn_stays_active_then_completes_normally(tmp_path):
+    sessions, _effects, bridge = stores(tmp_path)
+    private_lifecycle(sessions, bridge)
+    successor = sessions.record_hook(
+        context(
+            "private-2",
+            turn_id="turn-2",
+            observed_at=NOW + timedelta(minutes=1),
+        ),
+        "pre_llm_call",
+    )
+    active = bridge.observe(successor)
+    assert active.snapshot.active_chat is True
+    assert active.snapshot.open_turn_id == "turn-2"
+    assert active.snapshot.unsettled is True
+
+    completed = sessions.record_hook(
+        context(
+            "assistant-2",
+            source_kind="assistant_response",
+            turn_id="turn-2",
+            fresh=False,
+            observed_at=NOW + timedelta(minutes=2),
+        ),
+        "post_llm_call",
+        settled=True,
+    )
+    settled = bridge.observe(completed)
+    assert settled.snapshot.active_chat is False
+    assert settled.snapshot.settled is True
+
+
+def test_old_injected_session_snapshot_without_terminal_fields_fails_closed(
+    tmp_path, monkeypatch
+):
+    sessions, _effects, bridge = stores(tmp_path)
+    private_lifecycle(sessions, bridge)
+    monkeypatch.setattr(
+        bridge.session_store,
+        "snapshot",
+        lambda _lifecycle_id: SimpleNamespace(
+            session_id="session-1",
+            lifecycle_id="lifecycle-1",
+            open_turn_id=None,
+            settled_turn_ids=(),
+        ),
+    )
+    snapshot = bridge.snapshot("lifecycle-1")
+    assert snapshot.active_chat is True
+    assert snapshot.unsettled is True
+
+
+def test_invalid_terminal_snapshot_inclusion_is_rejected(tmp_path, monkeypatch):
+    sessions, _effects, bridge = stores(tmp_path)
+    private_lifecycle(sessions, bridge)
+    monkeypatch.setattr(
+        bridge.session_store,
+        "snapshot",
+        lambda _lifecycle_id: SimpleNamespace(
+            session_id="session-1",
+            lifecycle_id="lifecycle-1",
+            open_turn_id=None,
+            settled_turn_ids=(),
+            terminal_turn_ids=(),
+            abandoned_turn_ids=("turn-1",),
+        ),
+    )
+    with pytest.raises(StateError, match="missing terminal"):
+        bridge.snapshot("lifecycle-1")
+
+
 @pytest.mark.parametrize(
     "source_kind",
     ["session_start", "assistant_response", "system", "cron", "workroom", "tool"],

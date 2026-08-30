@@ -18,16 +18,32 @@ or undocumented implementation fields.
 
 ## 1. Verified Surface & Lifecycle Hooks
 
-Moonbite registers exactly 10 tools, 15 CLI commands, 1 slash command (`/moon`), and 5 manifest hooks.
+Moonbite registers exactly 10 tools, 16 CLI commands, 1 slash command (`/moon`), and 5 manifest hooks.
 
-The 5 manifest hooks execute in strict `HOOK_ORDER`:
+The 5 manifest hooks are registered in strict `HOOK_ORDER`:
 1. `pre_gateway_dispatch`: Fires before message authorization, providing a pre-auth host context seam. Without an explicit typed host resolver, Moonbite treats this as a no-op and never reads or records unauthorized message content.
 2. `on_session_start`: Fires when a session initializes; records normalized session-start lifecycle telemetry when resolvable context is available.
 3. `pre_llm_call`: Fires immediately before model invocation; records lifecycle step and optionally attaches fresh Panel Afterglow or enabled Memory recall as bounded, untrusted context (never as instructions).
-4. `post_llm_call`: Fires after model generation; records settled post-model lifecycle state.
+4. `post_llm_call`: Fires only for a non-empty, non-interrupted final response; records a completed post-model turn.
 5. `on_session_finalize`: Fires when a session finishes; records normalized session finalization.
 
 The outer manifest (`plugin.yaml`) retains `manifest_version: 1` and `kind: standalone` because the pinned Hermes installer accepts only v1 manifests.
+
+### Turn liveness contract
+
+Moonbite does not require `post_llm_call` to fire for every `pre_llm_call`.
+A later pre-model hook records the previous open turn as `abandoned` under the
+same mutation lock before opening its successor. Operators can inspect open
+turns with `hermes moonbite session status` and append the same non-success
+terminal with an exact-ID `session repair` command. Both paths preserve the
+append-only ledger and never manufacture a completed response.
+
+`settled_turn_ids` continues to contain completed turns only. An abandoned
+turn no longer holds the active-chat gate forever, but remains unsettled and
+cannot make a checkpoint eligible. The additive
+`moon.session.turn_terminal.v1` ledger row is not readable by Moonbite
+`0.1.0a1`; deployments must snapshot state before upgrading and must not point
+an older binary at upgraded state.
 
 ---
 

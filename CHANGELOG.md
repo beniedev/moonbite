@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Session recovery:** `hermes moonbite session status` lists exact open turns, and `session repair` appends an idempotent `abandoned` terminal for the specified current turn without fabricating a successful model response.
+
+### Fixed
+
+- **Orphaned turns:** a new `pre_llm_call` safely supersedes an older turn whose `post_llm_call` was omitted, preserving append-only audit history while preventing the Conversation Gate from remaining permanently active.
+
+### Compatibility
+
+- Session ledgers may now contain additive `moon.session.turn_terminal.v1` rows. Moonbite `0.1.0a1` cannot read upgraded state; take a state snapshot before upgrading and retain the new reader or restore that snapshot when rolling back.
+
 ## [0.1.0a1] - 2026-08-28
 
 ### Added

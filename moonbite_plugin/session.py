@@ -17,6 +17,7 @@ from .runtime_core import (
     isoformat,
     new_id,
     parse_time,
+    utc_now,
 )
 
 SESSION_LIFECYCLE_SCHEMA = "moon.session.lifecycle.v1"
@@ -24,6 +25,10 @@ SESSION_SCHEMA = SESSION_LIFECYCLE_SCHEMA
 LIFECYCLE_SCHEMA = SESSION_LIFECYCLE_SCHEMA
 SCHEMA_VERSION = SESSION_LIFECYCLE_SCHEMA
 SESSION_LIFECYCLE_KIND = "hook"
+SESSION_TURN_TERMINAL_SCHEMA = "moon.session.turn_terminal.v1"
+SESSION_TURN_TERMINAL_KIND = "turn_terminal"
+TURN_TERMINAL_OUTCOMES = frozenset({"abandoned"})
+TURN_TERMINAL_REASONS = frozenset({"superseded_by_new_pre", "operator_repair"})
 
 HOOK_ORDER = (
     "pre_gateway_dispatch",
@@ -65,6 +70,20 @@ _ROW_FIELDS = frozenset(
         "supported_hooks",
         "hook",
         "settled",
+    }
+)
+_TERMINAL_ROW_FIELDS = frozenset(
+    {
+        "schema_version",
+        "kind",
+        "event_id",
+        "session_id",
+        "lifecycle_id",
+        "turn_id",
+        "outcome",
+        "reason",
+        "superseded_by_turn_id",
+        "observed_at",
     }
 )
 
@@ -154,6 +173,8 @@ class SessionLifecycleSnapshot:
     open_turn_id: str | None
     finalized: bool
     private_contact_count: int
+    terminal_turn_ids: tuple[str, ...] = ()
+    abandoned_turn_ids: tuple[str, ...] = ()
 
     schema_version: ClassVar[str] = SESSION_LIFECYCLE_SCHEMA
 
@@ -239,6 +260,87 @@ SessionLifecycleState = SessionLifecycleSnapshot
 
 
 @dataclass(frozen=True, slots=True)
+class SessionTurnTerminal:
+    """Immutable non-hook terminal evidence for one session turn."""
+
+    schema_version: str
+    event_id: str
+    session_id: str
+    lifecycle_id: str
+    turn_id: str
+    outcome: str
+    reason: str
+    superseded_by_turn_id: str | None
+    observed_at: datetime
+
+    def __post_init__(self) -> None:
+        if self.schema_version != SESSION_TURN_TERMINAL_SCHEMA:
+            raise ValueError("unsupported turn terminal schema")
+        _reference(self.event_id, "event_id")
+        _reference(self.session_id, "session_id")
+        _reference(self.lifecycle_id, "lifecycle_id")
+        _reference(self.turn_id, "turn_id")
+        if self.outcome not in TURN_TERMINAL_OUTCOMES:
+            raise ValueError("unsupported turn terminal outcome")
+        if self.reason not in TURN_TERMINAL_REASONS:
+            raise ValueError("unsupported turn terminal reason")
+        if self.reason == "superseded_by_new_pre":
+            if self.superseded_by_turn_id is None:
+                raise ValueError("superseded terminal requires successor turn_id")
+            _reference(self.superseded_by_turn_id, "superseded_by_turn_id")
+            if self.superseded_by_turn_id == self.turn_id:
+                raise ValueError("turn cannot supersede itself")
+        elif self.superseded_by_turn_id is not None:
+            raise ValueError("operator repair cannot name a successor turn")
+        if not isinstance(self.observed_at, datetime):
+            raise TypeError("observed_at must be a datetime")
+        object.__setattr__(self, "observed_at", as_utc(self.observed_at))
+
+    def to_row(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "kind": SESSION_TURN_TERMINAL_KIND,
+            "event_id": self.event_id,
+            "session_id": self.session_id,
+            "lifecycle_id": self.lifecycle_id,
+            "turn_id": self.turn_id,
+            "outcome": self.outcome,
+            "reason": self.reason,
+            "superseded_by_turn_id": self.superseded_by_turn_id,
+            "observed_at": isoformat(self.observed_at),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class SessionTurnTerminalReceipt:
+    """Receipt returned after a turn terminal is appended or replayed."""
+
+    schema_version: str
+    event_id: str
+    session_id: str
+    lifecycle_id: str
+    turn_id: str
+    outcome: str
+    reason: str
+    superseded_by_turn_id: str | None
+    observed_at: datetime
+    deduplicated: bool
+    snapshot: SessionLifecycleSnapshot
+
+    @property
+    def already_repaired(self) -> bool:
+        return self.deduplicated
+
+    @property
+    def is_duplicate(self) -> bool:
+        return self.deduplicated
+
+    @property
+    def state(self) -> SessionLifecycleSnapshot:
+        return self.snapshot
+
+
+@dataclass(frozen=True, slots=True)
 class _Callback:
     context: SessionContext
     hook: str
@@ -262,8 +364,7 @@ class _Callback:
 
 @dataclass(slots=True)
 class _TurnState:
-    post_seen: bool = False
-    settled: bool = False
+    outcome: str | None = None
 
 
 @dataclass
@@ -277,6 +378,9 @@ class _LifecycleState:
     hooks: list[str] = field(default_factory=list)
     gates: set[str] = field(default_factory=set)
     turns: dict[str, _TurnState] = field(default_factory=dict)
+    terminals: dict[str, SessionTurnTerminal] = field(default_factory=dict)
+    terminal_turn_ids: list[str] = field(default_factory=list)
+    abandoned_turn_ids: list[str] = field(default_factory=list)
     current_turn_id: str | None = None
     settled_turn_ids: list[str] = field(default_factory=list)
     finalized: bool = False
@@ -291,6 +395,8 @@ def _snapshot(state: _LifecycleState) -> SessionLifecycleSnapshot:
         supported_hooks=state.supported_hooks,
         hooks=tuple(state.hooks),
         settled_turn_ids=tuple(state.settled_turn_ids),
+        terminal_turn_ids=tuple(state.terminal_turn_ids),
+        abandoned_turn_ids=tuple(state.abandoned_turn_ids),
         open_turn_id=state.current_turn_id,
         finalized=state.finalized,
         private_contact_count=state.private_contact_count,
@@ -439,16 +545,19 @@ class SessionLifecycleStore:
             turn_id = context.turn_id
             if turn_id is None:
                 raise SessionLifecycleError("post_llm_call requires turn_id")
+            turn = state.turns.get(turn_id)
+            if turn is not None and turn.outcome is not None:
+                raise SessionLifecycleError(
+                    f"turn is already terminal ({turn.outcome})"
+                )
             if state.current_turn_id != turn_id:
                 raise SessionLifecycleError(
                     "post_llm_call must match the current pre_llm_call turn"
                 )
-            turn = state.turns[turn_id]
-            if turn.settled:
-                raise SessionLifecycleError("turn is already settled")
-            turn.post_seen = True
+            assert turn is not None
             if callback.settled:
-                turn.settled = True
+                turn.outcome = "completed"
+                state.terminal_turn_ids.append(turn_id)
                 state.settled_turn_ids.append(turn_id)
                 state.current_turn_id = None
 
@@ -480,15 +589,11 @@ class SessionLifecycleStore:
         if "pre_llm_call" in supported and not state.turns:
             raise SessionLifecycleError("on_session_finalize requires pre_llm_call")
         if state.current_turn_id is not None or any(
-            not turn.settled for turn in state.turns.values()
+            turn.outcome is None for turn in state.turns.values()
         ):
             raise SessionLifecycleError(
-                "on_session_finalize requires all turns to be settled"
+                "on_session_finalize requires all turns to be terminal or settled"
             )
-        if "post_llm_call" in supported and not any(
-            turn.post_seen for turn in state.turns.values()
-        ):
-            raise SessionLifecycleError("on_session_finalize requires post_llm_call")
 
     @staticmethod
     def _callback_from_row(row: Mapping[str, Any]) -> _Callback:
@@ -554,20 +659,134 @@ class SessionLifecycleStore:
             event_id=event_id,
         )
 
+    @staticmethod
+    def _terminal_from_row(row: Mapping[str, Any]) -> SessionTurnTerminal:
+        if set(row) != _TERMINAL_ROW_FIELDS:
+            raise SessionLifecycleError("turn terminal row has invalid fields")
+        if row["schema_version"] != SESSION_TURN_TERMINAL_SCHEMA:
+            raise SessionLifecycleError("turn terminal row has an unsupported schema")
+        if row["kind"] != SESSION_TURN_TERMINAL_KIND:
+            raise SessionLifecycleError("turn terminal row has an unsupported kind")
+        if type(row["observed_at"]) is not str:
+            raise SessionLifecycleError("turn terminal observed_at is invalid")
+        if (
+            row["superseded_by_turn_id"] is not None
+            and type(row["superseded_by_turn_id"]) is not str
+        ):
+            raise SessionLifecycleError(
+                "turn terminal superseded_by_turn_id is invalid"
+            )
+        try:
+            return SessionTurnTerminal(
+                schema_version=row["schema_version"],
+                event_id=row["event_id"],
+                session_id=row["session_id"],
+                lifecycle_id=row["lifecycle_id"],
+                turn_id=row["turn_id"],
+                outcome=row["outcome"],
+                reason=row["reason"],
+                superseded_by_turn_id=row["superseded_by_turn_id"],
+                observed_at=parse_time(row["observed_at"]),
+            )
+        except (KeyError, TypeError, ValueError, StateError) as exc:
+            raise SessionLifecycleError("turn terminal row is invalid") from exc
+
+    @staticmethod
+    def _validate_state_identity(
+        state: _LifecycleState, context: SessionContext
+    ) -> None:
+        if context.lifecycle_id != state.lifecycle_id:
+            raise SessionLifecycleError("callback lifecycle_id does not match state")
+        if context.session_id != state.session_id:
+            raise SessionLifecycleError("session_id changed within a lifecycle")
+        if context.supported_hooks != state.supported_hooks:
+            raise SessionLifecycleError("supported_hooks changed within a lifecycle")
+
+    @staticmethod
+    def _validate_new_pre(state: _LifecycleState, callback: _Callback) -> None:
+        context = callback.context
+        if state.finalized:
+            raise SessionLifecycleError("session lifecycle is already finalized")
+        if callback.hook not in context.supported_hooks:
+            raise SessionLifecycleError(
+                f"hook {callback.hook!r} is not supported by this lifecycle"
+            )
+        turn_id = context.turn_id
+        if turn_id is None:
+            raise SessionLifecycleError("pre_llm_call requires turn_id")
+        if (
+            "pre_gateway_dispatch" in context.supported_hooks
+            and "pre_gateway_dispatch" not in state.gates
+        ):
+            raise SessionLifecycleError("pre_llm_call requires pre_gateway_dispatch")
+        if (
+            "on_session_start" in context.supported_hooks
+            and "on_session_start" not in state.gates
+        ):
+            raise SessionLifecycleError("pre_llm_call requires on_session_start")
+        if turn_id in state.turns:
+            raise SessionLifecycleError("turn_id was already used")
+
+    @staticmethod
+    def _apply_terminal(state: _LifecycleState, terminal: SessionTurnTerminal) -> None:
+        if terminal.lifecycle_id != state.lifecycle_id:
+            raise SessionLifecycleError("terminal lifecycle_id does not match state")
+        if terminal.session_id != state.session_id:
+            raise SessionLifecycleError(
+                "terminal session_id changed within a lifecycle"
+            )
+        if state.finalized:
+            raise SessionLifecycleError("session lifecycle is already finalized")
+        if terminal.turn_id in state.terminals:
+            raise SessionLifecycleError("turn already has a terminal")
+        turn = state.turns.get(terminal.turn_id)
+        if turn is None:
+            raise SessionLifecycleError("terminal references an unknown turn")
+        if turn.outcome is not None:
+            raise SessionLifecycleError(f"turn is already terminal ({turn.outcome})")
+        if state.current_turn_id != terminal.turn_id:
+            raise SessionLifecycleError(
+                "terminal must match the current pre_llm_call turn"
+            )
+        turn.outcome = terminal.outcome
+        state.terminals[terminal.turn_id] = terminal
+        state.terminal_turn_ids.append(terminal.turn_id)
+        if terminal.outcome == "abandoned":
+            state.abandoned_turn_ids.append(terminal.turn_id)
+        state.current_turn_id = None
+
     def _replay_unlocked(self) -> dict[str, _LifecycleState]:
         states: dict[str, _LifecycleState] = {}
         event_ids: set[str] = set()
         for row_number, row in enumerate(self.ledger.rows(), start=1):
             try:
-                callback = self._callback_from_row(row)
-                if callback.event_id in event_ids:
+                kind = row.get("kind")
+                if kind == SESSION_LIFECYCLE_KIND:
+                    callback = self._callback_from_row(row)
+                    event_id = callback.event_id
+                elif kind == SESSION_TURN_TERMINAL_KIND:
+                    terminal = self._terminal_from_row(row)
+                    event_id = terminal.event_id
+                else:
+                    raise SessionLifecycleError(
+                        "session lifecycle row has an unsupported kind"
+                    )
+                if event_id in event_ids:
                     raise SessionLifecycleError("duplicate session lifecycle event_id")
-                event_ids.add(callback.event_id)
-                state = states.get(callback.context.lifecycle_id)
-                if state is None:
-                    state = self._new_state(callback.context)
-                    states[callback.context.lifecycle_id] = state
-                self._apply(state, callback, allow_duplicate=False)
+                event_ids.add(event_id)
+                if kind == SESSION_LIFECYCLE_KIND:
+                    state = states.get(callback.context.lifecycle_id)
+                    if state is None:
+                        state = self._new_state(callback.context)
+                        states[callback.context.lifecycle_id] = state
+                    self._apply(state, callback, allow_duplicate=False)
+                else:
+                    state = states.get(terminal.lifecycle_id)
+                    if state is None:
+                        raise SessionLifecycleError(
+                            "turn terminal references an unknown lifecycle"
+                        )
+                    self._apply_terminal(state, terminal)
             except SessionLifecycleError as exc:
                 raise SessionLifecycleError(
                     f"session_lifecycle.jsonl row {row_number} is invalid"
@@ -594,6 +813,27 @@ class SessionLifecycleStore:
             snapshot=_snapshot(state),
         )
 
+    @staticmethod
+    def _terminal_receipt(
+        terminal: SessionTurnTerminal,
+        state: _LifecycleState,
+        *,
+        deduplicated: bool,
+    ) -> SessionTurnTerminalReceipt:
+        return SessionTurnTerminalReceipt(
+            schema_version=terminal.schema_version,
+            event_id=terminal.event_id,
+            session_id=terminal.session_id,
+            lifecycle_id=terminal.lifecycle_id,
+            turn_id=terminal.turn_id,
+            outcome=terminal.outcome,
+            reason=terminal.reason,
+            superseded_by_turn_id=terminal.superseded_by_turn_id,
+            observed_at=terminal.observed_at,
+            deduplicated=deduplicated,
+            snapshot=_snapshot(state),
+        )
+
     def record_hook(
         self,
         context: SessionContext,
@@ -616,15 +856,43 @@ class SessionLifecycleStore:
             if state is None:
                 state = self._new_state(context)
                 states[context.lifecycle_id] = state
-            deduplicated = self._apply(state, callback, allow_duplicate=True)
-            if deduplicated:
-                existing = state.callbacks[callback.key]
+            existing = state.callbacks.get(callback.key)
+            if existing is not None:
+                # Let the normal identity validator handle duplicate and
+                # conflicting callbacks before any recovery path runs.
+                self._apply(state, callback, allow_duplicate=True)
                 callback = existing
+                deduplicated = True
             else:
+                if hook == "pre_llm_call":
+                    # Validate the successor before closing the old turn. This
+                    # keeps rejected pre callbacks from mutating durable state.
+                    self._validate_state_identity(state, context)
+                    self._validate_new_pre(state, callback)
+                if hook == "pre_llm_call" and state.current_turn_id is not None:
+                    old_turn_id = state.current_turn_id
+                    assert old_turn_id is not None
+                    terminal = SessionTurnTerminal(
+                        schema_version=SESSION_TURN_TERMINAL_SCHEMA,
+                        event_id=new_id("session_turn_terminal"),
+                        session_id=state.session_id,
+                        lifecycle_id=state.lifecycle_id,
+                        turn_id=old_turn_id,
+                        outcome="abandoned",
+                        reason="superseded_by_new_pre",
+                        superseded_by_turn_id=context.turn_id,
+                        observed_at=context.observed_at,
+                    )
+                    self._apply_terminal(state, terminal)
+                    # If this append fails, the successor pre is not opened.
+                    # A later retry replays the durable terminal and proceeds.
+                    self.ledger.append(terminal.to_row())
                 # JsonlLedger propagates all write errors. State is rebuilt from
                 # disk on the next retry, so a failed append cannot leak a
                 # partially accepted callback into this store instance.
+                self._apply(state, callback, allow_duplicate=True)
                 self.ledger.append(callback.to_row())
+                deduplicated = False
             return self._receipt(
                 callback,
                 state,
@@ -636,6 +904,60 @@ class SessionLifecycleStore:
         with file_lock(self.mutation_lock):
             state = self._replay_unlocked().get(lifecycle_id)
             return None if state is None else _snapshot(state)
+
+    def abandon_open_turn(
+        self,
+        lifecycle_id: str,
+        turn_id: str,
+        observed_at: datetime | None = None,
+    ) -> SessionTurnTerminalReceipt:
+        """Append an exact operator repair for the current open turn.
+
+        This is a compare-and-set operation under the same mutation lock as
+        hook recording.  A previously abandoned turn is returned as-is,
+        while unknown, completed, or no-longer-current turns are rejected.
+        """
+
+        _reference(lifecycle_id, "lifecycle_id")
+        _reference(turn_id, "turn_id")
+        effective_observed_at = utc_now() if observed_at is None else observed_at
+        if not isinstance(effective_observed_at, datetime):
+            raise TypeError("observed_at must be a datetime")
+        effective_observed_at = as_utc(effective_observed_at)
+        with file_lock(self.mutation_lock):
+            state = self._replay_unlocked().get(lifecycle_id)
+            if state is None:
+                raise SessionLifecycleError("lifecycle_id was not found")
+            existing = state.terminals.get(turn_id)
+            if existing is not None:
+                if existing.outcome != "abandoned":
+                    raise SessionLifecycleError("turn is already terminal")
+                return self._terminal_receipt(existing, state, deduplicated=True)
+            turn = state.turns.get(turn_id)
+            if turn is None:
+                raise SessionLifecycleError("turn_id was not found")
+            if turn.outcome is not None:
+                raise SessionLifecycleError(
+                    f"turn is already terminal ({turn.outcome})"
+                )
+            if state.current_turn_id != turn_id:
+                raise SessionLifecycleError(
+                    "turn_id does not match the current open turn"
+                )
+            terminal = SessionTurnTerminal(
+                schema_version=SESSION_TURN_TERMINAL_SCHEMA,
+                event_id=new_id("session_turn_terminal"),
+                session_id=state.session_id,
+                lifecycle_id=state.lifecycle_id,
+                turn_id=turn_id,
+                outcome="abandoned",
+                reason="operator_repair",
+                superseded_by_turn_id=None,
+                observed_at=effective_observed_at,
+            )
+            self._apply_terminal(state, terminal)
+            self.ledger.append(terminal.to_row())
+            return self._terminal_receipt(terminal, state, deduplicated=False)
 
     def snapshots(self) -> tuple[SessionLifecycleSnapshot, ...]:
         with file_lock(self.mutation_lock):
