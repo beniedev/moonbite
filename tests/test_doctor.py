@@ -105,3 +105,30 @@ def test_doctor_runtime_uses_existing_runtime_health(tmp_path):
     assert report["plugin_loaded"] is True
     assert report["health"]["target_date"] == "2026-08-24"
     assert not (tmp_path / "controls.jsonl").exists()
+
+
+def test_doctor_exposes_redacted_runtime_resolution(tmp_path):
+    runtime = MoonbiteRuntime(
+        {
+            "timezone": "America/Los_Angeles",
+            "state": {"directory": "/private/state"},
+            "delivery": {"target": "private-target"},
+            "model_routes": {
+                "schema_version": "moon.model_route_bindings.v1",
+                "main": {"alias": "private_main"},
+                "heartbeat": {"alias": "private_heartbeat"},
+                "hippocampus": {"alias": "private_memory"},
+            },
+        },
+        root=tmp_path,
+    )
+
+    report = doctor_report(runtime)
+
+    assert report["scenario_pack"] is None
+    effective = report["resolution"]["effective_config"]
+    assert effective["timezone"] == "<redacted>"
+    assert effective["state"]["directory"] == "<redacted>"
+    assert effective["delivery"]["target"] == "<redacted>"
+    assert effective["model_routes"]["main"]["alias"] == "<redacted>"
+    assert report["model_routes"]["roles"]["main"] == "<redacted>"

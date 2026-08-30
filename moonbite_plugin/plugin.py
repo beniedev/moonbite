@@ -12,7 +12,7 @@ from typing import Any
 
 from .autonomy import ActivityProvider, AutonomyJudge
 from .components import RuntimeComponents
-from .config import normalize_config, route_bindings
+from .config import route_bindings
 from .conversation import ConversationBridge
 from .doctor import doctor_report
 from .hermes_adapter import (
@@ -27,6 +27,7 @@ from .memory import DiaryWriter
 from .memory_orchestration import MemoryOrchestrator, SourceRegistry
 from .service import MoonbiteRuntime, SessionContextResolver
 from .session import HOOK_ORDER
+from .scenarios import resolve_config
 
 TOOL_NAMES = (
     "moonbite_status",
@@ -42,6 +43,7 @@ TOOL_NAMES = (
 )
 
 _RAW_CONFIG_MISSING = object()
+_SELECTED_PACK_MISSING = object()
 _MOONBITE_RUNTIME_TYPE = MoonbiteRuntime
 
 
@@ -706,10 +708,22 @@ def _register_tools(
         )
 
 
-def _resolve_raw_config(ctx: Any, raw_config: Any) -> Any:
-    if raw_config is _RAW_CONFIG_MISSING:
-        return ctx.get_config("config", default={})
-    return raw_config
+def _resolve_scenario_pack(ctx: Any) -> str | None:
+    return ctx.get_config("scenario_pack", default=None)
+
+
+def _resolve_config_inputs(
+    ctx: Any,
+    raw_config: Any,
+    selected_pack: Any = _SELECTED_PACK_MISSING,
+) -> tuple[Any, str | None]:
+    explicit_raw = raw_config is not _RAW_CONFIG_MISSING
+    resolved_raw = raw_config if explicit_raw else ctx.get_config("config", default={})
+    if selected_pack is _SELECTED_PACK_MISSING:
+        resolved_pack = None if explicit_raw else _resolve_scenario_pack(ctx)
+    else:
+        resolved_pack = selected_pack
+    return resolved_raw, resolved_pack
 
 
 def _validated_plan(plan: RegistrationPlan | None) -> RegistrationPlan:
@@ -743,6 +757,7 @@ def build_runtime(
     ctx: Any,
     *,
     raw_config: Any = _RAW_CONFIG_MISSING,
+    selected_pack: str | None | object = _SELECTED_PACK_MISSING,
     components: RuntimeComponents | None = None,
     heartbeat_judge: Judge | None = None,
     autonomy_judge: AutonomyJudge | None = None,
@@ -755,8 +770,9 @@ def build_runtime(
     approval_adapter: Any = None,
 ) -> MoonbiteRuntime:
     """Construct the Moonbite runtime without registering host surfaces."""
-    raw_config = _resolve_raw_config(ctx, raw_config)
-    config = normalize_config(raw_config)
+    raw_config, selected_pack = _resolve_config_inputs(ctx, raw_config, selected_pack)
+    resolution = resolve_config(raw_config, selected_pack)
+    config = resolution.effective_config
     bindings = route_bindings(config)
 
     if heartbeat_judge is None and bindings is not None:
@@ -782,6 +798,8 @@ def build_runtime(
         memory_orchestrator=memory_orchestrator,
         source_registry=source_registry,
         approval_adapter=approval_adapter,
+        resolution=resolution,
+        resolution_raw_config=raw_config,
     )
 
     if bindings is not None:
@@ -800,6 +818,7 @@ def register_runtime(
     runtime: MoonbiteRuntime,
     *,
     raw_config: Any = _RAW_CONFIG_MISSING,
+    selected_pack: str | None | object = _SELECTED_PACK_MISSING,
     plan: RegistrationPlan | None = None,
 ) -> None:
     """Register one planned Hermes surface for a same-context prebuilt runtime.
@@ -808,17 +827,21 @@ def register_runtime(
     unique registration owner because Hermes exposes no portable registration
     transaction or rollback API.
     """
-    raw_config = _resolve_raw_config(ctx, raw_config)
-    config = normalize_config(raw_config)
-    bindings = route_bindings(config)
-    plan = _validated_plan(plan)
-
     if not isinstance(runtime, _MOONBITE_RUNTIME_TYPE):
         raise TypeError("runtime must be a MoonbiteRuntime")
     if getattr(runtime, "_registration_context_owner", None) is not ctx:
         raise ValueError("runtime was built for a different Hermes context")
-    if runtime.config != config:
+    raw_config, selected_pack = _resolve_config_inputs(ctx, raw_config, selected_pack)
+    if (
+        runtime._resolution_raw_config != raw_config
+        or runtime._resolution_selected_pack != selected_pack
+    ):
         raise ValueError("runtime config does not match registration config")
+    if runtime.config != runtime.resolution.effective_config:
+        raise ValueError("runtime config does not match registration resolution")
+    config = runtime.config
+    bindings = route_bindings(config)
+    plan = _validated_plan(plan)
 
     # This preflight intentionally protects only this call's zero-to-one
     # transition.  The host registry remains responsible for duplicate names.
@@ -911,11 +934,12 @@ def register(
     approval_adapter: Any = None,
     plan: RegistrationPlan | None = None,
 ) -> MoonbiteRuntime:
-    raw_config = _resolve_raw_config(ctx, _RAW_CONFIG_MISSING)
+    raw_config, selected_pack = _resolve_config_inputs(ctx, _RAW_CONFIG_MISSING)
     plan = _validated_plan(plan)
     runtime = build_runtime(
         ctx,
         raw_config=raw_config,
+        selected_pack=selected_pack,
         components=components,
         heartbeat_judge=heartbeat_judge,
         autonomy_judge=autonomy_judge,
@@ -927,5 +951,11 @@ def register(
         source_registry=source_registry,
         approval_adapter=approval_adapter,
     )
-    register_runtime(ctx, runtime, raw_config=raw_config, plan=plan)
+    register_runtime(
+        ctx,
+        runtime,
+        raw_config=raw_config,
+        selected_pack=selected_pack,
+        plan=plan,
+    )
     return runtime

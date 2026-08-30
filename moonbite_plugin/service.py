@@ -6,6 +6,7 @@ import hashlib
 import json
 import logging
 from collections.abc import Callable, Mapping
+from copy import deepcopy
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -20,7 +21,6 @@ from .autonomy import (
     ProviderRegistry,
 )
 from .components import RuntimeComponents, RuntimeComponentsError
-from .config import normalize_config
 from .conversation import ConversationBridge
 from .effects import EffectReceipt, EffectRecord
 from .example_providers import example_activity_providers
@@ -55,6 +55,7 @@ from .observer import HealthSnapshot, ObservationFact, Observer, ScheduleProof
 from .platforms import PlatformInfo, detect_platform, state_root
 from .runtime_core import StateError, ensure_bounded_text, new_id, parse_time, utc_now
 from .session import HOOK_ORDER, SessionContext, SessionHookReceipt
+from .scenarios import ConfigResolution, resolve_config
 
 logger = logging.getLogger(__name__)
 
@@ -146,8 +147,21 @@ class MoonbiteRuntime:
         memory_orchestrator: MemoryOrchestrator | None = None,
         source_registry: SourceRegistry | None = None,
         approval_adapter: Any = None,
+        resolution: ConfigResolution | None = None,
+        selected_pack: str | None = None,
+        resolution_raw_config: Any = _MISSING,
     ):
-        self.config = normalize_config(raw_config)
+        if resolution is None:
+            resolution = resolve_config(raw_config, selected_pack)
+        elif not isinstance(resolution, ConfigResolution):
+            raise TypeError("resolution must be a ConfigResolution")
+        self.resolution = resolution
+        self.config = resolution.effective_config
+        resolution_input = (
+            raw_config if resolution_raw_config is _MISSING else resolution_raw_config
+        )
+        self._resolution_raw_config = deepcopy(resolution_input)
+        self._resolution_selected_pack = resolution.selected_pack
         provided_components = components is not None
         if provided_components and root is not None:
             raise RuntimeComponentsError("multiple_state_writers")
@@ -659,6 +673,7 @@ class MoonbiteRuntime:
             ),
             "scheduler": "host_owned",
             "delivery_adapter": self.config["delivery"]["adapter"],
+            "scenario_pack": self.resolution.selected_pack,
             "model_routes": bindings,
             "registered_activity_providers": list(self.providers.names()),
             "active_controls": self._active_control_metadata(now=effective_now),

@@ -8,12 +8,12 @@ from typing import Any
 
 from .config import (
     ConfigError,
-    normalize_config,
     route_bindings,
     validate_known_aliases,
 )
 from .observer import HealthSnapshot, ScheduleProof
 from .platforms import UnsupportedPlatformError, detect_platform, state_root
+from .scenarios import ConfigResolution, ScenarioPackError, resolve_config
 
 
 def _looks_like_runtime(value: Any) -> bool:
@@ -94,6 +94,8 @@ def doctor_report(
     now: datetime | None = None,
     schedule_proof: ScheduleProof | None = None,
     include_private_paths: bool = False,
+    selected_pack: str | None = None,
+    resolution: ConfigResolution | None = None,
 ) -> dict[str, Any]:
     """Return configuration and optional runtime health without side effects.
 
@@ -121,17 +123,34 @@ def doctor_report(
         schedule_proof=schedule_proof,
     )
     try:
-        config = normalize_config(raw)
+        if runtime is not None and isinstance(
+            getattr(runtime, "resolution", None), ConfigResolution
+        ):
+            resolved = runtime.resolution
+        elif resolution is not None:
+            if not isinstance(resolution, ConfigResolution):
+                raise TypeError("resolution must be a ConfigResolution")
+            resolved = resolution
+        else:
+            resolved = resolve_config(raw, selected_pack)
+        config = resolved.effective_config
         validate_known_aliases(config, known_aliases)
         platform = detect_platform()
     except (ConfigError, UnsupportedPlatformError) as exc:
         unsupported = isinstance(exc, UnsupportedPlatformError)
+        error_code = (
+            exc.code
+            if isinstance(exc, ScenarioPackError)
+            else "unsupported_platform"
+            if unsupported
+            else "invalid_config"
+        )
         return {
             "ok": False,
             "plugin_loaded": runtime is not None,
             "config_valid": False,
             "error": type(exc).__name__,
-            "code": "unsupported_platform" if unsupported else "invalid_config",
+            "code": error_code,
             "message": (
                 "Moonbite supports macOS and Linux/WSL."
                 if unsupported
@@ -150,12 +169,16 @@ def doctor_report(
         }
 
     bindings = route_bindings(config)
+    redacted = resolved.redacted_config
+    redacted_routes = redacted.get("model_routes")
     health_available = health_result.get("available") is True
     return {
         "ok": True,
         "plugin_loaded": runtime is not None,
         "config_valid": True,
         "config_version": config["config_version"],
+        "scenario_pack": resolved.selected_pack,
+        "resolution": resolved.to_dict(redacted=True),
         "enabled_modules": sorted(
             name for name, enabled in config["modules"].items() if enabled
         ),
@@ -177,7 +200,10 @@ def doctor_report(
             None
             if bindings is None
             else {
-                "roles": bindings.__dict__,
+                "roles": {
+                    role: redacted_routes[role]["alias"]
+                    for role in ("main", "heartbeat", "hippocampus")
+                },
                 "resolution": (
                     "verified" if known_aliases is not None else "host_owned_not_probed"
                 ),

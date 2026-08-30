@@ -23,8 +23,9 @@ from moonbite_plugin.service import MoonbiteRuntime
 
 
 class FakeContext:
-    def __init__(self, config=None):
+    def __init__(self, config=None, scenario_pack=None):
         self.config = {} if config is None else config
+        self.scenario_pack = scenario_pack
         self.cli = None
         self.slash = None
         self.tools = {}
@@ -33,8 +34,11 @@ class FakeContext:
         self.llm = object()
 
     def get_config(self, key, default=None):
-        assert key == "config"
-        return self.config
+        if key == "config":
+            return self.config
+        if key == "scenario_pack":
+            return self.scenario_pack
+        return default
 
     def register_cli_command(self, **kwargs):
         self.cli = kwargs
