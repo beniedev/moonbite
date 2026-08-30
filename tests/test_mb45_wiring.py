@@ -352,6 +352,7 @@ def test_provided_standalone_bundle_is_not_an_injection_seam(tmp_path):
 class RecordingContext:
     def __init__(self, config: dict[str, Any] | None = None):
         self.config = {} if config is None else config
+        self.scenario_pack = None
         self.llm = object()
         self.tools: dict[str, dict[str, Any]] = {}
         self.hooks: dict[str, Any] = {}
@@ -360,8 +361,11 @@ class RecordingContext:
         self.hook_order: list[str] = []
 
     def get_config(self, key: str, default=None):
-        assert key == "config"
-        return self.config
+        if key == "config":
+            return self.config
+        if key == "scenario_pack":
+            return self.scenario_pack
+        return default
 
     def register_tool(self, **kwargs: Any):
         self.registered.append("tool")

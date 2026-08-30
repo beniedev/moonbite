@@ -28,6 +28,9 @@ moonbite = "moonbite_plugin"
 [tool.setuptools.packages.find]
 include = ["moonbite_plugin*"]
 
+[tool.setuptools.package-data]
+moonbite_plugin = ["scenario_packs/*.json"]
+
 [tool.ruff]
 target-version = "py311"
 
