@@ -33,6 +33,112 @@ class FixtureRetriever:
         return self.hits
 
 
+@pytest.mark.parametrize(
+    ("query", "summary"),
+    [
+        ("口语", "偏好简短口语回复"),
+        ("かな", "かなを含む長い日記題名"),
+        ("カナ", "カナを含む長い日記本文"),
+        ("한글", "한글을 포함한 긴 기록"),
+    ],
+)
+def test_cjk_literal_fallback_covers_supported_scripts(tmp_path, query, summary):
+    memory = MemoryStore(tmp_path, clock=lambda: NOW)
+    card = memory.add_card(
+        summary,
+        provenance="user_explicit",
+        source_ref="conversation:fixture",
+        card_id="fixture-cjk-card",
+    )
+
+    hits = memory.search(query)
+
+    assert [(hit.open_ref, hit.score) for hit in hits] == [(card.open_ref, 1)]
+
+
+def test_cjk_fallback_keeps_score_order_gates_and_limit(tmp_path):
+    memory = MemoryStore(tmp_path, clock=lambda: NOW)
+    token_hit = memory.add_card(
+        "口语 回复 alpha",
+        provenance="user_explicit",
+        source_ref="conversation:fixture",
+        card_id="fixture-token-hit",
+    )
+    fallback_hit = memory.add_card(
+        "偏好口语 回复偏好",
+        provenance="user_explicit",
+        source_ref="conversation:fixture",
+        card_id="fixture-fallback-hit",
+    )
+    diary = memory.append_diary(
+        day=date(2026, 8, 22),
+        title="合成日记标题",
+        body="这里记录口语回复相关内容。",
+        source_ref="event:fixture",
+        entry_id="fixture-cjk-diary",
+    )
+
+    hits = memory.search("口语 回复")
+
+    assert [(hit.open_ref, hit.score) for hit in hits] == [
+        (token_hit.open_ref, 2),
+        (fallback_hit.open_ref, 1),
+    ]
+    assert [(hit.open_ref, hit.score) for hit in memory.search("口语回复")] == [
+        (diary.open_ref, 1)
+    ]
+    assert [hit.open_ref for hit in memory.search("口语 回复", limit=1)] == [
+        token_hit.open_ref
+    ]
+    assert memory.search("口") == []
+
+    original = memory.add_card(
+        "旧口语记录",
+        provenance="user_explicit",
+        source_ref="conversation:fixture",
+        card_id="fixture-history-old",
+        event_time="2026-01-01",
+        state_key="fixture.cjk",
+    )
+    current = memory.add_card(
+        "新口语记录",
+        provenance="user_explicit",
+        source_ref="conversation:fixture",
+        card_id="fixture-history-current",
+        event_time="2026-08-22",
+        state_key="fixture.cjk",
+        supersedes=[original.card_id],
+        supersession_kind="evolution",
+    )
+    default_refs = {hit.open_ref for hit in memory.search("口语")}
+    assert original.open_ref not in default_refs
+    assert current.open_ref in default_refs
+    assert {hit.open_ref for hit in memory.search("口语", include_historical=True)} == {
+        original.open_ref,
+        current.open_ref,
+        diary.open_ref,
+        fallback_hit.open_ref,
+        token_hit.open_ref,
+    }
+
+
+def test_lexical_recall_reconstructs_cjk_fallback_candidate(tmp_path):
+    memory = MemoryStore(tmp_path, clock=lambda: NOW)
+    card = memory.add_card(
+        "偏好口语 回复偏好",
+        provenance="user_explicit",
+        source_ref="conversation:fixture",
+        card_id="fixture-cjk-recall",
+    )
+
+    candidates = memory.lexical_recall("口语 回复")
+
+    assert [
+        (candidate.open_ref, candidate.score, candidate.excerpt)
+        for candidate in candidates
+    ] == [(card.open_ref, 1, "偏好口语 回复偏好")]
+
+
 def test_cards_and_diary_return_exact_open_references(tmp_path):
     memory = MemoryStore(tmp_path, clock=lambda: NOW)
     card = memory.add_card(
@@ -49,8 +155,10 @@ def test_cards_and_diary_return_exact_open_references(tmp_path):
         entry_id="fixture-diary",
     )
 
-    refs = {hit.open_ref for hit in memory.search("moonlit")}
-    assert refs == {card.open_ref, diary.open_ref}
+    assert [(hit.open_ref, hit.score) for hit in memory.search("moonlit")] == [
+        (card.open_ref, 1),
+        (diary.open_ref, 1),
+    ]
     assert memory.open(card.open_ref)["source_ref"] == "conversation:fixture"
     assert memory.open(diary.open_ref)["source_ref"] == "event:fixture"
 
@@ -416,7 +524,7 @@ def test_history_relations_project_current_corrected_and_medium_context(tmp_path
 def test_retire_apply_archives_without_deleting_and_replays(tmp_path):
     memory = MemoryStore(tmp_path, clock=lambda: NOW)
     card = memory.add_card(
-        "Archive boundary fixture",
+        "Archive boundary口语fixture",
         provenance="agent_observation",
         source_ref="event:fixture",
         card_id="archive-fixture",
@@ -454,6 +562,7 @@ def test_retire_apply_archives_without_deleting_and_replays(tmp_path):
     assert receipt["archived_card_ids"] == [card.card_id]
     assert "delete" not in str(receipt).casefold()
     assert memory.search("archive boundary") == []
+    assert memory.search("口语") == []
     assert memory.open(card.open_ref)["lifecycle_status"] == "archived"
 
     with pytest.raises(StateError, match="replay conflict"):

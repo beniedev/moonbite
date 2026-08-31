@@ -684,6 +684,28 @@ def test_external_provider_failure_falls_back_to_lexical_and_audits(tmp_path):
     assert audit.payload == {"status": "fallback", "error": "OSError"}
 
 
+@pytest.mark.parametrize("provider_failure", [False, True])
+def test_recall_memory_cjk_fallback_with_or_without_external(
+    tmp_path, provider_failure
+):
+    runtime = MoonbiteRuntime(
+        recall_config(),
+        root=tmp_path,
+        external_retriever=(
+            Retriever(error=OSError("provider fixture")) if provider_failure else None
+        ),
+    )
+    card = runtime.add_memory_card(
+        "偏好简短口语回复",
+        provenance="user_explicit",
+        source_ref="conversation:fixture",
+    )
+
+    result = runtime.recall_memory("口语")
+
+    assert [candidate.open_ref for candidate in result] == [f"card:{card['card_id']}"]
+
+
 def test_external_retriever_order_takes_precedence_when_refs_open(tmp_path):
     runtime = MoonbiteRuntime(recall_config(), root=tmp_path)
     lexical_first = runtime.add_memory_card(

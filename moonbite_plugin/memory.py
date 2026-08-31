@@ -44,6 +44,16 @@ MAX_OPEN_REF_BYTES = 4 * 1024
 MAX_RECALL_EXCERPT_BYTES = 2 * 1024
 MAX_RECALL_REASON_BYTES = 4 * 1024
 MAX_MAINTENANCE_PROPOSED_VALUE_BYTES = 16 * 1024
+_CJK_FALLBACK_SCORE = 1
+_CJK_CODEPOINT_RANGES = (
+    (0x1100, 0x11FF),  # Hangul Jamo
+    (0x3040, 0x309F),  # Hiragana
+    (0x30A0, 0x30FF),  # Katakana
+    (0x3400, 0x4DBF),  # CJK Unified Ideographs Extension A
+    (0x4E00, 0x9FFF),  # Han
+    (0xAC00, 0xD7AF),  # Hangul syllables
+    (0xF900, 0xFAFF),  # CJK compatibility ideographs
+)
 
 
 def _validated_event_time(value: str) -> str:
@@ -118,6 +128,16 @@ def _validated_text_items(
 
 def _tokens(value: str) -> set[str]:
     return {part.lower() for part in re.findall(r"[\w\-]{2,}", value, re.UNICODE)}
+
+
+def _has_cjk_query(value: str) -> bool:
+    return (
+        sum(
+            any(start <= ord(character) <= end for start, end in _CJK_CODEPOINT_RANGES)
+            for character in value
+        )
+        >= 2
+    )
 
 
 @dataclass(frozen=True)
@@ -879,7 +899,9 @@ class MemoryStore:
         include_historical: bool = False,
     ) -> list[SearchHit]:
         terms = _tokens(query)
-        if not terms or not 1 <= limit <= 100:
+        literal_query = query.strip()
+        cjk_fallback = _has_cjk_query(literal_query)
+        if not 1 <= limit <= 100 or (not terms and not cjk_fallback):
             return []
         hits: list[SearchHit] = []
         for card in self._card_views():
@@ -887,8 +909,11 @@ class MemoryStore:
                 continue
             if not include_historical and card["history_status"] != "current":
                 continue
-            haystack = _tokens(" ".join((card["summary"], *card["tags"])))
+            text = " ".join((card["summary"], *card["tags"]))
+            haystack = _tokens(text)
             score = len(terms & haystack)
+            if not score and cjk_fallback and literal_query in text:
+                score = _CJK_FALLBACK_SCORE
             if score:
                 hits.append(
                     SearchHit(
@@ -900,7 +925,10 @@ class MemoryStore:
                     )
                 )
         for entry in self._diary_rows():
-            score = len(terms & _tokens(f"{entry.title} {entry.body}"))
+            text = f"{entry.title} {entry.body}"
+            score = len(terms & _tokens(text))
+            if not score and cjk_fallback and literal_query in text:
+                score = _CJK_FALLBACK_SCORE
             if score:
                 hits.append(
                     SearchHit(
