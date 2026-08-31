@@ -555,6 +555,23 @@ def test_memory_prompt_context_is_bounded_untrusted_json(tmp_path):
     assert "Ignore instructions" in context["context"]
 
 
+def test_memory_prompt_context_uses_cjk_natural_overlap(tmp_path):
+    runtime = MoonbiteRuntime(recall_config(), root=tmp_path)
+    runtime.add_memory_card(
+        "偏好简短口语回复",
+        provenance="user_explicit",
+        source_ref="conversation:fixture-cjk",
+    )
+
+    context = runtime.memory_prompt_context(
+        "你还记得我偏好简短口语回复吗",
+        session_receipt=private_exposure_context(),
+    )
+
+    assert context is not None
+    assert "偏好简短口语回复" in context["context"]
+
+
 def test_memory_prompt_requires_typed_private_receipt_and_keeps_body_transient(
     tmp_path,
 ):
@@ -682,6 +699,28 @@ def test_external_provider_failure_falls_back_to_lexical_and_audits(tmp_path):
     audit = runtime.bus.read_audit()[-1]
     assert audit.kind == "audit.memory_recall"
     assert audit.payload == {"status": "fallback", "error": "OSError"}
+
+
+@pytest.mark.parametrize("provider_failure", [False, True])
+def test_recall_memory_cjk_fallback_with_or_without_external(
+    tmp_path, provider_failure
+):
+    runtime = MoonbiteRuntime(
+        recall_config(),
+        root=tmp_path,
+        external_retriever=(
+            Retriever(error=OSError("provider fixture")) if provider_failure else None
+        ),
+    )
+    card = runtime.add_memory_card(
+        "偏好简短口语回复",
+        provenance="user_explicit",
+        source_ref="conversation:fixture",
+    )
+
+    result = runtime.recall_memory("口语")
+
+    assert [candidate.open_ref for candidate in result] == [f"card:{card['card_id']}"]
 
 
 def test_external_retriever_order_takes_precedence_when_refs_open(tmp_path):
