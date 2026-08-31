@@ -120,6 +120,46 @@ class PathlessCadence:
         return NOW
 
 
+class LegacyDailyAnchorCadence:
+    """Minimal pre-kind cadence port used by host compatibility tests."""
+
+    def __init__(self, *, due_error=None, mark_error=None):
+        self.due_error = due_error
+        self.mark_error = mark_error
+        self.due_calls = 0
+        self.mark_calls = 0
+        self.anchor_epochs = []
+
+    def blocked(self, _kind):
+        return False, "open"
+
+    def clock(self):
+        return NOW
+
+    def daily_anchor_due(self, _now=None):
+        self.due_calls += 1
+        if self.due_error is not None:
+            raise self.due_error
+        return True
+
+    def daily_anchor_epoch(self, _now=None):
+        return "2026-08-22"
+
+    def mark_judge(
+        self,
+        *,
+        now=None,
+        next_judge_at=None,
+        cadence_minutes=None,
+        anchor_epoch=None,
+    ):
+        self.mark_calls += 1
+        self.anchor_epochs.append(anchor_epoch)
+        if self.mark_error is not None:
+            raise self.mark_error
+        return now
+
+
 class PathlessControls:
     @property
     def ledger(self):
@@ -930,6 +970,56 @@ def test_heartbeat_engine_settles_exact_daily_anchor_kind(tmp_path):
     }
 
 
+def test_heartbeat_engine_supports_pre_kind_injected_cadence_port(tmp_path):
+    cadence = LegacyDailyAnchorCadence()
+    judge = Judge(JudgeDecision(False, False, "silent"))
+    runtime = HeartbeatEngine(
+        bus=EventBus(tmp_path, clock=lambda: NOW),
+        controls=ControlStore(tmp_path, clock=lambda: NOW),
+        cadence=cadence,
+        judge=judge,
+        sink=Sink(),
+        locks=FakeLocks(),
+        kind_policies={
+            "day_open": _policy(profile="daily_anchor", host_only=True),
+        },
+    )
+
+    result = runtime.run(HeartbeatCandidate("day_open", {}))
+
+    assert (result.status, result.reason) == ("skipped", "silent")
+    assert (cadence.due_calls, cadence.mark_calls, judge.calls) == (1, 1, 1)
+    assert cadence.anchor_epochs == ["2026-08-22"]
+
+
+@pytest.mark.parametrize("failure_port", ["due", "mark"])
+def test_injected_cadence_internal_type_error_is_not_retried(tmp_path, failure_port):
+    error = TypeError("cadence internal fixture")
+    cadence = LegacyDailyAnchorCadence(
+        due_error=error if failure_port == "due" else None,
+        mark_error=error if failure_port == "mark" else None,
+    )
+    judge = Judge(JudgeDecision(False, False, "silent"))
+    runtime = HeartbeatEngine(
+        bus=EventBus(tmp_path, clock=lambda: NOW),
+        controls=ControlStore(tmp_path, clock=lambda: NOW),
+        cadence=cadence,
+        judge=judge,
+        sink=Sink(),
+        locks=FakeLocks(),
+        kind_policies={
+            "day_open": _policy(profile="daily_anchor", host_only=True),
+        },
+    )
+
+    result = runtime.run(HeartbeatCandidate("day_open", {}))
+
+    assert (result.status, result.reason) == ("failed", "cadence_state_error")
+    assert cadence.due_calls == 1
+    assert cadence.mark_calls == (0 if failure_port == "due" else 1)
+    assert judge.calls == (0 if failure_port == "due" else 1)
+
+
 def test_daily_anchor_manual_snooze_bypass_is_explicit_per_kind(tmp_path):
     judge = Judge(JudgeDecision(False, False, "silent"))
     runtime, _controls, _bus, cadence = engine(
@@ -1061,6 +1151,66 @@ def test_legacy_daily_anchor_completion_is_a_migrated_wildcard(
     assert cadence.daily_anchor_due(NOW + timedelta(days=1), kind="day_close") is True
     assert json.loads(cadence.path.read_text(encoding="utf-8"))["schema_version"] == (
         "moon.heartbeat.cadence.v4"
+    )
+
+
+def test_legacy_anchor_without_completion_fails_closed_without_rewrite(tmp_path):
+    cadence = HeartbeatCadence(tmp_path, clock=lambda: NOW)
+    cadence.path.write_text(
+        json.dumps(
+            {
+                "schema_version": "moon.heartbeat.cadence.v3",
+                "daily_anchor_epoch": "2026-08-22",
+            }
+        ),
+        encoding="utf-8",
+    )
+    before = cadence.path.read_bytes(), cadence.path.stat().st_mtime_ns
+
+    with pytest.raises(StateError, match="daily anchor state"):
+        cadence.daily_anchor_due(NOW, kind="day_open")
+    with pytest.raises(StateError, match="daily anchor state"):
+        cadence.snooze(60, manual=True)
+    facts = cadence.observer_status(target_date=NOW.date(), now=NOW)
+
+    assert len(facts) == 1
+    assert facts[0].state == "current"
+    assert "integrity" in facts[0].code
+    assert (cadence.path.read_bytes(), cadence.path.stat().st_mtime_ns) == before
+
+
+def test_legacy_incomplete_anchor_migrates_to_empty_exact_state(tmp_path):
+    cadence = HeartbeatCadence(tmp_path, clock=lambda: NOW)
+    cadence.path.write_text(
+        json.dumps(
+            {
+                "schema_version": "moon.heartbeat.cadence.v3",
+                "daily_anchor_epoch": "2026-08-22",
+                "daily_anchor_completed": False,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    cadence.snooze(60, manual=True)
+    persisted = json.loads(cadence.path.read_text(encoding="utf-8"))
+
+    assert cadence.daily_anchor_due(NOW, kind="day_open") is True
+    assert persisted["schema_version"] == "moon.heartbeat.cadence.v4"
+    assert persisted["daily_anchor_epochs"] == {}
+    assert persisted["daily_anchor_legacy_epoch"] is None
+
+
+def test_legacy_snapshot_completion_remains_true_across_epoch_boundary(tmp_path):
+    cadence = HeartbeatCadence(tmp_path, clock=lambda: NOW, anchor_hour=6)
+    cadence.mark_daily_anchor("2026-08-22", kind="daily_anchor", now=NOW)
+
+    snapshot = cadence.snapshot(now=NOW + timedelta(days=1))
+
+    assert snapshot["daily_anchor_epoch"] == "2026-08-22"
+    assert snapshot["daily_anchor_completed"] is True
+    assert (
+        cadence.daily_anchor_due(NOW + timedelta(days=1), kind="daily_anchor") is True
     )
 
 

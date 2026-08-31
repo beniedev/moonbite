@@ -239,6 +239,24 @@ def _daily_anchor_kind(value: Any, label: str = "daily anchor kind") -> str:
     return value
 
 
+def _accepts_keyword(method: Callable[..., Any], keyword: str) -> bool:
+    """Return whether a callable explicitly supports one keyword."""
+
+    try:
+        parameters = inspect.signature(method).parameters
+    except (TypeError, ValueError):
+        return False
+    parameter = parameters.get(keyword)
+    return (
+        parameter is not None
+        and parameter.kind
+        in {
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            inspect.Parameter.KEYWORD_ONLY,
+        }
+    ) or any(item.kind is inspect.Parameter.VAR_KEYWORD for item in parameters.values())
+
+
 def _json_time(value: datetime | None) -> str | None:
     return None if value is None else isoformat(value)
 
@@ -773,6 +791,8 @@ def _normalise_daily_anchor_state(
     epoch = raw.get("daily_anchor_epoch")
     if epoch is not None:
         _strict_iso_date(epoch, "heartbeat daily_anchor_epoch")
+        if "daily_anchor_completed" not in raw:
+            raise ValueError("heartbeat daily_anchor_completed is required with epoch")
     completed = raw.get("daily_anchor_completed", False)
     if type(completed) is not bool:
         raise ValueError("heartbeat daily_anchor_completed is invalid")
@@ -1780,9 +1800,7 @@ class HeartbeatCadence:
             # The old fields remain as a compatibility view for the default
             # kind; per-kind callers must use daily_anchor_epochs.
             "daily_anchor_epoch": default_anchor_epoch,
-            "daily_anchor_completed": bool(
-                default_anchor_epoch == self._anchor_epoch(effective_now)
-            ),
+            "daily_anchor_completed": bool(default_anchor_epoch),
             "daily_anchor_epochs": anchor_epochs,
             "daily_anchor_legacy_epoch": state["daily_anchor_legacy_epoch"],
             "daily_anchor_hour": self.anchor_hour,
@@ -2772,13 +2790,16 @@ class HeartbeatEngine:
                 "anchor_completed_for_epoch requires a daily_anchor kind profile"
             )
         if is_anchor:
-            try:
-                due = self.cadence.daily_anchor_due(now, kind=candidate.kind)
-            except AttributeError:
+            daily_anchor_due = getattr(self.cadence, "daily_anchor_due", None)
+            if not callable(daily_anchor_due):
                 # Compatibility fallback for a minimal injected cadence port.
                 # A durable cadence implementation remains the authority when
                 # it exposes daily_anchor_due().
                 due = completed is not True
+            elif _accepts_keyword(daily_anchor_due, "kind"):
+                due = daily_anchor_due(now, kind=candidate.kind)
+            else:
+                due = daily_anchor_due(now)
             return due, None if due else self._next_due(candidate, now)
         explicit = context.get("due")
         if explicit is not None and type(explicit) is not bool:
@@ -4031,33 +4052,34 @@ class HeartbeatEngine:
                 anchor_epoch = self.cadence.daily_anchor_epoch(now)
             except AttributeError:
                 pass
-        try:
+        mark_judge = getattr(self.cadence, "mark_judge", None)
+        if callable(mark_judge):
             mark_kwargs = {
                 "now": now,
                 "next_judge_at": decision.next_judge_at,
                 "cadence_minutes": decision.cadence_minutes,
                 "anchor_epoch": anchor_epoch,
             }
-            if anchor_epoch is not None:
+            if anchor_epoch is not None and _accepts_keyword(mark_judge, "anchor_kind"):
                 mark_kwargs["anchor_kind"] = candidate.kind
-            next_judge = self.cadence.mark_judge(
-                **mark_kwargs,
-            )
-        except AttributeError:
+        if not callable(mark_judge):
             next_judge = (
                 _optional_time(decision.next_judge_at, "next_judge_at")
                 if decision.next_judge_at is not None
                 else None
             )
-        except Exception:
-            return self._result(
-                "failed",
-                "cadence_state_error",
-                candidate_id,
-                gate,
-                code=HeartbeatReasonCode.CADENCE_ERROR,
-                decision=decision,
-            )
+        else:
+            try:
+                next_judge = mark_judge(**mark_kwargs)
+            except Exception:
+                return self._result(
+                    "failed",
+                    "cadence_state_error",
+                    candidate_id,
+                    gate,
+                    code=HeartbeatReasonCode.CADENCE_ERROR,
+                    decision=decision,
+                )
         if not decision.wake_main and not decision.dm_user:
             if decision.allow_autonomy is True or decision.maintenance is True:
                 return self._result(
