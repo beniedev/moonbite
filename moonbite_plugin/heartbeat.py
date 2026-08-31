@@ -39,10 +39,12 @@ from .session import SessionHookReceipt
 CADENCE_SCHEMA_V1 = "moon.heartbeat.cadence.v1"
 CADENCE_SCHEMA_V2 = "moon.heartbeat.cadence.v2"
 CADENCE_SCHEMA_V3 = "moon.heartbeat.cadence.v3"
-HEARTBEAT_CADENCE_SCHEMA = CADENCE_SCHEMA_V3
+CADENCE_SCHEMA_V4 = "moon.heartbeat.cadence.v4"
+HEARTBEAT_CADENCE_SCHEMA = CADENCE_SCHEMA_V4
 CADENCE_SCHEMA = HEARTBEAT_CADENCE_SCHEMA
 _PRIVATE_CONTACT_MAX = 128
 _VISIBLE_CONTACT_MAX = 128
+_DAILY_ANCHOR_MAX = 128
 _EFFECT_TERMINAL_MAX = 256
 _EFFECT_REF_MAX = 256
 _SILENCE_BACKOFF_RECEIPT_MAX = 256
@@ -126,7 +128,7 @@ class HeartbeatKindPolicy:
         if self.profile == "daily_anchor" and (
             not self.host_only
             or self.judge != "required"
-            or not self.bypass <= {"automatic_cooldown"}
+            or not self.bypass <= {"automatic_cooldown", "manual_snooze"}
         ):
             raise ValueError("daily_anchor heartbeat policy is fixed")
         if self.profile == "urgent" and (
@@ -231,6 +233,30 @@ def _strict_iso_date(value: Any, label: str) -> date:
     return decoded
 
 
+def _daily_anchor_kind(value: Any, label: str = "daily anchor kind") -> str:
+    if type(value) is not str or _HEARTBEAT_KIND_PATTERN.fullmatch(value) is None:
+        raise ValueError(f"{label} has invalid syntax")
+    return value
+
+
+def _accepts_keyword(method: Callable[..., Any], keyword: str) -> bool:
+    """Return whether a callable explicitly supports one keyword."""
+
+    try:
+        parameters = inspect.signature(method).parameters
+    except (TypeError, ValueError):
+        return False
+    parameter = parameters.get(keyword)
+    return (
+        parameter is not None
+        and parameter.kind
+        in {
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            inspect.Parameter.KEYWORD_ONLY,
+        }
+    ) or any(item.kind is inspect.Parameter.VAR_KEYWORD for item in parameters.values())
+
+
 def _json_time(value: datetime | None) -> str | None:
     return None if value is None else isoformat(value)
 
@@ -251,6 +277,8 @@ _CADENCE_OBSERVER_FIELDS = frozenset(
         "last_effect_at",
         "daily_anchor_epoch",
         "daily_anchor_completed",
+        "daily_anchor_epochs",
+        "daily_anchor_legacy_epoch",
         "private_contacts",
         "verified_visible_contacts",
         "private_contact_overflow_until",
@@ -288,6 +316,7 @@ def _read_cadence_state_lock_free(
         CADENCE_SCHEMA_V1,
         CADENCE_SCHEMA_V2,
         CADENCE_SCHEMA_V3,
+        CADENCE_SCHEMA_V4,
     }:
         return None, "unsupported_schema"
     if set(raw) - _CADENCE_OBSERVER_FIELDS:
@@ -674,7 +703,7 @@ def _compact_tail(values: Mapping[str, str], limit: int) -> dict[str, str]:
 
 def _empty_state() -> dict[str, Any]:
     return {
-        "schema_version": CADENCE_SCHEMA_V3,
+        "schema_version": CADENCE_SCHEMA_V4,
         "last_judge_at": None,
         "next_judge_at": None,
         "manual_cooldown_until": None,
@@ -682,6 +711,8 @@ def _empty_state() -> dict[str, Any]:
         "last_effect_at": None,
         "daily_anchor_epoch": None,
         "daily_anchor_completed": False,
+        "daily_anchor_epochs": {},
+        "daily_anchor_legacy_epoch": None,
         "private_contacts": {},
         "verified_visible_contacts": {},
         "private_contact_overflow_until": None,
@@ -694,6 +725,80 @@ def _empty_state() -> dict[str, Any]:
         "silence_backoff_streak": 0,
         "silence_backoff_last_completed_at": None,
     }
+
+
+def _normalise_daily_anchor_state(
+    raw: Mapping[str, Any],
+) -> tuple[dict[str, str], str | None, bool]:
+    """Decode exact-kind anchor evidence and the one-time legacy wildcard."""
+
+    legacy_fields = {"daily_anchor_epoch", "daily_anchor_completed"}
+    new_fields = {"daily_anchor_epochs", "daily_anchor_legacy_epoch"}
+    fields = set(raw)
+    schema = raw.get("schema_version")
+
+    def normalise_epochs(value: Any) -> dict[str, str]:
+        if not isinstance(value, Mapping):
+            raise ValueError("heartbeat daily_anchor_epochs must be an object")
+        if len(value) > _DAILY_ANCHOR_MAX:
+            raise ValueError("heartbeat daily_anchor_epochs exceeds its bound")
+        selected: dict[str, str] = {}
+        for kind, epoch in value.items():
+            _daily_anchor_kind(kind)
+            _strict_iso_date(epoch, f"daily_anchor_epochs.{kind}")
+            selected[kind] = epoch
+        return selected
+
+    # Early per-kind hosts wrote an exact map under the v3 schema while keeping
+    # the two old fields as a compatibility summary. Accept only the bounded,
+    # internally consistent shape and let the next normal write persist v4.
+    if schema == CADENCE_SCHEMA_V3 and "daily_anchor_epochs" in fields:
+        if "daily_anchor_legacy_epoch" in fields:
+            raise ValueError("heartbeat daily anchor state has a mixed schema")
+        present_legacy = fields & legacy_fields
+        if present_legacy not in (set(), legacy_fields):
+            raise ValueError("heartbeat daily anchor transition is incomplete")
+        selected = normalise_epochs(raw["daily_anchor_epochs"])
+        if not present_legacy:
+            return selected, None, False
+        epoch = raw.get("daily_anchor_epoch")
+        if epoch is not None:
+            _strict_iso_date(epoch, "heartbeat daily_anchor_epoch")
+        completed = raw.get("daily_anchor_completed")
+        if type(completed) is not bool:
+            raise ValueError("heartbeat daily_anchor_completed is invalid")
+        if completed != (epoch is not None):
+            raise ValueError("heartbeat daily anchor summary is inconsistent")
+        if selected:
+            if not completed or epoch not in selected.values():
+                raise ValueError("heartbeat daily anchor summary conflicts with map")
+            return selected, None, False
+        return selected, epoch, False
+
+    if set(raw) & new_fields:
+        if schema not in {None, CADENCE_SCHEMA_V4}:
+            raise ValueError("heartbeat daily anchor state has a mixed schema")
+        if set(raw) & legacy_fields:
+            raise ValueError("heartbeat daily anchor state mixes schemas")
+        selected = normalise_epochs(raw.get("daily_anchor_epochs", {}))
+        legacy = raw.get("daily_anchor_legacy_epoch")
+        if legacy is not None:
+            _strict_iso_date(legacy, "heartbeat daily_anchor_legacy_epoch")
+        return selected, legacy, False
+
+    if raw.get("schema_version") == CADENCE_SCHEMA_V4 and set(raw) & legacy_fields:
+        raise ValueError("heartbeat daily anchor v4 requires per-kind state")
+    epoch = raw.get("daily_anchor_epoch")
+    if epoch is not None:
+        _strict_iso_date(epoch, "heartbeat daily_anchor_epoch")
+        if "daily_anchor_completed" not in raw:
+            raise ValueError("heartbeat daily_anchor_completed is required with epoch")
+    completed = raw.get("daily_anchor_completed", False)
+    if type(completed) is not bool:
+        raise ValueError("heartbeat daily_anchor_completed is invalid")
+    if completed and epoch is None:
+        raise ValueError("heartbeat completed daily anchor requires an epoch")
+    return {}, epoch if completed else None, True
 
 
 def _normalise_silence_policy(policy: Mapping[str, Any]) -> dict[str, Any]:
@@ -814,6 +919,7 @@ class HeartbeatCadence:
             CADENCE_SCHEMA_V1,
             CADENCE_SCHEMA_V2,
             CADENCE_SCHEMA_V3,
+            CADENCE_SCHEMA_V4,
         }:
             raise StateError("heartbeat cadence state has an unsupported schema")
         allowed = {
@@ -827,6 +933,8 @@ class HeartbeatCadence:
             "last_effect_at",
             "daily_anchor_epoch",
             "daily_anchor_completed",
+            "daily_anchor_epochs",
+            "daily_anchor_legacy_epoch",
             "private_contacts",
             "verified_visible_contacts",
             "private_contact_overflow_until",
@@ -870,17 +978,20 @@ class HeartbeatCadence:
             if len(set(decoded)) > 1:
                 raise StateError(f"heartbeat cadence {key} has conflicting timestamps")
             state[key] = decoded[0] if decoded else None
-        epoch = raw.get("daily_anchor_epoch")
-        if epoch is not None:
-            try:
-                _strict_iso_date(epoch, "heartbeat daily_anchor_epoch")
-            except ValueError as exc:
-                raise StateError("heartbeat daily_anchor_epoch is invalid") from exc
-        state["daily_anchor_epoch"] = epoch
-        completed = raw.get("daily_anchor_completed", False)
-        if type(completed) is not bool:
-            raise StateError("heartbeat daily_anchor_completed is invalid")
-        state["daily_anchor_completed"] = completed
+        try:
+            anchor_epochs, legacy_epoch, _legacy_state = _normalise_daily_anchor_state(
+                raw
+            )
+        except ValueError as exc:
+            raise StateError("heartbeat daily anchor state is invalid") from exc
+        state["daily_anchor_epochs"] = anchor_epochs
+        state["daily_anchor_legacy_epoch"] = legacy_epoch
+        # Keep the old fields in the in-memory snapshot for direct callers. The
+        # mapping and legacy epoch are the canonical v4 state.
+        state["daily_anchor_epoch"] = anchor_epochs.get("daily_anchor") or legacy_epoch
+        state["daily_anchor_completed"] = bool(
+            anchor_epochs.get("daily_anchor") or legacy_epoch
+        )
         for key in (
             "private_contacts",
             "verified_visible_contacts",
@@ -980,7 +1091,7 @@ class HeartbeatCadence:
     @staticmethod
     def _serialise(state: Mapping[str, Any]) -> dict[str, Any]:
         return {
-            "schema_version": CADENCE_SCHEMA_V3,
+            "schema_version": CADENCE_SCHEMA_V4,
             "last_judge_at": state.get("last_judge_at"),
             "next_judge_at": state.get("next_judge_at"),
             "manual_cooldown_until": state.get("manual_cooldown_until"),
@@ -988,8 +1099,8 @@ class HeartbeatCadence:
             "manual_until": state.get("manual_cooldown_until"),
             "auto_until": state.get("automatic_cooldown_until"),
             "last_effect_at": state.get("last_effect_at"),
-            "daily_anchor_epoch": state.get("daily_anchor_epoch"),
-            "daily_anchor_completed": bool(state.get("daily_anchor_completed", False)),
+            "daily_anchor_epochs": dict(state.get("daily_anchor_epochs", {})),
+            "daily_anchor_legacy_epoch": state.get("daily_anchor_legacy_epoch"),
             "private_contacts": dict(state.get("private_contacts", {})),
             "verified_visible_contacts": dict(
                 state.get("verified_visible_contacts", {})
@@ -1354,25 +1465,40 @@ class HeartbeatCadence:
     def daily_anchor_epoch(self, now: datetime | None = None) -> str:
         return self._anchor_epoch(self._now(now))
 
-    def daily_anchor_due(self, now: datetime | None = None) -> bool:
+    def daily_anchor_due(
+        self, now: datetime | None = None, *, kind: str = "daily_anchor"
+    ) -> bool:
+        selected_kind = _daily_anchor_kind(kind)
         epoch = self.daily_anchor_epoch(now)
         if not self.path.exists():
             return True
         with file_lock(self.lock_path):
             state = self._load()
-        return not (
-            state["daily_anchor_completed"] and state["daily_anchor_epoch"] == epoch
-        )
+        if state["daily_anchor_legacy_epoch"] == epoch:
+            return False
+        return state["daily_anchor_epochs"].get(selected_kind) != epoch
 
     def mark_daily_anchor(
-        self, epoch: str | None = None, *, now: datetime | None = None
+        self,
+        epoch: str | None = None,
+        *,
+        kind: str = "daily_anchor",
+        now: datetime | None = None,
     ) -> str:
+        selected_kind = _daily_anchor_kind(kind)
         selected = epoch if epoch is not None else self.daily_anchor_epoch(now)
         _strict_iso_date(selected, "daily anchor epoch")
         with file_lock(self.lock_path):
             state = self._load()
-            state["daily_anchor_epoch"] = selected
-            state["daily_anchor_completed"] = True
+            epochs = dict(state["daily_anchor_epochs"])
+            if selected_kind not in epochs and len(epochs) >= _DAILY_ANCHOR_MAX:
+                raise StateError("heartbeat daily_anchor_epochs exceeds its bound")
+            epochs[selected_kind] = selected
+            state["daily_anchor_epochs"] = epochs
+            state["daily_anchor_epoch"] = (
+                epochs.get("daily_anchor") or state["daily_anchor_legacy_epoch"]
+            )
+            state["daily_anchor_completed"] = bool(state["daily_anchor_epoch"])
             self._save(state)
         return selected
 
@@ -1395,8 +1521,18 @@ class HeartbeatCadence:
         next_judge_at: datetime | str | None = None,
         cadence_minutes: int | None = None,
         anchor_epoch: str | None = None,
+        anchor_kind: str | None = None,
     ) -> datetime:
         effective_now = self._now(now)
+        if anchor_kind is not None and anchor_epoch is None:
+            raise ValueError("anchor_kind requires anchor_epoch")
+        if anchor_epoch is not None:
+            _strict_iso_date(anchor_epoch, "anchor_epoch")
+        selected_anchor_kind = (
+            _daily_anchor_kind(anchor_kind)
+            if anchor_kind is not None
+            else "daily_anchor"
+        )
         if next_judge_at is not None:
             selected = _optional_time(next_judge_at, "next_judge_at")
             assert selected is not None
@@ -1407,7 +1543,6 @@ class HeartbeatCadence:
                 raise ValueError("cadence_minutes is out of bounds")
             selected = effective_now + timedelta(minutes=cadence_minutes)
         elif anchor_epoch is not None:
-            _strict_iso_date(anchor_epoch, "anchor_epoch")
             local = effective_now.astimezone(self.timezone)
             next_date = local.date() + timedelta(days=1)
             selected = datetime(
@@ -1424,8 +1559,18 @@ class HeartbeatCadence:
             state["last_judge_at"] = isoformat(effective_now)
             state["next_judge_at"] = isoformat(selected)
             if anchor_epoch is not None:
-                state["daily_anchor_epoch"] = anchor_epoch
-                state["daily_anchor_completed"] = True
+                epochs = dict(state["daily_anchor_epochs"])
+                if (
+                    selected_anchor_kind not in epochs
+                    and len(epochs) >= _DAILY_ANCHOR_MAX
+                ):
+                    raise StateError("heartbeat daily_anchor_epochs exceeds its bound")
+                epochs[selected_anchor_kind] = anchor_epoch
+                state["daily_anchor_epochs"] = epochs
+                state["daily_anchor_epoch"] = (
+                    epochs.get("daily_anchor") or state["daily_anchor_legacy_epoch"]
+                )
+                state["daily_anchor_completed"] = bool(state["daily_anchor_epoch"])
             self._save(state)
         return selected
 
@@ -1643,15 +1788,23 @@ class HeartbeatCadence:
             last = _optional_time(state["last_judge_at"], "last_judge_at")
             next_at = effective_now if last is None else last + self.judge_interval
         recent_kind, recent_at = self._recent_from_state(state, effective_now)
+        anchor_epochs = dict(state["daily_anchor_epochs"])
+        default_anchor_epoch = (
+            anchor_epochs.get("daily_anchor") or state["daily_anchor_legacy_epoch"]
+        )
         return {
-            "schema_version": CADENCE_SCHEMA_V3,
+            "schema_version": CADENCE_SCHEMA_V4,
             "last_judge_at": state["last_judge_at"],
             "next_judge_at": isoformat(next_at),
             "manual_cooldown_until": state["manual_cooldown_until"],
             "automatic_cooldown_until": state["automatic_cooldown_until"],
             "last_effect_at": state["last_effect_at"],
-            "daily_anchor_epoch": state["daily_anchor_epoch"],
-            "daily_anchor_completed": state["daily_anchor_completed"],
+            # The old fields remain as a compatibility view for the default
+            # kind; per-kind callers must use daily_anchor_epochs.
+            "daily_anchor_epoch": default_anchor_epoch,
+            "daily_anchor_completed": bool(default_anchor_epoch),
+            "daily_anchor_epochs": anchor_epochs,
+            "daily_anchor_legacy_epoch": state["daily_anchor_legacy_epoch"],
             "daily_anchor_hour": self.anchor_hour,
             "timezone": self.timezone_name,
             "last_private_contact_at": state["last_private_contact_at"],
@@ -1740,13 +1893,12 @@ class HeartbeatCadence:
             ):
                 raise ValueError("silence backoff streak is invalid")
 
+            anchor_epochs, legacy_epoch, legacy_state = _normalise_daily_anchor_state(
+                raw
+            )
             completed_present = "daily_anchor_completed" in raw
             completed = raw.get("daily_anchor_completed", False)
-            if type(completed) is not bool:
-                raise ValueError("daily anchor completion is invalid")
             epoch = raw.get("daily_anchor_epoch")
-            if epoch is not None:
-                _strict_iso_date(epoch, "daily anchor epoch")
 
             contact_maps: dict[str, dict[str, datetime]] = {}
             for name in ("private_contacts", "verified_visible_contacts"):
@@ -1806,6 +1958,8 @@ class HeartbeatCadence:
                 "last_effect_at",
                 "daily_anchor_epoch",
                 "daily_anchor_completed",
+                "daily_anchor_epochs",
+                "daily_anchor_legacy_epoch",
                 "private_contacts",
                 "verified_visible_contacts",
                 "effect_terminals",
@@ -1888,7 +2042,7 @@ class HeartbeatCadence:
                         counts={"judge_schedule_entries": 1},
                     )
                 )
-            if epoch is not None:
+            if legacy_state and epoch is not None:
                 target_epoch = target_date.isoformat()
                 current_epoch = self._anchor_epoch(now)
                 if not completed_present:
@@ -1923,6 +2077,8 @@ class HeartbeatCadence:
                     anchor_state = "neutral" if completed else "current"
                     anchor_refs = (f"anchor:{epoch}",)
                     anchor_counts = {"anchor_entries": 1}
+                anchor_refs = (*anchor_refs, "migration:legacy")
+                anchor_counts = {**anchor_counts, "legacy": 1}
                 facts.append(
                     _observer_fact(
                         key="heartbeat:anchor",
@@ -1933,6 +2089,62 @@ class HeartbeatCadence:
                         counts=anchor_counts,
                     )
                 )
+            elif anchor_epochs or legacy_epoch is not None:
+                target_epoch = target_date.isoformat()
+                current_epoch = self._anchor_epoch(now)
+
+                def append_anchor_fact(
+                    kind: str, anchor_epoch: str, *, legacy: bool = False
+                ) -> None:
+                    if anchor_epoch != target_epoch:
+                        anchor_code = "heartbeat_anchor_outside_target"
+                        anchor_state = "neutral"
+                        anchor_refs = (
+                            f"anchor:{anchor_epoch}",
+                            f"target:{target_epoch}",
+                            f"current:{current_epoch}",
+                        )
+                        anchor_counts = {"anchor_entries": 1, "outside_target": 1}
+                    elif anchor_epoch != current_epoch:
+                        anchor_code = "heartbeat_anchor_stale_observed"
+                        anchor_state = "neutral"
+                        anchor_refs = (
+                            f"anchor:{anchor_epoch}",
+                            f"target:{target_epoch}",
+                            f"current:{current_epoch}",
+                        )
+                        anchor_counts = {"anchor_entries": 1, "stale": 1}
+                    else:
+                        anchor_code = (
+                            "heartbeat_anchor_legacy_completed"
+                            if legacy
+                            else "heartbeat_anchor_completed"
+                        )
+                        anchor_state = "neutral"
+                        anchor_refs = (
+                            f"anchor:{anchor_epoch}",
+                            f"kind:{kind}",
+                            "completion:legacy" if legacy else "completion:exact",
+                        )
+                        anchor_counts = {
+                            "anchor_entries": 1,
+                            "legacy": int(legacy),
+                        }
+                    facts.append(
+                        _observer_fact(
+                            key=f"heartbeat:anchor:{kind}",
+                            code=anchor_code,
+                            state=anchor_state,
+                            target_date=target_date,
+                            refs=anchor_refs,
+                            counts=anchor_counts,
+                        )
+                    )
+
+                if legacy_epoch is not None:
+                    append_anchor_fact("legacy", legacy_epoch, legacy=True)
+                for kind, anchor_epoch in sorted(anchor_epochs.items()):
+                    append_anchor_fact(kind, anchor_epoch)
 
             for name, code, key in (
                 (
@@ -2580,13 +2792,23 @@ class HeartbeatEngine:
                 "anchor_completed_for_epoch requires a daily_anchor kind profile"
             )
         if is_anchor:
-            try:
-                due = self.cadence.daily_anchor_due(now)
-            except AttributeError:
+            daily_anchor_due = getattr(self.cadence, "daily_anchor_due", None)
+            if not callable(daily_anchor_due):
                 # Compatibility fallback for a minimal injected cadence port.
                 # A durable cadence implementation remains the authority when
                 # it exposes daily_anchor_due().
                 due = completed is not True
+            else:
+                try:
+                    due = (
+                        daily_anchor_due(now, kind=candidate.kind)
+                        if _accepts_keyword(daily_anchor_due, "kind")
+                        else daily_anchor_due(now)
+                    )
+                except Exception as exc:
+                    raise StateError(
+                        "heartbeat cadence daily_anchor_due failed"
+                    ) from exc
             return due, None if due else self._next_due(candidate, now)
         explicit = context.get("due")
         if explicit is not None and type(explicit) is not bool:
@@ -3835,32 +4057,47 @@ class HeartbeatEngine:
             )
         anchor_epoch = None
         if policy.profile == "daily_anchor":
-            try:
-                anchor_epoch = self.cadence.daily_anchor_epoch(now)
-            except AttributeError:
-                pass
-        try:
-            next_judge = self.cadence.mark_judge(
-                now=now,
-                next_judge_at=decision.next_judge_at,
-                cadence_minutes=decision.cadence_minutes,
-                anchor_epoch=anchor_epoch,
-            )
-        except AttributeError:
+            daily_anchor_epoch = getattr(self.cadence, "daily_anchor_epoch", None)
+            if callable(daily_anchor_epoch):
+                try:
+                    anchor_epoch = daily_anchor_epoch(now)
+                except Exception:
+                    return self._result(
+                        "failed",
+                        "cadence_state_error",
+                        candidate_id,
+                        gate,
+                        code=HeartbeatReasonCode.CADENCE_ERROR,
+                        decision=decision,
+                    )
+        mark_judge = getattr(self.cadence, "mark_judge", None)
+        if callable(mark_judge):
+            mark_kwargs = {
+                "now": now,
+                "next_judge_at": decision.next_judge_at,
+                "cadence_minutes": decision.cadence_minutes,
+                "anchor_epoch": anchor_epoch,
+            }
+            if anchor_epoch is not None and _accepts_keyword(mark_judge, "anchor_kind"):
+                mark_kwargs["anchor_kind"] = candidate.kind
+        if not callable(mark_judge):
             next_judge = (
                 _optional_time(decision.next_judge_at, "next_judge_at")
                 if decision.next_judge_at is not None
                 else None
             )
-        except Exception:
-            return self._result(
-                "failed",
-                "cadence_state_error",
-                candidate_id,
-                gate,
-                code=HeartbeatReasonCode.CADENCE_ERROR,
-                decision=decision,
-            )
+        else:
+            try:
+                next_judge = mark_judge(**mark_kwargs)
+            except Exception:
+                return self._result(
+                    "failed",
+                    "cadence_state_error",
+                    candidate_id,
+                    gate,
+                    code=HeartbeatReasonCode.CADENCE_ERROR,
+                    decision=decision,
+                )
         if not decision.wake_main and not decision.dm_user:
             if decision.allow_autonomy is True or decision.maintenance is True:
                 return self._result(
@@ -3940,6 +4177,8 @@ class HeartbeatEngine:
 __all__ = [
     "CADENCE_SCHEMA_V1",
     "CADENCE_SCHEMA_V2",
+    "CADENCE_SCHEMA_V3",
+    "CADENCE_SCHEMA_V4",
     "CADENCE_SCHEMA",
     "HEARTBEAT_CADENCE_SCHEMA",
     "HEARTBEAT_BYPASSES",

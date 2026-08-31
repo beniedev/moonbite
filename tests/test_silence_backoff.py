@@ -8,6 +8,7 @@ import pytest
 from moonbite_plugin.config import ConfigError, normalize_config
 from moonbite_plugin.heartbeat import (
     CADENCE_SCHEMA_V1,
+    CADENCE_SCHEMA_V4,
     HeartbeatCadence,
     HeartbeatSilenceReceipt,
 )
@@ -218,11 +219,12 @@ def test_v1_state_migrates_on_next_write(tmp_path):
         ),
         encoding="utf-8",
     )
-    assert cadence.snapshot()["schema_version"].endswith("v3")
+    assert cadence.snapshot()["schema_version"] == CADENCE_SCHEMA_V4
     cadence.apply_silence_backoff(receipt(), policy=POLICY)
-    assert json.loads(cadence.path.read_text(encoding="utf-8"))[
-        "schema_version"
-    ].endswith("v3")
+    assert (
+        json.loads(cadence.path.read_text(encoding="utf-8"))["schema_version"]
+        == CADENCE_SCHEMA_V4
+    )
 
 
 def test_unknown_policy_and_malformed_state_fail_closed(tmp_path):

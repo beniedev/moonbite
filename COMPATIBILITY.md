@@ -45,6 +45,10 @@ cannot make a checkpoint eligible. The additive
 `0.1.0a1`; deployments must snapshot state before upgrading and must not point
 an older binary at upgraded state.
 
+Heartbeat cadence writes upgrade valid legacy state to schema v4. Deployments
+must snapshot cadence state before upgrading and must not point an older
+Moonbite binary at a state directory after a v4 cadence write.
+
 ---
 
 ## 2. Platform & Isolation Invariants

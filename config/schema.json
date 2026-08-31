@@ -223,8 +223,10 @@
               "judge": {"const": "required"},
               "host_only": {"const": true},
               "bypass": {
-                "maxItems": 1,
-                "items": {"const": "automatic_cooldown"}
+                "maxItems": 2,
+                "items": {
+                  "enum": ["automatic_cooldown", "manual_snooze"]
+                }
               }
             }
           }

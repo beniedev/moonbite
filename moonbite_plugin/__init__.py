@@ -47,6 +47,7 @@ from .heartbeat import (
     CADENCE_SCHEMA_V1,
     CADENCE_SCHEMA_V2,
     CADENCE_SCHEMA_V3,
+    CADENCE_SCHEMA_V4,
     HeartbeatSilenceReceipt,
 )
 
@@ -112,5 +113,6 @@ __all__ = [
     "CADENCE_SCHEMA_V1",
     "CADENCE_SCHEMA_V2",
     "CADENCE_SCHEMA_V3",
+    "CADENCE_SCHEMA_V4",
     "HeartbeatSilenceReceipt",
 ]

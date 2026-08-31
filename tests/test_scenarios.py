@@ -104,6 +104,48 @@ def test_pack_user_merge_provenance_and_redaction(monkeypatch, tmp_path):
     assert safe["model_routes"]["main"]["alias"] == "<redacted>"
 
 
+def test_companion_pack_accepts_kind_scoped_daily_anchor_mute_bypass(
+    monkeypatch, tmp_path
+):
+    _resource_fixture(
+        monkeypatch,
+        tmp_path,
+        name="companion",
+        overlay={
+            "modules": {"heartbeat": True},
+            "heartbeat": {
+                "kinds": {
+                    "day_open": {
+                        "enabled": True,
+                        "profile": "daily_anchor",
+                        "judge": "required",
+                        "host_only": True,
+                        "bypass": ["automatic_cooldown", "manual_snooze"],
+                    },
+                    "day_close": {
+                        "enabled": True,
+                        "profile": "daily_anchor",
+                        "judge": "required",
+                        "host_only": True,
+                        "bypass": ["automatic_cooldown", "manual_snooze"],
+                    },
+                }
+            },
+        },
+    )
+
+    config = resolve_config({}, "companion").effective_config
+
+    assert config["heartbeat"]["kinds"]["day_open"]["bypass"] == [
+        "automatic_cooldown",
+        "manual_snooze",
+    ]
+    assert config["heartbeat"]["kinds"]["day_close"]["bypass"] == [
+        "automatic_cooldown",
+        "manual_snooze",
+    ]
+
+
 def test_empty_mapping_replaces_pack_map_and_lists_are_literals(monkeypatch, tmp_path):
     _resource_fixture(
         monkeypatch,

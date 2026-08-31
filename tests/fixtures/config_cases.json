@@ -64,6 +64,21 @@
       }
     },
     {
+      "id": "heartbeat_daily_anchor_manual_bypasses",
+      "config": {
+        "heartbeat": {
+          "kinds": {
+            "anchor_probe": {
+              "profile": "daily_anchor",
+              "judge": "required",
+              "host_only": true,
+              "bypass": ["automatic_cooldown", "manual_snooze"]
+            }
+          }
+        }
+      }
+    },
+    {
       "id": "heartbeat_urgent_both_bypasses",
       "config": {
         "heartbeat": {
@@ -302,20 +317,6 @@
         "heartbeat": {
           "kinds": {
             "routine_probe": {"profile": "routine", "judge": "skip"}
-          }
-        }
-      }
-    },
-    {
-      "id": "heartbeat_daily_anchor_manual_bypass_forbidden",
-      "config": {
-        "heartbeat": {
-          "kinds": {
-            "anchor_probe": {
-              "profile": "daily_anchor",
-              "host_only": true,
-              "bypass": ["manual_snooze"]
-            }
           }
         }
       }
