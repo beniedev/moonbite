@@ -796,6 +796,8 @@ def _normalise_daily_anchor_state(
     completed = raw.get("daily_anchor_completed", False)
     if type(completed) is not bool:
         raise ValueError("heartbeat daily_anchor_completed is invalid")
+    if completed and epoch is None:
+        raise ValueError("heartbeat completed daily anchor requires an epoch")
     return {}, epoch if completed else None, True
 
 
@@ -2796,10 +2798,17 @@ class HeartbeatEngine:
                 # A durable cadence implementation remains the authority when
                 # it exposes daily_anchor_due().
                 due = completed is not True
-            elif _accepts_keyword(daily_anchor_due, "kind"):
-                due = daily_anchor_due(now, kind=candidate.kind)
             else:
-                due = daily_anchor_due(now)
+                try:
+                    due = (
+                        daily_anchor_due(now, kind=candidate.kind)
+                        if _accepts_keyword(daily_anchor_due, "kind")
+                        else daily_anchor_due(now)
+                    )
+                except Exception as exc:
+                    raise StateError(
+                        "heartbeat cadence daily_anchor_due failed"
+                    ) from exc
             return due, None if due else self._next_due(candidate, now)
         explicit = context.get("due")
         if explicit is not None and type(explicit) is not bool:
@@ -4048,10 +4057,19 @@ class HeartbeatEngine:
             )
         anchor_epoch = None
         if policy.profile == "daily_anchor":
-            try:
-                anchor_epoch = self.cadence.daily_anchor_epoch(now)
-            except AttributeError:
-                pass
+            daily_anchor_epoch = getattr(self.cadence, "daily_anchor_epoch", None)
+            if callable(daily_anchor_epoch):
+                try:
+                    anchor_epoch = daily_anchor_epoch(now)
+                except Exception:
+                    return self._result(
+                        "failed",
+                        "cadence_state_error",
+                        candidate_id,
+                        gate,
+                        code=HeartbeatReasonCode.CADENCE_ERROR,
+                        decision=decision,
+                    )
         mark_judge = getattr(self.cadence, "mark_judge", None)
         if callable(mark_judge):
             mark_kwargs = {

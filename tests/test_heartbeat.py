@@ -123,10 +123,12 @@ class PathlessCadence:
 class LegacyDailyAnchorCadence:
     """Minimal pre-kind cadence port used by host compatibility tests."""
 
-    def __init__(self, *, due_error=None, mark_error=None):
+    def __init__(self, *, due_error=None, epoch_error=None, mark_error=None):
         self.due_error = due_error
+        self.epoch_error = epoch_error
         self.mark_error = mark_error
         self.due_calls = 0
+        self.epoch_calls = 0
         self.mark_calls = 0
         self.anchor_epochs = []
 
@@ -143,6 +145,9 @@ class LegacyDailyAnchorCadence:
         return True
 
     def daily_anchor_epoch(self, _now=None):
+        self.epoch_calls += 1
+        if self.epoch_error is not None:
+            raise self.epoch_error
         return "2026-08-22"
 
     def mark_judge(
@@ -988,24 +993,39 @@ def test_heartbeat_engine_supports_pre_kind_injected_cadence_port(tmp_path):
     result = runtime.run(HeartbeatCandidate("day_open", {}))
 
     assert (result.status, result.reason) == ("skipped", "silent")
-    assert (cadence.due_calls, cadence.mark_calls, judge.calls) == (1, 1, 1)
+    assert (
+        cadence.due_calls,
+        cadence.epoch_calls,
+        cadence.mark_calls,
+        judge.calls,
+    ) == (
+        1,
+        1,
+        1,
+        1,
+    )
     assert cadence.anchor_epochs == ["2026-08-22"]
 
 
-@pytest.mark.parametrize("failure_port", ["due", "mark"])
-def test_injected_cadence_internal_type_error_is_not_retried(tmp_path, failure_port):
-    error = TypeError("cadence internal fixture")
+@pytest.mark.parametrize("error_type", [TypeError, AttributeError])
+@pytest.mark.parametrize("failure_port", ["due", "epoch", "mark"])
+def test_injected_cadence_internal_error_fails_closed(
+    tmp_path, failure_port, error_type
+):
+    error = error_type("cadence internal fixture")
     cadence = LegacyDailyAnchorCadence(
         due_error=error if failure_port == "due" else None,
+        epoch_error=error if failure_port == "epoch" else None,
         mark_error=error if failure_port == "mark" else None,
     )
-    judge = Judge(JudgeDecision(False, False, "silent"))
+    judge = Judge(JudgeDecision(True, True, "contact", "hello"))
+    sink = Sink()
     runtime = HeartbeatEngine(
         bus=EventBus(tmp_path, clock=lambda: NOW),
         controls=ControlStore(tmp_path, clock=lambda: NOW),
         cadence=cadence,
         judge=judge,
-        sink=Sink(),
+        sink=sink,
         locks=FakeLocks(),
         kind_policies={
             "day_open": _policy(profile="daily_anchor", host_only=True),
@@ -1016,8 +1036,10 @@ def test_injected_cadence_internal_type_error_is_not_retried(tmp_path, failure_p
 
     assert (result.status, result.reason) == ("failed", "cadence_state_error")
     assert cadence.due_calls == 1
-    assert cadence.mark_calls == (0 if failure_port == "due" else 1)
+    assert cadence.epoch_calls == (0 if failure_port == "due" else 1)
+    assert cadence.mark_calls == (1 if failure_port == "mark" else 0)
     assert judge.calls == (0 if failure_port == "due" else 1)
+    assert (sink.deliveries, sink.wakes) == (0, 0)
 
 
 def test_daily_anchor_manual_snooze_bypass_is_explicit_per_kind(tmp_path):
@@ -1154,13 +1176,21 @@ def test_legacy_daily_anchor_completion_is_a_migrated_wildcard(
     )
 
 
-def test_legacy_anchor_without_completion_fails_closed_without_rewrite(tmp_path):
+@pytest.mark.parametrize(
+    "anchor_fields",
+    [
+        {"daily_anchor_epoch": "2026-08-22"},
+        {"daily_anchor_epoch": None, "daily_anchor_completed": True},
+    ],
+    ids=["missing-completion", "completion-without-epoch"],
+)
+def test_legacy_ambiguous_anchor_fails_closed_without_rewrite(tmp_path, anchor_fields):
     cadence = HeartbeatCadence(tmp_path, clock=lambda: NOW)
     cadence.path.write_text(
         json.dumps(
             {
                 "schema_version": "moon.heartbeat.cadence.v3",
-                "daily_anchor_epoch": "2026-08-22",
+                **anchor_fields,
             }
         ),
         encoding="utf-8",
