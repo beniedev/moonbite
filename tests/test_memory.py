@@ -139,6 +139,40 @@ def test_lexical_recall_reconstructs_cjk_fallback_candidate(tmp_path):
     ] == [(card.open_ref, 1, "偏好口语 回复偏好")]
 
 
+@pytest.mark.parametrize(
+    ("summary", "query"),
+    [
+        ("偏好简短口语回复", "请继续用简短口语回复"),
+        ("偏好简短口语回复", "你还记得我偏好简短口语回复吗"),
+        ("偏好﨑短口語回复", "请继续用崎短口語回复"),
+    ],
+)
+def test_cjk_natural_overlap_is_bounded_and_nfkc_normalized(tmp_path, summary, query):
+    memory = MemoryStore(tmp_path, clock=lambda: NOW)
+    card = memory.add_card(
+        summary,
+        provenance="user_explicit",
+        source_ref="conversation:fixture",
+        card_id="fixture-cjk-natural",
+    )
+
+    hits = memory.search(query)
+
+    assert [(hit.open_ref, hit.score) for hit in hits] == [(card.open_ref, 1)]
+
+
+def test_cjk_natural_overlap_rejects_common_short_phrases(tmp_path):
+    memory = MemoryStore(tmp_path, clock=lambda: NOW)
+    memory.add_card(
+        "今天的天气晴朗适合散步但是路上拥挤",
+        provenance="user_explicit",
+        source_ref="conversation:fixture",
+        card_id="fixture-cjk-unrelated",
+    )
+
+    assert memory.search("明天的天气阴沉需要带伞") == []
+
+
 def test_cards_and_diary_return_exact_open_references(tmp_path):
     memory = MemoryStore(tmp_path, clock=lambda: NOW)
     card = memory.add_card(

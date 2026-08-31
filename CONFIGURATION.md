@@ -41,10 +41,11 @@ fail-closed and auditable.
   the hooks are no-ops while disabled.
 - `modules.memory` enables card/diary search, capture, exact history inspection,
   grounded diary synthesis, and operator maintenance commands.
-- Local lexical search also uses a bounded literal-substring fallback for
-  queries containing at least two Han, Hiragana, Katakana, or Hangul code
-  points when token matching has no hit; single-character CJK queries return
-  no results.
+- Local lexical search also uses a bounded literal-substring or natural
+  contiguous-overlap fallback for queries containing at least two Han,
+  Hiragana, Katakana, or Hangul code points when token matching has no hit.
+  Natural overlap requires two shared four-codepoint features after Unicode
+  NFKC normalization; single-character CJK queries return no results.
 - `delivery.adapter: noop` is safe and cannot claim delivery.
 - `delivery.adapter: hermes_session` can request a targeted main-session wake
   only when the host's `inject_message` surface explicitly supports a

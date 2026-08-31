@@ -6,6 +6,7 @@ import hashlib
 import json
 import math
 import re
+import unicodedata
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import date, datetime
@@ -45,6 +46,10 @@ MAX_RECALL_EXCERPT_BYTES = 2 * 1024
 MAX_RECALL_REASON_BYTES = 4 * 1024
 MAX_MAINTENANCE_PROPOSED_VALUE_BYTES = 16 * 1024
 _CJK_FALLBACK_SCORE = 1
+_CJK_OVERLAP_NGRAM_SIZE = 4
+_CJK_OVERLAP_MIN_FEATURES = 2
+_CJK_OVERLAP_MAX_FEATURES = 256
+_CJK_OVERLAP_MAX_CODEPOINTS = 4096
 _CJK_CODEPOINT_RANGES = (
     (0x1100, 0x11FF),  # Hangul Jamo
     (0x3040, 0x309F),  # Hiragana
@@ -137,6 +142,51 @@ def _has_cjk_query(value: str) -> bool:
             for character in value
         )
         >= 2
+    )
+
+
+def _cjk_features(value: str) -> set[str]:
+    features: set[str] = set()
+    run: list[str] = []
+    scanned = 0
+
+    def add_run() -> bool:
+        if len(run) < _CJK_OVERLAP_NGRAM_SIZE:
+            return False
+        for index in range(len(run) - _CJK_OVERLAP_NGRAM_SIZE + 1):
+            features.add("".join(run[index : index + _CJK_OVERLAP_NGRAM_SIZE]))
+            if len(features) >= _CJK_OVERLAP_MAX_FEATURES:
+                return True
+        return False
+
+    for character in value:
+        if scanned >= _CJK_OVERLAP_MAX_CODEPOINTS:
+            break
+        scanned += 1
+        is_cjk = any(
+            start <= ord(character) <= end for start, end in _CJK_CODEPOINT_RANGES
+        )
+        if is_cjk:
+            run.append(character)
+            continue
+        if add_run():
+            return features
+        run.clear()
+    add_run()
+    return features
+
+
+def _cjk_fallback_matches(
+    literal_query: str, query_features: set[str], text: str
+) -> bool:
+    normalized_text = unicodedata.normalize("NFKC", text)
+    if literal_query in normalized_text:
+        return True
+    if len(query_features) < _CJK_OVERLAP_MIN_FEATURES:
+        return False
+    return (
+        len(query_features & _cjk_features(normalized_text))
+        >= _CJK_OVERLAP_MIN_FEATURES
     )
 
 
@@ -899,8 +949,9 @@ class MemoryStore:
         include_historical: bool = False,
     ) -> list[SearchHit]:
         terms = _tokens(query)
-        literal_query = query.strip()
+        literal_query = unicodedata.normalize("NFKC", query.strip())
         cjk_fallback = _has_cjk_query(literal_query)
+        cjk_features = _cjk_features(literal_query) if cjk_fallback else set()
         if not 1 <= limit <= 100 or (not terms and not cjk_fallback):
             return []
         hits: list[SearchHit] = []
@@ -912,7 +963,11 @@ class MemoryStore:
             text = " ".join((card["summary"], *card["tags"]))
             haystack = _tokens(text)
             score = len(terms & haystack)
-            if not score and cjk_fallback and literal_query in text:
+            if (
+                not score
+                and cjk_fallback
+                and _cjk_fallback_matches(literal_query, cjk_features, text)
+            ):
                 score = _CJK_FALLBACK_SCORE
             if score:
                 hits.append(
@@ -927,7 +982,11 @@ class MemoryStore:
         for entry in self._diary_rows():
             text = f"{entry.title} {entry.body}"
             score = len(terms & _tokens(text))
-            if not score and cjk_fallback and literal_query in text:
+            if (
+                not score
+                and cjk_fallback
+                and _cjk_fallback_matches(literal_query, cjk_features, text)
+            ):
                 score = _CJK_FALLBACK_SCORE
             if score:
                 hits.append(
