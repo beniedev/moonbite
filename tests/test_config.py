@@ -99,6 +99,13 @@ def test_custom_heartbeat_kind_is_normalized_with_safe_defaults():
         ("routine", [], "required", True),
         ("daily_anchor", [], "required", True),
         ("daily_anchor", ["automatic_cooldown"], "required", True),
+        ("daily_anchor", ["manual_snooze"], "required", True),
+        (
+            "daily_anchor",
+            ["automatic_cooldown", "manual_snooze"],
+            "required",
+            True,
+        ),
         ("urgent", [], "required", True),
         ("urgent", ["automatic_cooldown"], "required", True),
         ("urgent", ["manual_snooze"], "required", True),
@@ -154,10 +161,7 @@ def test_heartbeat_kind_profile_boundaries_are_accepted(
     [
         ({"profile": "routine", "bypass": ["manual_snooze"]}, "routine"),
         ({"profile": "routine", "judge": "skip"}, "routine"),
-        (
-            {"profile": "daily_anchor", "bypass": ["manual_snooze"]},
-            "daily_anchor",
-        ),
+        ({"profile": "daily_anchor", "bypass": ["active_chat"]}, "daily_anchor"),
         ({"profile": "daily_anchor", "host_only": False}, "daily_anchor"),
         ({"profile": "urgent", "judge": "skip"}, "urgent"),
         ({"profile": "urgent", "host_only": False}, "urgent"),

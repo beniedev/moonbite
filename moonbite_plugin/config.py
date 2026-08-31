@@ -235,9 +235,12 @@ def _normalize_heartbeat_kinds(value: Any) -> dict[str, dict[str, Any]]:
             if judge != "required":
                 raise ConfigError(f"{path}.routine requires judge=required")
         elif profile == "daily_anchor":
-            if any(item != "automatic_cooldown" for item in bypass):
+            if any(
+                item not in {"automatic_cooldown", "manual_snooze"}
+                for item in bypass
+            ):
                 raise ConfigError(
-                    f"{path}.daily_anchor only allows automatic_cooldown bypass"
+                    f"{path}.daily_anchor only allows automatic_cooldown and manual_snooze bypass"
                 )
             if judge != "required":
                 raise ConfigError(f"{path}.daily_anchor requires judge=required")

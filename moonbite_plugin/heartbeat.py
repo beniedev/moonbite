@@ -128,7 +128,7 @@ class HeartbeatKindPolicy:
         if self.profile == "daily_anchor" and (
             not self.host_only
             or self.judge != "required"
-            or not self.bypass <= {"automatic_cooldown"}
+            or not self.bypass <= {"automatic_cooldown", "manual_snooze"}
         ):
             raise ValueError("daily_anchor heartbeat policy is fixed")
         if self.profile == "urgent" and (
@@ -716,21 +716,53 @@ def _normalise_daily_anchor_state(
 
     legacy_fields = {"daily_anchor_epoch", "daily_anchor_completed"}
     new_fields = {"daily_anchor_epochs", "daily_anchor_legacy_epoch"}
-    if set(raw) & new_fields:
-        if raw.get("schema_version") not in {None, CADENCE_SCHEMA_V4}:
-            raise ValueError("heartbeat daily anchor state has a mixed schema")
-        if set(raw) & legacy_fields:
-            raise ValueError("heartbeat daily anchor state mixes schemas")
-        mapping = raw.get("daily_anchor_epochs", {})
-        if not isinstance(mapping, Mapping):
+    fields = set(raw)
+    schema = raw.get("schema_version")
+
+    def normalise_epochs(value: Any) -> dict[str, str]:
+        if not isinstance(value, Mapping):
             raise ValueError("heartbeat daily_anchor_epochs must be an object")
-        if len(mapping) > _DAILY_ANCHOR_MAX:
+        if len(value) > _DAILY_ANCHOR_MAX:
             raise ValueError("heartbeat daily_anchor_epochs exceeds its bound")
         selected: dict[str, str] = {}
-        for kind, epoch in mapping.items():
+        for kind, epoch in value.items():
             _daily_anchor_kind(kind)
             _strict_iso_date(epoch, f"daily_anchor_epochs.{kind}")
             selected[kind] = epoch
+        return selected
+
+    # Early per-kind hosts wrote an exact map under the v3 schema while keeping
+    # the two old fields as a compatibility summary. Accept only the bounded,
+    # internally consistent shape and let the next normal write persist v4.
+    if schema == CADENCE_SCHEMA_V3 and "daily_anchor_epochs" in fields:
+        if "daily_anchor_legacy_epoch" in fields:
+            raise ValueError("heartbeat daily anchor state has a mixed schema")
+        present_legacy = fields & legacy_fields
+        if present_legacy not in (set(), legacy_fields):
+            raise ValueError("heartbeat daily anchor transition is incomplete")
+        selected = normalise_epochs(raw["daily_anchor_epochs"])
+        if not present_legacy:
+            return selected, None, False
+        epoch = raw.get("daily_anchor_epoch")
+        if epoch is not None:
+            _strict_iso_date(epoch, "heartbeat daily_anchor_epoch")
+        completed = raw.get("daily_anchor_completed")
+        if type(completed) is not bool:
+            raise ValueError("heartbeat daily_anchor_completed is invalid")
+        if completed != (epoch is not None):
+            raise ValueError("heartbeat daily anchor summary is inconsistent")
+        if selected:
+            if not completed or epoch not in selected.values():
+                raise ValueError("heartbeat daily anchor summary conflicts with map")
+            return selected, None, False
+        return selected, epoch, False
+
+    if set(raw) & new_fields:
+        if schema not in {None, CADENCE_SCHEMA_V4}:
+            raise ValueError("heartbeat daily anchor state has a mixed schema")
+        if set(raw) & legacy_fields:
+            raise ValueError("heartbeat daily anchor state mixes schemas")
+        selected = normalise_epochs(raw.get("daily_anchor_epochs", {}))
         legacy = raw.get("daily_anchor_legacy_epoch")
         if legacy is not None:
             _strict_iso_date(legacy, "heartbeat daily_anchor_legacy_epoch")
