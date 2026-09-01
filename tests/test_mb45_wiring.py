@@ -586,7 +586,42 @@ def test_plugin_shutdown_finalize_is_noop_and_successor_pre_repairs_old_turn(tmp
     ] == ["superseded_by_new_pre"]
 
 
-@pytest.mark.parametrize("reason", (None, "new_session", "other", ["shutdown"]))
+def test_plugin_new_session_finalize_closes_old_session_only(tmp_path):
+    components, _locks, _bus = injected_bundle(tmp_path / "host")
+    context = RecordingContext()
+    register(context, components=components)
+
+    context.hooks["on_session_start"](session_id="session-old")
+    context.hooks["pre_llm_call"](session_id="session-old", turn_id="turn-old")
+    context.hooks["on_session_finalize"](
+        session_id="session-old",
+        reason="new_session",
+        old_session_id="session-old",
+        new_session_id="session-new",
+    )
+
+    old_snapshot = components.session.snapshot("session-old")
+    assert old_snapshot is not None
+    assert old_snapshot.finalized is True
+    assert old_snapshot.open_turn_id is None
+    assert old_snapshot.settled_turn_ids == ()
+    assert old_snapshot.abandoned_turn_ids == ("turn-old",)
+    assert [
+        row["reason"]
+        for row in components.session.ledger.rows()
+        if row["kind"] == "turn_terminal"
+    ] == ["host_session_finalized"]
+
+    context.hooks["on_session_start"](session_id="session-new")
+    context.hooks["pre_llm_call"](session_id="session-new", turn_id="turn-new")
+    new_snapshot = components.session.snapshot("session-new")
+    assert new_snapshot is not None
+    assert new_snapshot.finalized is False
+    assert new_snapshot.open_turn_id == "turn-new"
+    assert new_snapshot.abandoned_turn_ids == ()
+
+
+@pytest.mark.parametrize("reason", (None, "other", ["shutdown"]))
 def test_plugin_non_definitive_hermes_finalize_keeps_bare_fail_closed_behavior(
     tmp_path, reason
 ):
@@ -606,7 +641,19 @@ def test_plugin_non_definitive_hermes_finalize_keeps_bare_fail_closed_behavior(
     assert all(row["kind"] != "turn_terminal" for row in rows)
 
 
-def test_session_expired_falls_back_for_legacy_session_owner(tmp_path):
+@pytest.mark.parametrize(
+    ("reason", "extra"),
+    (
+        ("session_expired", {}),
+        (
+            "new_session",
+            {"old_session_id": "session-fixture", "new_session_id": "session-new"},
+        ),
+    ),
+)
+def test_definitive_finalize_falls_back_for_legacy_session_owner(
+    tmp_path, reason, extra
+):
     components, _locks, _bus = injected_bundle(tmp_path / "host")
     underlying_session = components.session
     legacy_session = SimpleNamespace(
@@ -622,7 +669,7 @@ def test_session_expired_falls_back_for_legacy_session_owner(tmp_path):
     context.hooks["pre_llm_call"](session_id="session-fixture", turn_id="turn-fixture")
     with pytest.raises(SessionLifecycleError, match="settled"):
         context.hooks["on_session_finalize"](
-            session_id="session-fixture", reason="session_expired"
+            session_id="session-fixture", reason=reason, **extra
         )
 
     rows = underlying_session.ledger.rows()

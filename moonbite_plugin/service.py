@@ -65,7 +65,7 @@ SUPPORTED_SESSION_HOOKS = frozenset(SESSION_HOOK_ORDER)
 DEFAULT_SESSION_HOOKS = frozenset(
     hook for hook in SUPPORTED_SESSION_HOOKS if hook != "pre_gateway_dispatch"
 )
-_DEFINITIVE_HERMES_FINALIZE_REASONS = frozenset({"session_expired"})
+_DEFINITIVE_HERMES_FINALIZE_REASONS = frozenset({"new_session", "session_expired"})
 SessionContextResolver = Callable[
     [str, Mapping[str, Any], frozenset[str]], SessionContext | None
 ]
