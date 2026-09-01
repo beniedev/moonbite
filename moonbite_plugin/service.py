@@ -65,7 +65,7 @@ SUPPORTED_SESSION_HOOKS = frozenset(SESSION_HOOK_ORDER)
 DEFAULT_SESSION_HOOKS = frozenset(
     hook for hook in SUPPORTED_SESSION_HOOKS if hook != "pre_gateway_dispatch"
 )
-_DEFINITIVE_HERMES_FINALIZE_REASONS = frozenset({"shutdown", "session_expired"})
+_DEFINITIVE_HERMES_FINALIZE_REASONS = frozenset({"session_expired"})
 SessionContextResolver = Callable[
     [str, Mapping[str, Any], frozenset[str]], SessionContext | None
 ]
@@ -439,7 +439,13 @@ class MoonbiteRuntime:
                 # resolver is present.
                 return None
             if _record_host_finalize:
-                receipt = self.session.record_host_finalize(context)
+                record_host_finalize = getattr(
+                    self.session, "record_host_finalize", None
+                )
+                if callable(record_host_finalize):
+                    receipt = record_host_finalize(context)
+                else:
+                    receipt = self.session.record_hook(context, hook, settled=settled)
             else:
                 receipt = self.session.record_hook(context, hook, settled=settled)
         except SessionHookMappingError as exc:
@@ -469,6 +475,8 @@ class MoonbiteRuntime:
 
         payload = {} if kwargs is None else kwargs
         reason = payload.get("reason")
+        if type(reason) is str and reason == "shutdown":
+            return None
         definitive = (
             type(reason) is str and reason in _DEFINITIVE_HERMES_FINALIZE_REASONS
         )
