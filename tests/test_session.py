@@ -21,6 +21,7 @@ from moonbite_plugin.session import (
 NOW = datetime(2026, 8, 24, 19, 0, tzinfo=UTC)
 ALL_HOOKS = frozenset(HOOK_ORDER)
 TURN_HOOKS = frozenset({"pre_llm_call", "post_llm_call"})
+FINALIZE_HOOKS = frozenset(HOOK_ORDER[1:])
 
 
 def context(
@@ -42,6 +43,28 @@ def context(
         observed_at=observed_at,
         fresh=fresh,
         supported_hooks=supported_hooks,
+    )
+
+
+def open_turn_store(root):
+    store = SessionLifecycleStore(root)
+    store.record_hook(
+        context("start", source_kind="session_start", supported_hooks=FINALIZE_HOOKS),
+        "on_session_start",
+    )
+    store.record_hook(
+        context("pre", turn_id="turn-1", supported_hooks=FINALIZE_HOOKS),
+        "pre_llm_call",
+    )
+    return store
+
+
+def finalize_context(*, observed_at=NOW):
+    return context(
+        "finalize",
+        source_kind="system",
+        supported_hooks=FINALIZE_HOOKS,
+        observed_at=observed_at,
     )
 
 
@@ -338,6 +361,118 @@ def test_finalize_rejects_unsettled_turn(tmp_path) -> None:
             context("finalize", source_kind="system"), "on_session_finalize"
         )
     assert len(store.ledger.rows()) == 3
+
+
+def test_host_finalize_abandons_open_turn_without_settling(tmp_path) -> None:
+    store = open_turn_store(tmp_path)
+
+    receipt = store.record_host_finalize(finalize_context())
+
+    assert receipt.snapshot.finalized is True
+    assert receipt.snapshot.open_turn_id is None
+    assert receipt.snapshot.settled_turn_ids == ()
+    assert receipt.snapshot.abandoned_turn_ids == ("turn-1",)
+    terminal_rows = [
+        row for row in store.ledger.rows() if row["kind"] == "turn_terminal"
+    ]
+    assert len(terminal_rows) == 1
+    assert terminal_rows[0]["reason"] == "host_session_finalized"
+    assert terminal_rows[0]["outcome"] == "abandoned"
+    assert [row["hook"] for row in store.ledger.rows() if row["kind"] == "hook"] == [
+        "on_session_start",
+        "pre_llm_call",
+        "on_session_finalize",
+    ]
+
+
+def test_host_finalize_completed_turn_only_records_finalize(tmp_path) -> None:
+    store = open_turn_store(tmp_path)
+    store.record_hook(
+        context(
+            "post",
+            source_kind="assistant_response",
+            turn_id="turn-1",
+            fresh=False,
+            supported_hooks=FINALIZE_HOOKS,
+        ),
+        "post_llm_call",
+        settled=True,
+    )
+
+    receipt = store.record_host_finalize(finalize_context())
+
+    assert receipt.snapshot.finalized is True
+    assert receipt.snapshot.settled_turn_ids == ("turn-1",)
+    assert receipt.snapshot.abandoned_turn_ids == ()
+    assert [row for row in store.ledger.rows() if row["kind"] == "turn_terminal"] == []
+
+
+def test_host_finalize_is_idempotent_and_late_post_cannot_replace_abandoned_turn(
+    tmp_path,
+) -> None:
+    store = open_turn_store(tmp_path)
+    first = store.record_host_finalize(finalize_context())
+    rows_after_first = store.ledger.rows()
+    second = store.record_host_finalize(
+        finalize_context(observed_at=NOW + timedelta(minutes=1))
+    )
+
+    assert first.deduplicated is False
+    assert second.deduplicated is True
+    assert store.ledger.rows() == rows_after_first
+    with pytest.raises(SessionLifecycleError, match="already finalized"):
+        store.record_hook(
+            context(
+                "post",
+                source_kind="assistant_response",
+                turn_id="turn-1",
+                fresh=False,
+                supported_hooks=FINALIZE_HOOKS,
+            ),
+            "post_llm_call",
+            settled=True,
+        )
+
+
+def test_host_finalize_finalize_append_failure_is_completed_on_retry(
+    tmp_path, monkeypatch
+) -> None:
+    store = open_turn_store(tmp_path)
+    original_append = store.ledger.append
+    failed = {"value": True}
+
+    def fail_finalize(row):
+        if (
+            failed["value"]
+            and row["kind"] == "hook"
+            and row["hook"] == "on_session_finalize"
+        ):
+            failed["value"] = False
+            raise OSError("host finalize append fixture")
+        return original_append(row)
+
+    monkeypatch.setattr(store.ledger, "append", fail_finalize)
+    with pytest.raises(OSError, match="host finalize append fixture"):
+        store.record_host_finalize(finalize_context())
+    assert [row["kind"] for row in store.ledger.rows()] == [
+        "hook",
+        "hook",
+        "turn_terminal",
+    ]
+    assert store.snapshot("lifecycle-1").finalized is False
+
+    monkeypatch.setattr(store.ledger, "append", original_append)
+    retry = store.record_host_finalize(
+        finalize_context(observed_at=NOW + timedelta(minutes=1))
+    )
+    assert retry.snapshot.finalized is True
+    assert retry.snapshot.abandoned_turn_ids == ("turn-1",)
+    assert [row["kind"] for row in store.ledger.rows()] == [
+        "hook",
+        "hook",
+        "turn_terminal",
+        "hook",
+    ]
 
 
 def test_successor_pre_abandons_missing_post_without_settling(tmp_path) -> None:

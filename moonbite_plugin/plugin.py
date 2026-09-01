@@ -883,7 +883,7 @@ def register_runtime(
         runtime.record_session_hook("post_llm_call", kwargs, settled=True)
 
     def on_session_finalize(**kwargs: Any) -> None:
-        runtime.record_session_hook("on_session_finalize", kwargs)
+        runtime.record_hermes_session_finalize(kwargs)
 
     hook_handlers = {
         "pre_gateway_dispatch": pre_gateway_dispatch,
