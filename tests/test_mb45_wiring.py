@@ -29,7 +29,12 @@ from moonbite_plugin.panel import PanelStore
 from moonbite_plugin.plugin import register
 from moonbite_plugin.runtime_core import EventBus
 from moonbite_plugin.service import MoonbiteRuntime
-from moonbite_plugin.session import HOOK_ORDER, SessionContext, SessionLifecycleStore
+from moonbite_plugin.session import (
+    HOOK_ORDER,
+    SessionContext,
+    SessionLifecycleError,
+    SessionLifecycleStore,
+)
 
 
 class RecordingLocks:
@@ -522,6 +527,154 @@ def test_registered_session_hooks_are_ordered_and_default_source_isolation(tmp_p
     assert "private body" not in components.session.ledger.path.read_text(
         encoding="utf-8"
     )
+
+
+@pytest.mark.parametrize(
+    ("reason", "complete"),
+    (("session_expired", False), ("session_expired", True)),
+)
+def test_plugin_session_expired_finalize_closes_open_turn(tmp_path, reason, complete):
+    components, _locks, _bus = injected_bundle(tmp_path / "host")
+    context = RecordingContext()
+    register(context, components=components)
+
+    context.hooks["on_session_start"](session_id="session-fixture")
+    context.hooks["pre_llm_call"](session_id="session-fixture", turn_id="turn-fixture")
+    if complete:
+        context.hooks["post_llm_call"](
+            session_id="session-fixture", turn_id="turn-fixture"
+        )
+    context.hooks["on_session_finalize"](session_id="session-fixture", reason=reason)
+
+    snapshot = components.session.snapshot("session-fixture")
+    assert snapshot is not None
+    assert snapshot.finalized is True
+    assert snapshot.open_turn_id is None
+    assert snapshot.settled_turn_ids == (("turn-fixture",) if complete else ())
+    assert snapshot.abandoned_turn_ids == (() if complete else ("turn-fixture",))
+    assert [
+        row["reason"]
+        for row in components.session.ledger.rows()
+        if row["kind"] == "turn_terminal"
+    ] == ([] if complete else ["host_session_finalized"])
+
+
+def test_plugin_shutdown_finalize_is_noop_and_successor_pre_repairs_old_turn(tmp_path):
+    components, _locks, _bus = injected_bundle(tmp_path / "host")
+    context = RecordingContext()
+    register(context, components=components)
+
+    context.hooks["on_session_start"](session_id="session-fixture")
+    context.hooks["pre_llm_call"](session_id="session-fixture", turn_id="turn-1")
+    context.hooks["on_session_finalize"](
+        session_id="session-fixture", reason="shutdown"
+    )
+    context.hooks["pre_llm_call"](session_id="session-fixture", turn_id="turn-2")
+
+    snapshot = components.session.snapshot("session-fixture")
+    assert snapshot is not None
+    assert snapshot.finalized is False
+    assert snapshot.open_turn_id == "turn-2"
+    assert snapshot.abandoned_turn_ids == ("turn-1",)
+    assert [
+        row["hook"] for row in components.session.ledger.rows() if row["kind"] == "hook"
+    ] == ["on_session_start", "pre_llm_call", "pre_llm_call"]
+    assert [
+        row["reason"]
+        for row in components.session.ledger.rows()
+        if row["kind"] == "turn_terminal"
+    ] == ["superseded_by_new_pre"]
+
+
+def test_plugin_new_session_finalize_closes_old_session_only(tmp_path):
+    components, _locks, _bus = injected_bundle(tmp_path / "host")
+    context = RecordingContext()
+    register(context, components=components)
+
+    context.hooks["on_session_start"](session_id="session-old")
+    context.hooks["pre_llm_call"](session_id="session-old", turn_id="turn-old")
+    context.hooks["on_session_finalize"](
+        session_id="session-old",
+        reason="new_session",
+        old_session_id="session-old",
+        new_session_id="session-new",
+    )
+
+    old_snapshot = components.session.snapshot("session-old")
+    assert old_snapshot is not None
+    assert old_snapshot.finalized is True
+    assert old_snapshot.open_turn_id is None
+    assert old_snapshot.settled_turn_ids == ()
+    assert old_snapshot.abandoned_turn_ids == ("turn-old",)
+    assert [
+        row["reason"]
+        for row in components.session.ledger.rows()
+        if row["kind"] == "turn_terminal"
+    ] == ["host_session_finalized"]
+
+    context.hooks["on_session_start"](session_id="session-new")
+    context.hooks["pre_llm_call"](session_id="session-new", turn_id="turn-new")
+    new_snapshot = components.session.snapshot("session-new")
+    assert new_snapshot is not None
+    assert new_snapshot.finalized is False
+    assert new_snapshot.open_turn_id == "turn-new"
+    assert new_snapshot.abandoned_turn_ids == ()
+
+
+@pytest.mark.parametrize("reason", (None, "other", ["shutdown"]))
+def test_plugin_non_definitive_hermes_finalize_keeps_bare_fail_closed_behavior(
+    tmp_path, reason
+):
+    components, _locks, _bus = injected_bundle(tmp_path / "host")
+    context = RecordingContext()
+    register(context, components=components)
+
+    context.hooks["on_session_start"](session_id="session-fixture")
+    context.hooks["pre_llm_call"](session_id="session-fixture", turn_id="turn-fixture")
+    with pytest.raises(SessionLifecycleError, match="settled"):
+        context.hooks["on_session_finalize"](
+            session_id="session-fixture", reason=reason
+        )
+
+    rows = components.session.ledger.rows()
+    assert len(rows) == 2
+    assert all(row["kind"] != "turn_terminal" for row in rows)
+
+
+@pytest.mark.parametrize(
+    ("reason", "extra"),
+    (
+        ("session_expired", {}),
+        (
+            "new_session",
+            {"old_session_id": "session-fixture", "new_session_id": "session-new"},
+        ),
+    ),
+)
+def test_definitive_finalize_falls_back_for_legacy_session_owner(
+    tmp_path, reason, extra
+):
+    components, _locks, _bus = injected_bundle(tmp_path / "host")
+    underlying_session = components.session
+    legacy_session = SimpleNamespace(
+        record_hook=underlying_session.record_hook,
+        snapshot=underlying_session.snapshot,
+        replay=underlying_session.replay,
+    )
+    components = replace(components, session=legacy_session)
+    context = RecordingContext()
+    register(context, components=components)
+
+    context.hooks["on_session_start"](session_id="session-fixture")
+    context.hooks["pre_llm_call"](session_id="session-fixture", turn_id="turn-fixture")
+    with pytest.raises(SessionLifecycleError, match="settled"):
+        context.hooks["on_session_finalize"](
+            session_id="session-fixture", reason=reason, **extra
+        )
+
+    rows = underlying_session.ledger.rows()
+    assert len(rows) == 2
+    assert all(row["kind"] != "turn_terminal" for row in rows)
 
 
 def test_resolver_can_supply_authorized_private_gateway_context(tmp_path):

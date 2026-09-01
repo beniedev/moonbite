@@ -65,6 +65,7 @@ SUPPORTED_SESSION_HOOKS = frozenset(SESSION_HOOK_ORDER)
 DEFAULT_SESSION_HOOKS = frozenset(
     hook for hook in SUPPORTED_SESSION_HOOKS if hook != "pre_gateway_dispatch"
 )
+_DEFINITIVE_HERMES_FINALIZE_REASONS = frozenset({"new_session", "session_expired"})
 SessionContextResolver = Callable[
     [str, Mapping[str, Any], frozenset[str]], SessionContext | None
 ]
@@ -396,6 +397,7 @@ class MoonbiteRuntime:
         kwargs: Mapping[str, Any] | None = None,
         *,
         settled: bool = False,
+        _record_host_finalize: bool = False,
     ):
         """Map one public hook and append it to the injected session owner.
 
@@ -436,7 +438,16 @@ class MoonbiteRuntime:
                 # Internal/system events are never contact, even when a
                 # resolver is present.
                 return None
-            receipt = self.session.record_hook(context, hook, settled=settled)
+            if _record_host_finalize:
+                record_host_finalize = getattr(
+                    self.session, "record_host_finalize", None
+                )
+                if callable(record_host_finalize):
+                    receipt = record_host_finalize(context)
+                else:
+                    receipt = self.session.record_hook(context, hook, settled=settled)
+            else:
+                receipt = self.session.record_hook(context, hook, settled=settled)
         except SessionHookMappingError as exc:
             self._remember_session_hook_error(hook, exc)
             return None
@@ -456,6 +467,24 @@ class MoonbiteRuntime:
             raise
         self._last_session_hook_error = None
         return receipt
+
+    def record_hermes_session_finalize(
+        self, kwargs: Mapping[str, Any] | None = None
+    ) -> SessionHookReceipt | None:
+        """Route only definitive Hermes finalization reasons to host close."""
+
+        payload = {} if kwargs is None else kwargs
+        reason = payload.get("reason")
+        if type(reason) is str and reason == "shutdown":
+            return None
+        definitive = (
+            type(reason) is str and reason in _DEFINITIVE_HERMES_FINALIZE_REASONS
+        )
+        return self.record_session_hook(
+            "on_session_finalize",
+            payload,
+            _record_host_finalize=definitive,
+        )
 
     def _local_reflection(self, context) -> dict[str, Any]:
         facts = dict(context.facts)

@@ -28,7 +28,9 @@ SESSION_LIFECYCLE_KIND = "hook"
 SESSION_TURN_TERMINAL_SCHEMA = "moon.session.turn_terminal.v1"
 SESSION_TURN_TERMINAL_KIND = "turn_terminal"
 TURN_TERMINAL_OUTCOMES = frozenset({"abandoned"})
-TURN_TERMINAL_REASONS = frozenset({"superseded_by_new_pre", "operator_repair"})
+TURN_TERMINAL_REASONS = frozenset(
+    {"superseded_by_new_pre", "operator_repair", "host_session_finalized"}
+)
 
 HOOK_ORDER = (
     "pre_gateway_dispatch",
@@ -291,7 +293,7 @@ class SessionTurnTerminal:
             if self.superseded_by_turn_id == self.turn_id:
                 raise ValueError("turn cannot supersede itself")
         elif self.superseded_by_turn_id is not None:
-            raise ValueError("operator repair cannot name a successor turn")
+            raise ValueError("only a superseded terminal can name a successor turn")
         if not isinstance(self.observed_at, datetime):
             raise TypeError("observed_at must be a datetime")
         object.__setattr__(self, "observed_at", as_utc(self.observed_at))
@@ -958,6 +960,67 @@ class SessionLifecycleStore:
             self._apply_terminal(state, terminal)
             self.ledger.append(terminal.to_row())
             return self._terminal_receipt(terminal, state, deduplicated=False)
+
+    def record_host_finalize(self, context: SessionContext) -> SessionHookReceipt:
+        """Finalize a session using already-validated host termination evidence.
+
+        The host adapter, rather than the portable lifecycle core, decides when
+        a finalization is authoritative.  Under the normal mutation lock we
+        apply the optional abandonment and finalize callback to the in-memory
+        state before appending either row.  If the second append fails, replay
+        of the first row leaves the finalize callback as the only operation to
+        complete on retry.
+        """
+
+        self._validate_inputs(context, "on_session_finalize", False)
+        callback = _Callback(
+            context=context,
+            hook="on_session_finalize",
+            settled=False,
+            event_id=new_id("session_hook"),
+        )
+        with file_lock(self.mutation_lock):
+            states = self._replay_unlocked()
+            state = states.get(context.lifecycle_id)
+            if state is None:
+                state = self._new_state(context)
+                states[context.lifecycle_id] = state
+
+            existing = state.callbacks.get(callback.key)
+            if existing is not None:
+                self._apply(state, callback, allow_duplicate=True)
+                callback = existing
+                deduplicated = True
+            else:
+                terminal: SessionTurnTerminal | None = None
+                if state.current_turn_id is not None:
+                    terminal = SessionTurnTerminal(
+                        schema_version=SESSION_TURN_TERMINAL_SCHEMA,
+                        event_id=new_id("session_turn_terminal"),
+                        session_id=state.session_id,
+                        lifecycle_id=state.lifecycle_id,
+                        turn_id=state.current_turn_id,
+                        outcome="abandoned",
+                        reason="host_session_finalized",
+                        superseded_by_turn_id=None,
+                        observed_at=context.observed_at,
+                    )
+                    self._apply_terminal(state, terminal)
+
+                # Apply every semantic check before making either durable
+                # append.  A rejected finalize therefore cannot leave a
+                # terminal row behind.
+                self._apply(state, callback, allow_duplicate=True)
+                if terminal is not None:
+                    self.ledger.append(terminal.to_row())
+                self.ledger.append(callback.to_row())
+                deduplicated = False
+
+            return self._receipt(
+                callback,
+                state,
+                deduplicated=deduplicated,
+            )
 
     def snapshots(self) -> tuple[SessionLifecycleSnapshot, ...]:
         with file_lock(self.mutation_lock):
