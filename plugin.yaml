@@ -1,6 +1,6 @@
 manifest_version: 1
 name: moonbite
-version: 0.1.0a1
+version: 0.1.0a2
 description: "Memory, working state, heartbeat, and bounded autonomy for long-running AI agents."
 author: "Bénie Studio"
 kind: standalone

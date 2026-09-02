@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from copy import deepcopy
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -22,6 +22,7 @@ from .autonomy import (
 )
 from .components import RuntimeComponents, RuntimeComponentsError
 from .conversation import ConversationBridge
+from .control import canonical_feature
 from .effects import EffectReceipt, EffectRecord
 from .example_providers import example_activity_providers
 from .heartbeat import (
@@ -133,6 +134,7 @@ class MoonbiteRuntime:
         memory_orchestrator: MemoryOrchestrator | None = None,
         source_registry: SourceRegistry | None = None,
         approval_adapter: Any = None,
+        activity_providers: Iterable[ActivityProvider] = (),
         resolution: ConfigResolution | None = None,
         selected_pack: str | None = None,
         resolution_raw_config: Any = _MISSING,
@@ -252,6 +254,8 @@ class MoonbiteRuntime:
         )
         provider_root = self.root if components.mode == "standalone" else None
         for provider in example_activity_providers(provider_root):
+            self.providers.register(provider)
+        for provider in activity_providers:
             self.providers.register(provider)
         self.heartbeat = HeartbeatEngine(
             bus=self.bus,
@@ -799,16 +803,26 @@ class MoonbiteRuntime:
         self,
         action: str,
         *,
-        feature: str = "background_costly",
+        feature: str = "proactive",
         source: str = "operator",
         minutes: int | None = None,
         now: datetime | None = None,
     ) -> dict[str, Any]:
+        feature = canonical_feature(feature)
         if action == "status":
             effective_now = utc_now() if now is None else now
+            controls = self._active_control_metadata(now=effective_now)
+            effective_features = (
+                {feature, "proactive"}
+                if feature in {"heartbeat", "autonomy"}
+                else {feature}
+            )
             return {
                 "ok": True,
-                "controls": self._active_control_metadata(now=effective_now),
+                "feature": feature,
+                "controls": [
+                    item for item in controls if item["feature"] in effective_features
+                ],
             }
         if action == "resume":
             if source == "self" and feature == "heartbeat":
@@ -947,6 +961,32 @@ class MoonbiteRuntime:
         )
         self._project_autonomy_afterglow(result)
         return result
+
+    def reconcile_autonomy(
+        self,
+        effect_id: str,
+        receipt: EffectReceipt,
+        *,
+        control_id: str | None = None,
+    ) -> ActivityResult:
+        """Settle one asynchronous autonomy effect from host evidence."""
+
+        if not self.config["modules"]["autonomy"]:
+            raise RuntimeError("autonomy module is disabled")
+        result = self.autonomy.reconcile(
+            effect_id,
+            receipt,
+            control_id=control_id,
+        )
+        self._project_autonomy_afterglow(result)
+        return result
+
+    def fail_autonomy(self, effect_id: str, reason: str) -> ActivityResult:
+        """Settle one asynchronous autonomy effect as failed."""
+
+        if not self.config["modules"]["autonomy"]:
+            raise RuntimeError("autonomy module is disabled")
+        return self.autonomy.fail(effect_id, reason)
 
     def _conversation_active_chat(self) -> bool:
         """Return the durable conversation gate, failing closed on uncertainty."""

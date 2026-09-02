@@ -454,6 +454,71 @@ def test_verified_autonomy_receipt_is_the_only_afterglow_source(tmp_path):
     }
 
 
+def test_host_can_reconcile_unverified_autonomy_and_project_afterglow(tmp_path):
+    runtime = MoonbiteRuntime(
+        {
+            "modules": {"autonomy": True, "panel": True},
+            "autonomy": {"providers": {"x_browse": {"enabled": True, "weight": 1}}},
+        },
+        root=tmp_path,
+        autonomy_judge=AllowAutonomyJudge(),
+    )
+    runtime.providers._providers["x_browse"] = ActivityProvider(
+        "x_browse", lambda _request: {"status": "queued_unverified"}
+    )
+
+    started = runtime.run_autonomy(
+        facts={"source_event_id": "event-async", "epoch_id": "epoch-async"}
+    )
+    assert started.status == "executed_unverified"
+    record = runtime.effects.get(started.effect_id)
+    receipt = EffectReceipt(
+        receipt_id="receipt-async",
+        event_id=record.source_event_id,
+        observed_at=NOW,
+        content_sha256=record.content_sha256,
+        content_length=record.content_length,
+        epoch_id=record.epoch_id,
+    )
+
+    completed = runtime.reconcile_autonomy(started.effect_id, receipt)
+
+    assert completed.status == "completed"
+    assert runtime.panel.snapshot()["fields"]["activity_afterglow"]["value"] == {
+        "event_id": "event-async",
+        "summary": "A recent autonomous activity is available.",
+    }
+
+
+def test_host_can_fail_unverified_autonomy_without_afterglow(tmp_path):
+    runtime = MoonbiteRuntime(
+        {
+            "modules": {"autonomy": True, "panel": True},
+            "autonomy": {"providers": {"x_browse": {"enabled": True, "weight": 1}}},
+        },
+        root=tmp_path,
+        autonomy_judge=AllowAutonomyJudge(),
+    )
+    runtime.providers._providers["x_browse"] = ActivityProvider(
+        "x_browse", lambda _request: {"status": "queued_unverified"}
+    )
+    started = runtime.run_autonomy(
+        facts={"source_event_id": "event-failed", "epoch_id": "epoch-failed"}
+    )
+
+    failed = runtime.fail_autonomy(started.effect_id, "activity_failed")
+    replay = runtime.fail_autonomy(started.effect_id, "activity_failed")
+    conflicting_replay = runtime.fail_autonomy(started.effect_id, "other_failure")
+
+    assert (failed.status, failed.reason) == ("failed", "activity_failed")
+    assert (replay.status, replay.reason) == ("failed", "activity_failed")
+    assert (conflicting_replay.status, conflicting_replay.reason) == (
+        "failed",
+        "activity_failed",
+    )
+    assert "activity_afterglow" not in runtime.panel.snapshot()["fields"]
+
+
 def test_afterglow_failure_does_not_mask_completed_autonomy(tmp_path, monkeypatch):
     runtime = MoonbiteRuntime(
         {
@@ -1006,6 +1071,24 @@ def test_health_snapshot_uses_config_timezone_without_creating_state(tmp_path):
 
     assert snapshot.target_date == date(2026, 8, 23)
     assert not (tmp_path / "state").exists()
+
+
+def test_runtime_registers_host_injected_activity_providers(tmp_path):
+    provider = ActivityProvider("host_activity", lambda _request: "accepted")
+
+    runtime = MoonbiteRuntime(
+        {}, root=tmp_path / "state", activity_providers=(provider,)
+    )
+
+    assert runtime.providers.get("host_activity") is provider
+    with pytest.raises(ValueError, match="duplicate"):
+        MoonbiteRuntime(
+            {},
+            root=tmp_path / "duplicate",
+            activity_providers=(
+                ActivityProvider("local_reflection", lambda _request: None),
+            ),
+        )
 
 
 def test_health_snapshot_missing_injected_optional_owners_is_neutral(tmp_path):

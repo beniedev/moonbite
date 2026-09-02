@@ -132,3 +132,55 @@ def test_event_payload_size_is_bounded_before_persistence(tmp_path):
         bus.emit("fixture", source="test", payload={"text": "x" * (256 * 1024)})
 
     assert bus.read_events() == []
+
+
+def test_audit_terminal_get_or_append_is_exact_once_and_conflict_safe(tmp_path):
+    bus = EventBus(tmp_path, clock=lambda: NOW)
+
+    first = bus.record_audit_terminal(
+        "heartbeat",
+        occurrence_id="occurrence-1",
+        terminal="active_chat",
+        status="skipped",
+        source="heartbeat",
+    )
+    duplicate = bus.record_audit_terminal(
+        "heartbeat",
+        occurrence_id="occurrence-1",
+        terminal="active_chat",
+        status="skipped",
+        source="heartbeat",
+    )
+
+    assert duplicate == first
+    assert len(bus.read_audit()) == 1
+    with pytest.raises(StateError, match="terminal conflict"):
+        bus.record_audit_terminal(
+            "heartbeat",
+            occurrence_id="occurrence-1",
+            terminal="verified",
+            status="completed",
+            source="heartbeat",
+        )
+
+
+def test_audit_terminal_same_label_rejects_conflicting_effect_identity(tmp_path):
+    bus = EventBus(tmp_path, clock=lambda: NOW)
+    bus.record_audit_terminal(
+        "heartbeat",
+        occurrence_id="occurrence-1",
+        terminal="verified",
+        status="completed",
+        source="heartbeat",
+        details={"effect_id": "effect-1"},
+    )
+
+    with pytest.raises(StateError, match="identity conflict"):
+        bus.record_audit_terminal(
+            "heartbeat",
+            occurrence_id="occurrence-1",
+            terminal="verified",
+            status="completed",
+            source="heartbeat",
+            details={"effect_id": "effect-2"},
+        )

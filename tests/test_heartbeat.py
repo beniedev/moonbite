@@ -222,6 +222,39 @@ def test_control_gate_runs_before_judge(tmp_path):
     assert bus.read_audit()[-1].payload["status"] == "skipped"
 
 
+def test_proactive_gate_blocks_urgent_before_any_bypass_or_judge(tmp_path):
+    judge = Judge(JudgeDecision(True, True, "would_run", "hello"))
+    sink = Sink()
+    runtime, controls, bus, _cadence = engine(
+        tmp_path,
+        judge,
+        sink,
+        kind_policies={
+            "location_event": _policy(
+                profile="urgent",
+                host_only=True,
+                bypass=["recent_contact", "active_chat"],
+            )
+        },
+    )
+    controls.put(feature="proactive", mode="pause", source="operator")
+
+    result = runtime.run(
+        HeartbeatCandidate(
+            "location_event",
+            {"events": ["fixture"], "active_chat": True},
+        )
+    )
+
+    assert (result.status, result.reason, judge.calls) == (
+        "skipped",
+        "controlled_by:operator",
+        0,
+    )
+    assert sink.deliveries == sink.wakes == 0
+    assert bus.read_audit()[-1].payload["reason_code"] == "control"
+
+
 def test_judge_error_is_fail_closed_and_audited(tmp_path):
     judge = Judge(error=RuntimeError("fixture"))
     sink = Sink()
@@ -256,6 +289,79 @@ def test_effect_exception_still_produces_terminal_audit(tmp_path):
     assert result.delivery.status == "delivery_error:RuntimeError"
     assert result.wake.ok is True
     assert bus.read_audit()[-1].payload["status"] == "failed"
+
+
+@pytest.mark.parametrize("settlement", ["verified", "intentional_silence", "failed"])
+def test_delegated_settlement_terminal_is_exact_once(tmp_path, settlement):
+    class DelegatedSink:
+        def deliver(self, _candidate, _decision, _intent=None):
+            return EffectResult(True, "queued")
+
+        def wake(self, _candidate, _decision, _intent=None):
+            return EffectResult(True, "queued")
+
+    runtime, _controls, bus, _cadence = engine(
+        tmp_path,
+        Judge(
+            JudgeDecision(
+                True,
+                True,
+                "contact",
+                "hello",
+                delivery_mode="delegated",
+            )
+        ),
+        DelegatedSink(),
+    )
+    candidate = HeartbeatCandidate(
+        "care_poke",
+        {"events": ["event"], "due": True, "source_event_id": "delegated"},
+        candidate_id="delegated",
+    )
+    initial = runtime.run(candidate)
+    effect_id = initial.delivery.effect_id
+    receipt = None
+    if settlement == "verified":
+        record = runtime.effect_ledger.get(effect_id)
+        receipt = EffectReceipt(
+            receipt_id="delegated-receipt",
+            event_id=record.source_event_id,
+            observed_at=NOW,
+            content_sha256=record.content_sha256,
+            content_length=record.content_length,
+            epoch_id=record.epoch_id,
+        )
+    first = runtime.reconcile_heartbeat_delivery(effect_id, settlement, receipt)
+    second = runtime.reconcile_heartbeat_delivery(effect_id, settlement, receipt)
+    assert not [
+        event
+        for event in bus.read_audit()
+        if event.payload.get("occurrence_id") == "delegated"
+        and event.payload.get("terminal") is not None
+    ]
+    wake_id = initial.wake.effect_id
+    wake_record = runtime.effect_ledger.get(wake_id)
+    wake_receipt = EffectReceipt(
+        receipt_id="wake-receipt",
+        event_id=wake_record.source_event_id,
+        observed_at=NOW,
+        content_sha256=wake_record.content_sha256,
+        content_length=wake_record.content_length,
+        epoch_id=wake_record.epoch_id,
+    )
+    runtime.reconcile_heartbeat_wake(wake_id, wake_receipt)
+    runtime.reconcile_heartbeat_wake(wake_id, wake_receipt)
+    terminals = [
+        event
+        for event in bus.read_audit()
+        if event.payload.get("occurrence_id") == "delegated"
+        and event.payload.get("terminal") is not None
+    ]
+
+    assert first.terminal == second.terminal == settlement
+    assert len(terminals) == 1
+    assert terminals[0].payload["terminal"] == settlement
+    assert terminals[0].payload["effect_ids"] == sorted([effect_id, wake_id])
 
 
 def test_accepted_but_unverified_wake_is_pending(tmp_path):
@@ -479,6 +585,58 @@ def test_automatic_cooldown_and_active_chat_gate_before_judge(tmp_path):
     assert cooldown.reason_code is HeartbeatReasonCode.COOLDOWN
     assert active.reason_code is HeartbeatReasonCode.ACTIVE_CHAT
     assert judge.calls == 0
+
+
+def test_prejudge_terminal_is_reused_for_exact_heartbeat_occurrence(tmp_path):
+    judge = Judge(JudgeDecision(True, True, "would_run", "should-not-send"))
+    sink = Sink()
+    runtime, _controls, bus, _cadence = engine(tmp_path, judge, sink)
+    candidate = HeartbeatCandidate(
+        "care_poke",
+        {"events": ["event"], "due": True, "source_event_id": "occurrence"},
+        candidate_id="occurrence",
+    )
+
+    first = runtime.run(candidate, active_chat=True)
+    duplicate = runtime.run(candidate, active_chat=False)
+    terminals = [
+        event
+        for event in bus.read_audit()
+        if event.payload.get("occurrence_id") == "occurrence"
+        and event.payload.get("terminal") is not None
+    ]
+
+    assert (first.status, first.reason_code) == (
+        "skipped",
+        HeartbeatReasonCode.ACTIVE_CHAT,
+    )
+    assert (duplicate.status, duplicate.reason_code) == (
+        "skipped",
+        HeartbeatReasonCode.ACTIVE_CHAT,
+    )
+    assert judge.calls == 0
+    assert sink.deliveries == sink.wakes == 0
+    assert len(terminals) == 1
+
+
+def test_activity_busy_is_a_public_prejudge_terminal_gate(tmp_path):
+    judge = Judge(JudgeDecision(True, True, "would-run", "should-not-send"))
+    sink = Sink()
+    runtime, _controls, bus, _cadence = engine(tmp_path, judge, sink)
+    candidate = HeartbeatCandidate(
+        "care_poke",
+        {"events": ["event"], "due": True, "source_event_id": "busy"},
+        candidate_id="busy",
+    )
+
+    result = runtime.run(candidate, activity_busy=True)
+
+    assert (result.status, result.reason_code) == (
+        "skipped",
+        HeartbeatReasonCode.ACTIVITY_BUSY,
+    )
+    assert judge.calls == 0
+    assert bus.read_audit()[-1].payload["terminal"] == "activity_busy"
 
 
 def _policy(

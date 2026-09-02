@@ -77,6 +77,7 @@ class HeartbeatReasonCode(StrEnum):
     COOLDOWN = "cooldown"
     RECENT_CONTACT = "recent_contact"
     ACTIVE_CHAT = "active_chat"
+    ACTIVITY_BUSY = "activity_busy"
     ALLOWED = "allowed"
     DENIED = "denied"
     EXECUTION_LOCK = "execution_lock"
@@ -594,6 +595,12 @@ class HeartbeatResult:
     @property
     def code(self) -> HeartbeatReasonCode | None:
         return self.reason_code
+
+    @property
+    def canonical_event_id(self) -> str:
+        """The candidate occurrence identity used by the public audit."""
+
+        return self.candidate_id
 
     @property
     def effects(self) -> tuple[EffectResult, ...]:
@@ -2581,14 +2588,67 @@ class HeartbeatEngine:
         facts.extend(visible_candidates)
         return _dedupe_observer_facts(facts)
 
+    @staticmethod
+    def _canonical_terminal(result: HeartbeatResult) -> str | None:
+        """Return a terminal only when durable effect truth is settled."""
+
+        if result.status == "skipped":
+            if result.reason_code is HeartbeatReasonCode.EXECUTION_LOCK:
+                # The lock only says another invocation is still deciding;
+                # it is not a settlement for this occurrence.
+                return None
+            return (
+                result.reason_code.value
+                if result.reason_code is not None
+                else "skipped"
+            )
+        if result.status == "allowed":
+            return "allowed"
+        if result.status == "completed":
+            if result.effects and not all(effect.verified for effect in result.effects):
+                return None
+            return "verified" if result.effects else "completed"
+        if result.status == "failed":
+            if result.effects and any(
+                effect.terminal not in {"failed", "intentional_silence", "verified"}
+                for effect in result.effects
+            ):
+                return None
+            return "failed"
+        return None
+
     def _finish(self, result: HeartbeatResult) -> HeartbeatResult:
         projection_errors = list(result.projection_errors)
+        terminal = self._canonical_terminal(result)
         try:
-            self.bus.record_audit(
-                "heartbeat",
-                status=result.status,
-                source="heartbeat",
-                details=self._audit_details(result),
+            details = self._audit_details(result)
+            details["occurrence_id"] = result.candidate_id
+            if terminal is None:
+                self.bus.record_audit(
+                    "heartbeat",
+                    status=result.status,
+                    source="heartbeat",
+                    details=details,
+                )
+            else:
+                self.bus.record_audit_terminal(
+                    "heartbeat",
+                    occurrence_id=result.candidate_id,
+                    terminal=terminal,
+                    status=result.status,
+                    source="heartbeat",
+                    details=details,
+                )
+        except StateError as exc:
+            # A conflicting terminal is an integrity failure, not a benign
+            # audit projection error.  Never report the new result as truth.
+            projection_errors.append(f"audit_terminal_conflict:{type(exc).__name__}")
+            return replace(
+                result,
+                status="failed",
+                reason="terminal_conflict",
+                degraded=True,
+                projection_errors=tuple(dict.fromkeys(projection_errors)),
             )
         except Exception as exc:
             projection_errors.append(f"audit_write:{type(exc).__name__}")
@@ -2670,6 +2730,104 @@ class HeartbeatEngine:
             return result
         return self._finish(result)
 
+    def _existing_terminal_result(self, candidate_id: str) -> HeartbeatResult | None:
+        finder = getattr(self.bus, "find_audit_terminal", None)
+        if not callable(finder):
+            return None
+        event = finder("heartbeat", candidate_id)
+        if event is None:
+            return None
+        payload = event.payload
+        status = payload.get("status")
+        if not isinstance(status, str) or not status.strip():
+            raise StateError("heartbeat terminal audit has invalid status")
+        allowed_statuses = {
+            "skipped",
+            "allowed",
+            "completed",
+            "failed",
+            "intentional_silence",
+        }
+        if status not in allowed_statuses:
+            raise StateError("heartbeat terminal audit has invalid status")
+        terminal = payload.get("terminal")
+        if type(terminal) is not str or not terminal.strip():
+            raise StateError("heartbeat terminal audit has invalid terminal")
+        if self._effect_owner_exists() and self.effect_ledger is not None:
+            matching = [
+                record
+                for record in self.effect_ledger.records()
+                if record.kind in {"heartbeat_delivery", "heartbeat_wake"}
+                and record.source_event_id == candidate_id
+            ]
+            audit_effect_id = payload.get("effect_id")
+            if audit_effect_id is not None:
+                if type(audit_effect_id) is not str or not audit_effect_id.strip():
+                    raise StateError("heartbeat terminal audit has invalid effect")
+                effect_records = [
+                    record for record in matching if record.effect_id == audit_effect_id
+                ]
+                if len(effect_records) != 1:
+                    raise StateError("heartbeat audit effect conflict")
+                effect = effect_records[0]
+                if effect.state == "verified":
+                    expected = "verified"
+                elif effect.state == "failed":
+                    expected = (
+                        "intentional_silence"
+                        if effect.reason == "intentional_silence"
+                        else "failed"
+                    )
+                else:
+                    raise StateError("heartbeat audit effect conflict")
+                if terminal != expected:
+                    raise StateError("heartbeat audit effect conflict")
+            elif matching:
+                # An occurrence-level terminal emitted by ``_finish`` is valid
+                # only after every sibling effect has reached durable truth.
+                if any(
+                    record.state not in {"verified", "failed"} for record in matching
+                ):
+                    raise StateError("heartbeat audit effect conflict")
+                expected = (
+                    "intentional_silence"
+                    if any(
+                        record.reason == "intentional_silence" for record in matching
+                    )
+                    else "failed"
+                    if any(record.state == "failed" for record in matching)
+                    else "verified"
+                )
+                if terminal != expected:
+                    raise StateError("heartbeat audit effect conflict")
+        raw_gate = payload.get("gate")
+        if isinstance(raw_gate, Mapping):
+            gate = GateResult(
+                bool(raw_gate.get("allowed", False)),
+                str(raw_gate.get("mode", "replay")),
+                str(raw_gate.get("reason", terminal)),
+                raw_gate.get("control_id")
+                if isinstance(raw_gate.get("control_id"), str)
+                else None,
+            )
+        else:
+            gate = GateResult(True, "replay", "already_settled", None)
+        raw_code = payload.get("reason_code")
+        try:
+            reason_code = HeartbeatReasonCode(raw_code)
+        except (TypeError, ValueError):
+            reason_code = None
+        replay_status = "completed" if status == "intentional_silence" else status
+        return HeartbeatResult(
+            status=replay_status,
+            reason=terminal,
+            candidate_id=candidate_id,
+            gate=gate,
+            reason_code=reason_code,
+            degraded=payload.get("degraded") is True,
+            projection_errors=(),
+        )
+
     @staticmethod
     def _candidate_id(candidate: HeartbeatCandidate) -> str:
         if candidate.candidate_id.strip():
@@ -2678,16 +2836,21 @@ class HeartbeatEngine:
             value = candidate.context.get(key)
             if type(value) is str and value.strip():
                 return value
-        events = candidate.context.get("events")
-        if events:
-            try:
-                encoded = json.dumps(
-                    events, ensure_ascii=False, sort_keys=True, separators=(",", ":")
-                ).encode("utf-8")
-                return f"events:{hashlib.sha256(encoded).hexdigest()}"
-            except (TypeError, ValueError):
-                pass
+        # An event payload without an explicit source/candidate id is not a
+        # durable occurrence identity.  Treat each such invocation as a new
+        # attempt; schedulers that need replay must provide candidate_id or
+        # source_event_id explicitly.
         return new_id("heartbeat_attempt")
+
+    @staticmethod
+    def _has_explicit_occurrence(candidate: HeartbeatCandidate) -> bool:
+        if candidate.candidate_id.strip():
+            return True
+        return any(
+            type(candidate.context.get(key)) is str
+            and bool(candidate.context.get(key).strip())
+            for key in ("event_id", "source_event_id", "candidate_id")
+        )
 
     @staticmethod
     def _context_receipt(
@@ -3039,7 +3202,12 @@ class HeartbeatEngine:
         )
 
     def _effect_result(
-        self, record: EffectRecord, status: str, code: HeartbeatReasonCode | None = None
+        self,
+        record: EffectRecord,
+        status: str,
+        code: HeartbeatReasonCode | None = None,
+        *,
+        audit_terminal: bool = False,
     ) -> EffectResult:
         projection_errors: list[str] = []
         if record.state == "verified" and record.receipt is not None:
@@ -3091,6 +3259,13 @@ class HeartbeatEngine:
             )
         except Exception as exc:
             projection_errors.append(f"effect_terminal_write:{type(exc).__name__}")
+        if audit_terminal and record.state in {"verified", "failed"}:
+            try:
+                self._record_settled_occurrence_terminal(record)
+            except StateError:
+                raise
+            except Exception as exc:
+                projection_errors.append(f"audit_write:{type(exc).__name__}")
         if projection_errors:
             result = replace(
                 result,
@@ -3098,6 +3273,59 @@ class HeartbeatEngine:
                 projection_errors=tuple(dict.fromkeys(projection_errors)),
             )
         return result
+
+    def _record_settled_occurrence_terminal(self, record: EffectRecord) -> None:
+        """Project a terminal only after every sibling effect is settled."""
+
+        if self.effect_ledger is None:
+            raise StateError("effect ledger is unavailable")
+        siblings = tuple(
+            candidate
+            for candidate in self.effect_ledger.records()
+            if candidate.kind in {"heartbeat_delivery", "heartbeat_wake"}
+            and candidate.source_event_id == record.source_event_id
+        )
+        if not siblings or all(
+            candidate.effect_id != record.effect_id for candidate in siblings
+        ):
+            raise StateError("heartbeat occurrence effect is missing")
+        if any(candidate.state not in {"verified", "failed"} for candidate in siblings):
+            return
+        terminal = (
+            "intentional_silence"
+            if any(candidate.reason == "intentional_silence" for candidate in siblings)
+            else "failed"
+            if any(candidate.state == "failed" for candidate in siblings)
+            else "verified"
+        )
+        effect_ids = sorted(candidate.effect_id for candidate in siblings)
+        details: dict[str, Any] = {
+            "effect_ids": effect_ids,
+            "source_event_id": record.source_event_id,
+            "reason_code": (
+                HeartbeatReasonCode.ALLOWED.value
+                if terminal == "verified"
+                else HeartbeatReasonCode.DENIED.value
+                if terminal == "intentional_silence"
+                else HeartbeatReasonCode.EFFECT_ERROR.value
+            ),
+        }
+        if len(effect_ids) == 1:
+            details["effect_id"] = effect_ids[0]
+        self.bus.record_audit_terminal(
+            "heartbeat",
+            occurrence_id=record.source_event_id,
+            terminal=terminal,
+            status=(
+                "intentional_silence"
+                if terminal == "intentional_silence"
+                else "failed"
+                if terminal == "failed"
+                else "completed"
+            ),
+            source="heartbeat",
+            details=details,
+        )
 
     def _fail_effect(
         self,
@@ -3148,6 +3376,12 @@ class HeartbeatEngine:
             )
         except Exception as exc:
             projection_errors.append(f"effect_terminal_write:{type(exc).__name__}")
+        try:
+            self._record_settled_occurrence_terminal(record)
+        except StateError:
+            raise
+        except Exception as exc:
+            projection_errors.append(f"audit_write:{type(exc).__name__}")
         return EffectResult(
             False,
             status,
@@ -3198,14 +3432,14 @@ class HeartbeatEngine:
             if record.state == "verified":
                 if record.receipt != receipt:
                     raise ValueError("conflicting delegated delivery receipt")
-                return self._effect_result(record, "verified")
+                return self._effect_result(record, "verified", audit_terminal=True)
             if record.state not in {"pending", "executed_unverified"}:
                 raise ValueError("delegated delivery is not awaiting settlement")
             try:
                 verified = self.effect_ledger.verify(effect_id, receipt)
             except Exception as exc:
                 raise ValueError("delegated delivery receipt mismatch") from exc
-            return self._effect_result(verified, "verified")
+            return self._effect_result(verified, "verified", audit_terminal=True)
         if receipt is not None:
             raise ValueError("non-verified delegated delivery cannot carry receipt")
         if selected_status == "unknown":
@@ -3296,14 +3530,14 @@ class HeartbeatEngine:
         if record.state == "verified":
             if record.receipt != receipt:
                 raise ValueError("conflicting heartbeat wake receipt")
-            return self._effect_result(record, "verified")
+            return self._effect_result(record, "verified", audit_terminal=True)
         if record.state not in {"pending", "executed_unverified"}:
             raise ValueError("heartbeat wake is not awaiting settlement")
         try:
             verified = self.effect_ledger.verify(effect_id, receipt)
         except Exception as exc:
             raise ValueError("heartbeat wake receipt mismatch") from exc
-        return self._effect_result(verified, "verified")
+        return self._effect_result(verified, "verified", audit_terminal=True)
 
     def _existing_effect(
         self, record: EffectRecord, now: datetime
@@ -3722,10 +3956,18 @@ class HeartbeatEngine:
         *,
         session_receipt: SessionHookReceipt | None = None,
         active_chat: bool | None = None,
+        activity_busy: bool | None = None,
     ) -> HeartbeatResult:
         if not isinstance(candidate, HeartbeatCandidate):
             raise TypeError("candidate must be a HeartbeatCandidate")
         candidate_id = self._candidate_id(candidate)
+        existing_terminal = (
+            self._existing_terminal_result(candidate_id)
+            if self._has_explicit_occurrence(candidate)
+            else None
+        )
+        if existing_terminal is not None:
+            return existing_terminal
         policy, policy_error = self._candidate_policy(candidate.kind)
         if policy_error is not None:
             reason = (
@@ -3759,6 +4001,7 @@ class HeartbeatEngine:
                 effective,
                 session_receipt=session_receipt,
                 active_chat=active_chat,
+                activity_busy=activity_busy,
                 policy=policy,
             )
         with self.locks.try_exclusive("heartbeat_execution") as acquired:
@@ -3774,6 +4017,7 @@ class HeartbeatEngine:
                 effective,
                 session_receipt=session_receipt,
                 active_chat=active_chat,
+                activity_busy=activity_busy,
                 policy=policy,
             )
 
@@ -3783,6 +4027,7 @@ class HeartbeatEngine:
         *,
         session_receipt: SessionHookReceipt | None,
         active_chat: bool | None,
+        activity_busy: bool | None,
         policy: HeartbeatKindPolicy,
     ) -> HeartbeatResult:
         candidate_id = candidate.candidate_id
@@ -3900,6 +4145,27 @@ class HeartbeatEngine:
                     candidate_id,
                     gate,
                     code=HeartbeatReasonCode.ACTIVE_CHAT,
+                    next_judge_at=now
+                    + getattr(
+                        self.cadence,
+                        "recent_contact_window",
+                        DEFAULT_RECENT_CONTACT_WINDOW,
+                    ),
+                )
+            busy = (
+                candidate.context.get("activity_busy")
+                if activity_busy is None
+                else activity_busy
+            )
+            if busy is not None and type(busy) is not bool:
+                raise _CandidateInvalidError("activity_busy must be a boolean")
+            if busy is True:
+                return self._result(
+                    "skipped",
+                    "activity_busy",
+                    candidate_id,
+                    gate,
+                    code=HeartbeatReasonCode.ACTIVITY_BUSY,
                     next_judge_at=now
                     + getattr(
                         self.cadence,

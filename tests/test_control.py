@@ -40,6 +40,32 @@ def test_background_bundle_controls_both_costly_features(tmp_path):
     assert evaluate_gate(store.resolve("autonomy")).allowed is False
 
 
+def test_background_costly_is_one_canonical_proactive_state(tmp_path):
+    store = ControlStore(tmp_path)
+    first = store.put(feature="background_costly", mode="quota_save", source="operator")
+    second = store.put(feature="proactive", mode="pause", source="operator")
+
+    assert first.feature == "proactive"
+    assert second.feature == "proactive"
+    assert [intent.control_id for intent in store.active()] == [second.control_id]
+    assert store.resolve("background_costly").intent == second
+    assert ControlStore(tmp_path).resolve("proactive").intent == second
+
+    store.clear(feature="background_costly", source="operator")
+    assert store.resolve("proactive").intent is None
+    assert ControlStore(tmp_path).resolve("proactive").intent is None
+
+
+def test_operator_proactive_pause_outranks_newer_child_control(tmp_path):
+    clock = Clock()
+    store = ControlStore(tmp_path, clock=clock)
+    maintenance = store.put(feature="proactive", mode="pause", source="operator")
+    clock.now += timedelta(minutes=1)
+    store.put(feature="autonomy", mode="play_next", source="operator")
+
+    assert store.resolve("autonomy").intent == maintenance
+
+
 def test_self_control_requires_bounded_expiry(tmp_path):
     store = ControlStore(tmp_path)
     with pytest.raises(ValueError, match="require expires_at"):

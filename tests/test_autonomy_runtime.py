@@ -102,6 +102,7 @@ def make_engine(
     clock=lambda: NOW,
     locks=None,
     effect_ledger=None,
+    rng=None,
 ):
     registry = ProviderRegistry()
     for provider in providers:
@@ -114,7 +115,7 @@ def make_engine(
         controls=controls,
         registry=registry,
         judge=judge or AllowAutonomyJudge(),
-        rng=random.Random(0),
+        rng=random.Random(0) if rng is None else rng,
         clock=clock,
         locks=locks,
         effect_ledger=effect_ledger,
@@ -221,6 +222,83 @@ def test_strict_receipt_is_the_only_completed_result(tmp_path):
     assert seen[0].epoch_id == "epoch-1"
     assert seen[0].content_length > 0
     assert seen[0].attempt == 1
+
+
+def test_verified_autonomy_occurrence_terminal_is_reused(tmp_path):
+    calls = []
+
+    def run(request):
+        calls.append(request)
+        return receipt_for(request)
+
+    engine, _controls = make_engine(tmp_path, [ActivityProvider("chosen", run)])
+    facts = {"source_event_id": "verified-occurrence", "epoch_id": "epoch-1"}
+
+    first = engine.run_once(settings(), facts=facts)
+    duplicate = engine.run_once(settings(), facts=facts)
+    terminals = [
+        event
+        for event in engine.bus.read_audit()
+        if event.payload.get("occurrence_id") == "verified-occurrence"
+        and event.payload.get("terminal") is not None
+    ]
+
+    assert first.status == duplicate.status == "completed"
+    assert duplicate.effect_id == first.effect_id
+    assert len(calls) == 1
+    assert len(terminals) == 1
+
+
+def test_failed_autonomy_occurrence_terminal_is_reused(tmp_path):
+    calls = []
+
+    def run(_request):
+        calls.append(True)
+        raise RuntimeError("fixture")
+
+    engine, _controls = make_engine(tmp_path, [ActivityProvider("chosen", run)])
+    facts = {"source_event_id": "failed-occurrence", "epoch_id": "epoch-1"}
+
+    first = engine.run_once(settings(), facts=facts)
+    duplicate = engine.run_once(settings(), facts=facts)
+    terminals = [
+        event
+        for event in engine.bus.read_audit()
+        if event.payload.get("occurrence_id") == "failed-occurrence"
+        and event.payload.get("terminal") is not None
+    ]
+
+    assert first.status == duplicate.status == "failed"
+    assert duplicate.effect_id == first.effect_id
+    assert len(calls) == 1
+    assert len(terminals) == 1
+
+
+def test_expired_autonomy_occurrence_terminal_is_reused(tmp_path):
+    current = [NOW]
+    engine, _controls = make_engine(
+        tmp_path,
+        [ActivityProvider("chosen", lambda _request: "accepted")],
+        clock=lambda: current[0],
+    )
+    facts = {"source_event_id": "expired-occurrence", "epoch_id": "epoch-1"}
+
+    initial = engine.run_once(settings(effect_ttl=1), facts=facts)
+    current[0] = NOW + timedelta(seconds=2)
+    settled = engine.run_once(settings(effect_ttl=1), facts=facts)
+    duplicate = engine.run_once(settings(effect_ttl=1), facts=facts)
+    terminals = [
+        event
+        for event in engine.bus.read_audit()
+        if event.payload.get("occurrence_id") == "expired-occurrence"
+        and event.payload.get("terminal") is not None
+    ]
+
+    assert initial.status == "executed_unverified"
+    assert settled.status == duplicate.status == "failed"
+    assert settled.reason == duplicate.reason == "effect_expired_unverified"
+    assert terminals[0].payload["terminal"] == "expired"
+    assert len(terminals) == 1
 
 
 def test_started_event_is_after_effect_intent_and_failure_does_not_run_provider(
@@ -334,6 +412,288 @@ def test_selected_failure_never_rerolls(tmp_path):
     assert (result.status, result.provider, calls) == ("failed", "first", ["first"])
 
 
+def test_weighted_selection_replays_across_process_rng(tmp_path):
+    config = {
+        "heavy": {"enabled": True, "weight": 3},
+        "light": {"enabled": True, "weight": 1},
+    }
+
+    def select(root, seed):
+        engine, _controls = make_engine(
+            root,
+            [
+                ActivityProvider("heavy", lambda _request: "accepted"),
+                ActivityProvider("light", lambda _request: "accepted"),
+            ],
+            rng=random.Random(seed),
+        )
+        return engine.run_once(
+            config,
+            facts={"source_event_id": "occurrence-1", "epoch_id": "epoch-1"},
+        ).provider
+
+    assert select(tmp_path / "first", 1) == select(tmp_path / "second", 999)
+
+
+def test_weighted_selection_preserves_bounded_diversity(tmp_path):
+    engine, _controls = make_engine(
+        tmp_path,
+        [
+            ActivityProvider("heavy", lambda _request: "accepted"),
+            ActivityProvider("light", lambda _request: "accepted"),
+        ],
+    )
+    config = {
+        "heavy": {"enabled": True, "weight": 3},
+        "light": {"enabled": True, "weight": 1},
+    }
+
+    selected = [
+        engine.run_once(
+            config,
+            facts={"source_event_id": f"occurrence-{index}", "epoch_id": "epoch-1"},
+        ).provider
+        for index in range(64)
+    ]
+
+    assert set(selected) == {"heavy", "light"}
+    assert selected.count("heavy") > selected.count("light")
+
+
+def test_judge_can_apply_bounded_provider_weights_without_selecting(tmp_path):
+    class BiasJudge:
+        def decide(self, _context):
+            return AutonomyDecision(
+                True,
+                "bounded_bias",
+                provider_weights={"heavy": 0, "light": 100},
+            )
+
+    engine, _controls = make_engine(
+        tmp_path,
+        [
+            ActivityProvider("heavy", lambda _request: "accepted"),
+            ActivityProvider("light", lambda _request: "accepted"),
+        ],
+        judge=BiasJudge(),
+    )
+    result = engine.run_once(
+        {
+            "heavy": {"enabled": True, "weight": 100},
+            "light": {"enabled": True, "weight": 1},
+        },
+        facts={"source_event_id": "biased-occurrence", "epoch_id": "epoch-1"},
+    )
+
+    assert (result.status, result.provider) == ("executed_unverified", "light")
+
+
+def test_judge_provider_weights_reject_unknown_provider(tmp_path):
+    class UnknownJudge:
+        def decide(self, _context):
+            return AutonomyDecision(
+                True,
+                "bad_bias",
+                provider_weights={"not_registered": 1},
+            )
+
+    engine, _controls = make_engine(
+        tmp_path,
+        [ActivityProvider("chosen", lambda _request: pytest.fail("runner called"))],
+        judge=UnknownJudge(),
+    )
+    result = engine.run_once(settings(), facts={"source_event_id": "s1"})
+
+    assert (result.status, result.reason) == ("failed", "judge_unknown_provider")
+
+
+def test_weighted_occurrence_retry_does_not_invoke_a_second_provider(tmp_path):
+    calls = []
+
+    def provider(name):
+        return ActivityProvider(name, lambda _request: calls.append(name))
+
+    effect_ledger = EffectLedger(tmp_path, clock=lambda: NOW)
+    config = {
+        "alpha": {"enabled": True, "weight": 1},
+        "beta": {"enabled": True, "weight": 1},
+    }
+    first, _controls = make_engine(
+        tmp_path,
+        [provider("alpha"), provider("beta")],
+        effect_ledger=effect_ledger,
+    )
+    facts = {"source_event_id": "occurrence-1", "epoch_id": "epoch-1"}
+    initial = first.run_once(config, facts=facts)
+
+    class RejectUnexpectedJudge:
+        def decide(self, _context):
+            raise AssertionError("existing occurrence must replay before Judge")
+
+    replay, _controls = make_engine(
+        tmp_path,
+        [],
+        effect_ledger=effect_ledger,
+        rng=random.Random(999),
+        judge=RejectUnexpectedJudge(),
+    )
+    repeated = replay.run_once({}, facts=facts)
+
+    assert repeated.provider == initial.provider
+    assert calls == [initial.provider]
+    assert repeated.effect_id == initial.effect_id
+
+
+def test_custom_idempotency_replays_persisted_provider_after_restart(tmp_path):
+    effect_ledger = EffectLedger(tmp_path, clock=lambda: NOW)
+    first, _controls = make_engine(
+        tmp_path,
+        [ActivityProvider("beta", lambda _request: "accepted")],
+        effect_ledger=effect_ledger,
+    )
+    facts = {
+        "occurrence_id": "occurrence-custom",
+        "epoch_id": "epoch-1",
+        "idempotency_key": "custom-key",
+    }
+    initial = first.run_once(settings("beta"), facts=facts)
+
+    class RejectUnexpectedJudge:
+        def decide(self, _context):
+            raise AssertionError("existing idempotency key must replay before Judge")
+
+    replay, _controls = make_engine(
+        tmp_path,
+        [],
+        effect_ledger=effect_ledger,
+        judge=RejectUnexpectedJudge(),
+    )
+    repeated = replay.run_once({}, facts=facts)
+
+    assert initial.provider == "beta"
+    assert repeated.provider == "beta"
+    assert repeated.effect_id == initial.effect_id
+
+
+def test_ineligible_providers_create_no_effect_or_started_event(tmp_path):
+    engine, _controls = make_engine(
+        tmp_path,
+        [
+            ActivityProvider(
+                "blocked",
+                lambda _request: pytest.fail("runner called"),
+                eligible=lambda _context: False,
+            )
+        ],
+    )
+
+    result = engine.run_once(
+        settings("blocked"),
+        facts={"occurrence_id": "occurrence-1", "epoch_id": "epoch-1"},
+    )
+
+    assert (result.status, result.reason) == ("skipped", "no_eligible_provider")
+    assert engine.effect_ledger.records() == []
+    assert engine.bus.read_events() == []
+
+
+def test_eligibility_error_creates_no_effect(tmp_path):
+    def broken_eligibility(_context):
+        raise RuntimeError("fixture")
+
+    engine, _controls = make_engine(
+        tmp_path,
+        [
+            ActivityProvider(
+                "broken",
+                lambda _request: pytest.fail("runner called"),
+                eligible=broken_eligibility,
+            )
+        ],
+    )
+
+    result = engine.run_once(
+        settings("broken"),
+        facts={"occurrence_id": "occurrence-1", "epoch_id": "epoch-1"},
+    )
+
+    assert (result.status, result.reason) == (
+        "failed",
+        "eligibility_error:RuntimeError",
+    )
+    assert engine.effect_ledger.records() == []
+
+
+def test_pending_occurrence_replays_before_judge_or_provider_settings(tmp_path):
+    class RejectUnexpectedJudge:
+        def decide(self, _context):
+            raise AssertionError("pending occurrence must replay before Judge")
+
+    engine, _controls = make_engine(
+        tmp_path,
+        [],
+        judge=RejectUnexpectedJudge(),
+    )
+    digest, key, length = engine._effect_identity("selected", "occurrence-1", "epoch-1")
+    intent = engine.effect_ledger.begin_intent(
+        kind="autonomy_completion",
+        source_event_id="occurrence-1",
+        idempotency_key=key,
+        epoch_id="epoch-1",
+        content_sha256=digest,
+        content_length=length,
+        created_at=NOW,
+        expires_at=NOW + timedelta(hours=1),
+    )
+    engine.effect_ledger.mark_pending(intent.effect_id)
+
+    result = engine.run_once(
+        {}, facts={"occurrence_id": "occurrence-1", "epoch_id": "epoch-1"}
+    )
+
+    assert (result.status, result.provider, result.effect_id) == (
+        "awaiting_reconciliation",
+        "selected",
+        intent.effect_id,
+    )
+
+
+def test_runner_observes_pending_effect_before_execution(tmp_path):
+    holder = {}
+
+    def run(request):
+        assert holder["engine"].effect_ledger.get(request.effect_id).state == "pending"
+        return "accepted"
+
+    engine, _controls = make_engine(tmp_path, [ActivityProvider("chosen", run)])
+    holder["engine"] = engine
+
+    result = engine.run_once(
+        settings(),
+        facts={"occurrence_id": "occurrence-1", "epoch_id": "epoch-1"},
+    )
+
+    assert result.status == "executed_unverified"
+
+
+def test_conflicting_occurrence_aliases_fail_closed(tmp_path):
+    engine, _controls = make_engine(
+        tmp_path,
+        [ActivityProvider("chosen", lambda _request: pytest.fail("runner called"))],
+    )
+
+    result = engine.run_once(
+        settings(),
+        facts={
+            "source_event_id": "occurrence-1",
+            "occurrence_id": "occurrence-2",
+        },
+    )
+
+    assert (result.status, result.reason) == ("failed", "conflicting_identity")
+    assert engine.effect_ledger.records() == []
+
+
 def test_control_and_active_chat_are_before_judge(tmp_path):
     class CountingJudge:
         calls = 0
@@ -355,6 +715,67 @@ def test_control_and_active_chat_are_before_judge(tmp_path):
     controls.put(feature="autonomy", mode="pause", source="operator")
     assert engine.run_once(settings()).status == "skipped"
     assert judge.calls == 0
+    assert engine.bus.read_events() == []
+
+
+def test_prejudge_autonomy_terminal_replays_without_judge(tmp_path):
+    class CountingJudge:
+        calls = 0
+
+        def decide(self, _context):
+            self.calls += 1
+            raise AssertionError("active-chat occurrence must not reach Judge")
+
+    judge = CountingJudge()
+    engine, _controls = make_engine(
+        tmp_path,
+        [ActivityProvider("chosen", lambda _request: pytest.fail("runner called"))],
+        judge=judge,
+    )
+    facts = {
+        "source_event_id": "autonomy-occurrence",
+        "epoch_id": "epoch-1",
+        "active_chat": True,
+    }
+
+    first = engine.run_once(settings(), facts=facts)
+    duplicate = engine.run_once(settings(), facts={**facts, "active_chat": False})
+    terminals = [
+        event
+        for event in engine.bus.read_audit()
+        if event.payload.get("occurrence_id") == "autonomy-occurrence"
+        and event.payload.get("terminal") is not None
+    ]
+
+    assert (first.status, first.reason) == ("skipped", "active_chat")
+    assert (duplicate.status, duplicate.reason) == ("skipped", "active_chat")
+    assert judge.calls == 0
+    assert len(terminals) == 1
+
+
+def test_proactive_gate_blocks_autonomy_before_judge(tmp_path):
+    class CountingJudge:
+        calls = 0
+
+        def decide(self, _context):
+            self.calls += 1
+            return AutonomyDecision(True, "allow")
+
+    judge = CountingJudge()
+    engine, controls = make_engine(
+        tmp_path,
+        [ActivityProvider("chosen", lambda _request: pytest.fail("runner called"))],
+        judge=judge,
+    )
+    controls.put(feature="proactive", mode="pause", source="operator")
+
+    result = engine.run_once(settings())
+
+    assert (result.status, result.reason, judge.calls) == (
+        "skipped",
+        "controlled_by:operator",
+        0,
+    )
     assert engine.bus.read_events() == []
 
 
@@ -792,6 +1213,45 @@ def test_expired_effect_requires_explicit_requeue(tmp_path):
     assert len(calls) == 1
 
 
+def test_next_tick_fails_crashed_pre_provider_effect_without_replay(tmp_path):
+    current = [NOW]
+    calls = []
+
+    def run(_request):
+        calls.append(True)
+        if len(calls) == 1:
+            raise SystemExit("synthetic process crash")
+        return "queued"
+
+    engine, _controls = make_engine(
+        tmp_path,
+        [ActivityProvider("chosen", run)],
+        clock=lambda: current[0],
+    )
+    with pytest.raises(SystemExit, match="synthetic process crash"):
+        engine.run_once(
+            settings(effect_ttl=1),
+            facts={"source_event_id": "crashed", "epoch_id": "e1"},
+        )
+    orphan = engine.effect_ledger.records()[0]
+    assert orphan.state == "pending"
+
+    current[0] = NOW + timedelta(seconds=2)
+    next_result = engine.run_once(
+        settings(effect_ttl=1),
+        facts={"source_event_id": "next", "epoch_id": "e2"},
+    )
+
+    settled = engine.effect_ledger.get(orphan.effect_id)
+    assert (settled.state, settled.reason, settled.retryable) == (
+        "failed",
+        "effect_expired_unverified",
+        False,
+    )
+    assert next_result.status == "executed_unverified"
+    assert calls == [True, True]
+
+
 def test_injected_effect_port_and_locks_need_no_controls_path(tmp_path):
     class EffectPort:
         def __init__(self):
@@ -1121,7 +1581,7 @@ def test_observer_custom_idempotency_uses_exact_audit_provider_label(tmp_path):
     assert facts[0].recovery.ref == result.effect_record.receipt.receipt_id
 
 
-def test_observer_custom_verified_effect_without_audit_is_generic_verified(
+def test_observer_custom_verified_effect_without_audit_keeps_provider(
     tmp_path, monkeypatch
 ):
     engine, _controls = make_engine(
@@ -1144,12 +1604,12 @@ def test_observer_custom_verified_effect_without_audit_is_generic_verified(
     assert len(facts) == 1
     assert facts[0].code == "autonomy_verified"
     assert facts[0].state == "recovered_history"
-    assert "provider:chosen" not in facts[0].refs
+    assert "provider:chosen" in facts[0].refs
     assert facts[0].recovery is not None
     assert facts[0].recovery.ref == result.effect_record.receipt.receipt_id
 
 
-def test_observer_custom_unverified_effect_without_provider_is_integrity(tmp_path):
+def test_observer_custom_unverified_effect_keeps_provider(tmp_path):
     engine, _controls = make_engine(
         tmp_path,
         [ActivityProvider("chosen", lambda _request: None)],
@@ -1168,4 +1628,5 @@ def test_observer_custom_unverified_effect_without_provider_is_integrity(tmp_pat
     assert result.status == "executed_unverified"
     assert len(facts) == 1
     assert facts[0].state == "current"
-    assert facts[0].code == "autonomy_integrity_error:provider_unavailable"
+    assert facts[0].code == "autonomy_executed_unverified"
+    assert "provider:chosen" in facts[0].refs

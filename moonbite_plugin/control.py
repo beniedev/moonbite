@@ -20,7 +20,9 @@ from .runtime_core import (
 )
 
 CONTROL_SCHEMA = "moon.runtime_control.v1"
-FEATURES = frozenset({"heartbeat", "autonomy", "background_costly"})
+CANONICAL_FEATURES = frozenset({"heartbeat", "autonomy", "proactive"})
+FEATURE_ALIASES = {"background_costly": "proactive"}
+FEATURES = CANONICAL_FEATURES | frozenset(FEATURE_ALIASES)
 MODES = frozenset({"pause", "rest", "play_next", "quota_save"})
 SOURCE_PRIORITY = {
     "scheduler": 10,
@@ -46,6 +48,12 @@ def _nonempty_text(value: Any, label: str) -> str:
     if type(value) is not str or not value.strip():
         raise StateError(f"{label} must be a non-empty string")
     return value
+
+
+def canonical_feature(feature: str) -> str:
+    if feature not in FEATURES:
+        raise ValueError(f"unknown controlled feature: {feature}")
+    return FEATURE_ALIASES.get(feature, feature)
 
 
 def _aware_time(value: Any, label: str) -> datetime:
@@ -107,8 +115,7 @@ class ControlIntent:
     payload: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
-        if self.feature not in FEATURES:
-            raise ValueError(f"unknown controlled feature: {self.feature}")
+        object.__setattr__(self, "feature", canonical_feature(self.feature))
         if self.mode not in MODES:
             raise ValueError(f"unknown control mode: {self.mode}")
         if self.source not in SOURCE_PRIORITY:
@@ -155,8 +162,10 @@ class ControlIntent:
         feature = _nonempty_text(value["feature"], "control feature")
         mode = _nonempty_text(value["mode"], "control mode")
         source = _nonempty_text(value["source"], "control source")
-        if feature not in FEATURES:
-            raise StateError(f"unknown controlled feature: {feature}")
+        try:
+            feature = canonical_feature(feature)
+        except ValueError as exc:
+            raise StateError(f"unknown controlled feature: {feature}") from exc
         if mode not in MODES:
             raise StateError(f"unknown control mode: {mode}")
         if source not in SOURCE_PRIORITY:
@@ -245,8 +254,12 @@ class ControlStore:
         return intent
 
     def clear(self, *, feature: str, source: str) -> None:
-        if feature not in FEATURES or source not in SOURCE_PRIORITY:
+        if source not in SOURCE_PRIORITY:
             raise ValueError("clear requires a known feature and source")
+        try:
+            feature = canonical_feature(feature)
+        except ValueError as exc:
+            raise ValueError("clear requires a known feature and source") from exc
         self._append("clear", feature=feature, source=source)
 
     def consume(self, control_id: str) -> None:
@@ -310,7 +323,13 @@ class ControlStore:
             elif action == "clear":
                 feature = _nonempty_text(row["feature"], "clear feature")
                 source = _nonempty_text(row["source"], "clear source")
-                if feature not in FEATURES or source not in SOURCE_PRIORITY:
+                try:
+                    feature = canonical_feature(feature)
+                except ValueError as exc:
+                    raise StateError(
+                        f"controls.jsonl row {index} has invalid clear"
+                    ) from exc
+                if source not in SOURCE_PRIORITY:
                     raise StateError(f"controls.jsonl row {index} has invalid clear")
                 active = {
                     key: value
@@ -393,17 +412,19 @@ class ControlStore:
     def resolve(
         self, feature: str, *, now: datetime | None = None
     ) -> ControlResolution:
-        if feature not in FEATURES:
-            raise ValueError(f"unknown controlled feature: {feature}")
+        feature = canonical_feature(feature)
         active = self.active(now=now)
         candidates = [item for item in active if item.feature == feature]
         if feature in {"heartbeat", "autonomy"}:
-            candidates.extend(
-                item for item in active if item.feature == "background_costly"
-            )
+            candidates.extend(item for item in active if item.feature == "proactive")
         winner = max(
             candidates,
-            key=lambda item: (item.priority, item.created_at, item.control_id),
+            key=lambda item: (
+                item.priority,
+                item.feature == "proactive",
+                item.created_at,
+                item.control_id,
+            ),
             default=None,
         )
         return ControlResolution(feature, winner)

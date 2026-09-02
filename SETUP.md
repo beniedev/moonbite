@@ -169,7 +169,24 @@ edit `session_lifecycle.jsonl` by hand.
 An abandoned terminal releases the active-chat liveness gate for that turn,
 but it does not satisfy checkpoint or successful-response requirements.
 
-### 2.9 Enabling optional modules incrementally
+### 2.9 Pause all proactive execution for maintenance
+
+Use the group control before changing a host adapter or deployment wiring:
+
+```bash
+hermes moonbite control pause proactive
+hermes moonbite control status proactive
+# perform and verify the maintenance change
+hermes moonbite control resume proactive
+```
+
+`proactive` gates both Heartbeat and Autonomy before their Judge, provider, or
+delivery path. It does not block ordinary user-started conversation. Resume
+does not replay missed occurrences. `background_costly` remains an input alias
+for older operator scripts, but status and new ledger rows use only
+`proactive`; the two names never create independent controls.
+
+### 2.10 Enabling optional modules incrementally
 
 Once the inert baseline is verified:
 1. Choose exactly one optional module (for example, `modules.panel: true`).
