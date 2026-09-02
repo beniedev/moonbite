@@ -26,7 +26,7 @@ The 7 manifest hooks are registered in strict `HOOK_ORDER`:
 2. `on_session_start`: Fires when a session initializes; records normalized session-start lifecycle telemetry when resolvable context is available.
 3. `pre_llm_call`: Fires immediately before model invocation; records lifecycle step and optionally attaches fresh Panel Afterglow or enabled Memory recall as bounded, untrusted context (never as instructions).
 4. `post_llm_call`: Fires only for a non-empty, non-interrupted final response; records a completed post-model turn.
-5. `on_session_end`: Fires for every completed `run_conversation` path and maps success, failure, interruption, or incomplete exit into canonical terminal evidence without storing free-text exit details.
+5. `on_session_end`: Fires for every completed `run_conversation` path and maps success, failure, interruption, or incomplete exit into canonical terminal evidence without storing free-text exit details. `settled_turn_ids` independently records turns with a successful post callback.
 6. `on_session_finalize`: Fires when a session finishes; records normalized session rotation, expiry, or shutdown evidence.
 7. `subagent_stop`: Uses only `child_session_id` and `child_status`; a non-success stop closes that child's unique open turn without reading its summary, goal, or tool history. A completed child is a no-op because its own post/end callbacks carry success.
 
@@ -57,6 +57,9 @@ attaches to an existing five- or six-hook Moonbite lifecycle, the adapter
 preserves its recorded capabilities and writes only the canonical terminal row
 for a newly available host terminal. This releases liveness without rewriting
 old rows or claiming that the old lifecycle registered a newer hook.
+The same lifecycle-level correlation applies to `on_session_finalize`, so an
+upgrade can finalize an existing four- or five-hook lifecycle while preserving
+its recorded capability set.
 
 Hermes v0.21.0 bounds ordinary plugin hook callbacks with a 30-second host
 timeout, while `subagent_stop` preserves caller-thread serialization. Moonbite's
@@ -74,6 +77,15 @@ an older binary at upgraded state.
 Heartbeat cadence writes upgrade valid legacy state to schema v4. Deployments
 must snapshot cadence state before upgrading and must not point an older
 Moonbite binary at a state directory after a v4 cadence write.
+
+### Injected runtime components
+
+The current host-injected ownership contract is
+`moon.runtime_components.v3`. It requires the canonical session terminal ports
+(`record_host_turn_end`, `record_host_child_stop`, `record_host_shutdown`, and
+`record_host_finalize`) in addition to the existing component owners. The v2
+bundle contract is rejected rather than treated as a partial compatibility
+match; session ledgers remain append-only and are not rewritten.
 
 ---
 

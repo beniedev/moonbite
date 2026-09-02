@@ -151,6 +151,14 @@ def test_standalone_passes_anchor_timezone_to_cadence(tmp_path):
     )
 
 
+def test_previous_runtime_components_schema_is_rejected(tmp_path):
+    values = bundle_kwargs(tmp_path)
+    values["schema_version"] = "moon.runtime_components.v2"
+
+    with pytest.raises(RuntimeComponentsError, match="unsupported runtime components"):
+        RuntimeComponents(**values)
+
+
 def test_injected_preserves_supplied_identities_without_creating_state_root(tmp_path):
     root = tmp_path / "host-state"
     values = bundle_kwargs(tmp_path)

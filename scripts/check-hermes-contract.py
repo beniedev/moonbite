@@ -171,7 +171,7 @@ def _turn_exit_contract() -> None:
             ),
             (
                 {"completed": True, "failed": False, "interrupted": False},
-                "host_turn_completed_without_post",
+                "host_turn_completed",
             ),
         )
         for flags, expected_reason in exits:

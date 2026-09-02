@@ -14,7 +14,7 @@ from .panel import PanelStore
 from .runtime_core import EventBus, FileRuntimeLocks, RuntimeLocks, ensure_bounded_text
 from .session import SessionLifecycleStore
 
-RUNTIME_COMPONENTS_SCHEMA = "moon.runtime_components.v2"
+RUNTIME_COMPONENTS_SCHEMA = "moon.runtime_components.v3"
 REQUIRED_STATE_DOMAINS = frozenset(
     {
         "event",

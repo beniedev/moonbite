@@ -60,6 +60,23 @@ def test_host_adapter_normalizes_official_turn_end_payload():
     assert terminal.reason == "host_turn_failed"
 
 
+def test_host_adapter_completed_turn_uses_neutral_reason():
+    adapter = HermesHostAdapter()
+
+    terminal = adapter.turn_terminal(
+        {
+            **HERMES_TURN_END_PAYLOAD,
+            "completed": True,
+            "failed": False,
+            "interrupted": False,
+            "turn_exit_reason": "text_response(stop)",
+        },
+        supported_hooks=frozenset(HOOK_ORDER),
+    )
+
+    assert terminal.reason == "host_turn_completed"
+
+
 @pytest.mark.parametrize(
     ("status", "reason"),
     (
@@ -134,6 +151,40 @@ def test_host_adapter_correlates_rotated_session_from_durable_turn():
     assert correlated.session_id == "session-old"
     assert correlated.lifecycle_id == "session-old"
     assert correlated.turn_id == "contract-turn"
+
+
+def test_host_adapter_correlates_lifecycle_capabilities_from_durable_state():
+    adapter = HermesHostAdapter()
+    context = adapter.session_context(
+        "on_session_finalize",
+        {"session_id": "legacy-session"},
+        frozenset(HOOK_ORDER),
+    )
+    legacy_hooks = frozenset(
+        {
+            "pre_gateway_dispatch",
+            "on_session_start",
+            "pre_llm_call",
+            "post_llm_call",
+            "on_session_finalize",
+        }
+    )
+    snapshot = SessionLifecycleSnapshot(
+        session_id="legacy-session",
+        lifecycle_id="legacy-session",
+        supported_hooks=legacy_hooks,
+        hooks=("on_session_start", "pre_llm_call"),
+        settled_turn_ids=(),
+        open_turn_id=None,
+        finalized=False,
+        private_contact_count=0,
+    )
+
+    correlated = adapter.correlate_lifecycle(context, (snapshot,))
+
+    assert correlated.session_id == "legacy-session"
+    assert correlated.lifecycle_id == "legacy-session"
+    assert correlated.supported_hooks == legacy_hooks
 
 
 def test_host_adapter_rejects_ambiguous_turn_correlation():

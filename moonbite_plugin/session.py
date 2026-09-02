@@ -34,6 +34,8 @@ TURN_TERMINAL_REASONS = frozenset(
         "operator_repair",
         "host_session_finalized",
         "host_shutdown",
+        "host_turn_completed",
+        # Legacy rows remain readable and are never rewritten.
         "host_turn_completed_without_post",
         "host_turn_failed",
         "host_turn_incomplete",
@@ -1095,10 +1097,10 @@ class SessionLifecycleStore:
                         existing_terminal, state, deduplicated=True
                     )
 
-            if (
-                turn.outcome == "completed"
-                and terminal_reason != "host_turn_completed_without_post"
-            ):
+            if turn.outcome == "completed" and terminal_reason not in {
+                "host_turn_completed",
+                "host_turn_completed_without_post",
+            }:
                 raise SessionLifecycleError(
                     "on_session_end conflicts with settled turn evidence"
                 )

@@ -137,7 +137,7 @@ Moonbite registers exactly 7 lifecycle hooks in Hermes (in actual `HOOK_ORDER`):
 2. `on_session_start`: Fires when a session starts; records normalized session-start lifecycle telemetry when resolvable context is available.
 3. `pre_llm_call`: Fires before an LLM call; records the lifecycle step and may attach fresh Panel Afterglow or enabled Memory recall as bounded, untrusted context (never as instructions).
 4. `post_llm_call`: Fires only when Hermes has a non-empty final response and the turn was not interrupted; records a completed post-model turn.
-5. `on_session_end`: Fires at every `run_conversation` exit; records canonical terminal evidence for failure, interruption, or a completed turn that had no successful post callback.
+5. `on_session_end`: Fires at every `run_conversation` exit; records canonical terminal evidence for failure, interruption, or completion. `settled_turn_ids` independently records turns with a successful post callback.
 6. `on_session_finalize`: Fires at a session boundary; records normalized rotation, expiry, or shutdown evidence.
 7. `subagent_stop`: For a non-success child, reads only `child_session_id` and `child_status` and closes that child's unique open turn. A completed child is a no-op.
 

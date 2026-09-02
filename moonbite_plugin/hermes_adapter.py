@@ -22,6 +22,9 @@ from .session import SessionContext, SessionLifecycleSnapshot
 _DEFINITIVE_FINALIZE_REASONS = frozenset({"new_session", "session_expired"})
 _TURN_TERMINAL_REASONS = frozenset(
     {
+        "host_turn_completed",
+        # Keep accepting this legacy label so old lifecycle rows remain
+        # readable; new host callbacks use the neutral reason above.
         "host_turn_completed_without_post",
         "host_turn_failed",
         "host_turn_incomplete",
@@ -166,7 +169,7 @@ class HermesHostAdapter:
         elif kwargs["failed"]:
             reason = "host_turn_failed"
         elif kwargs["completed"]:
-            reason = "host_turn_completed_without_post"
+            reason = "host_turn_completed"
         else:
             reason = "host_turn_incomplete"
         return HermesTurnTerminal(context=context, reason=reason)
@@ -215,6 +218,32 @@ class HermesHostAdapter:
                 "turn_id matches multiple Moonbite session lifecycles"
             )
         snapshot = candidates[0]
+        return replace(
+            context,
+            session_id=snapshot.session_id,
+            lifecycle_id=snapshot.lifecycle_id,
+            supported_hooks=snapshot.supported_hooks,
+        )
+
+    @staticmethod
+    def correlate_lifecycle(
+        context: SessionContext,
+        snapshots: tuple[SessionLifecycleSnapshot, ...],
+    ) -> SessionContext:
+        """Reuse durable lifecycle identity and capabilities for session hooks."""
+
+        matches = [
+            snapshot
+            for snapshot in snapshots
+            if snapshot.lifecycle_id == context.lifecycle_id
+        ]
+        if not matches:
+            return context
+        if len(matches) != 1:
+            raise SessionHookMappingError(
+                "session_id matches multiple Moonbite session lifecycles"
+            )
+        snapshot = matches[0]
         return replace(
             context,
             session_id=snapshot.session_id,

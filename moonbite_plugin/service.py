@@ -340,10 +340,15 @@ class MoonbiteRuntime:
             "pre_llm_call",
             "post_llm_call",
             "on_session_end",
+            "on_session_finalize",
         }:
             snapshots = self.session.replay()
             if hook == "pre_llm_call":
                 context = self.hermes_host_adapter.pre_turn_context(context, snapshots)
+            elif hook == "on_session_finalize":
+                context = self.hermes_host_adapter.correlate_lifecycle(
+                    context, snapshots
+                )
             else:
                 context = self.hermes_host_adapter.correlate_turn(context, snapshots)
         return context

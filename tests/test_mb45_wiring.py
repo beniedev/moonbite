@@ -603,7 +603,7 @@ def test_plugin_shutdown_closes_only_open_turn_and_session_remains_reusable(tmp_
     (
         ((False, True, False), "host_turn_failed"),
         ((False, False, True), "host_turn_interrupted"),
-        ((True, False, False), "host_turn_completed_without_post"),
+        ((True, False, False), "host_turn_completed"),
     ),
 )
 def test_plugin_on_session_end_closes_turn_without_fake_post(
@@ -829,6 +829,96 @@ def test_upgraded_host_closes_and_reuses_legacy_five_hook_lifecycle(tmp_path):
     assert components.session.snapshot("legacy-session").open_turn_id == (
         "legacy-turn-next"
     )
+
+
+@pytest.mark.parametrize(
+    "legacy_hooks",
+    (
+        frozenset(
+            {
+                "pre_gateway_dispatch",
+                "on_session_start",
+                "pre_llm_call",
+                "post_llm_call",
+                "on_session_finalize",
+            }
+        ),
+        frozenset(
+            {
+                "on_session_start",
+                "pre_llm_call",
+                "post_llm_call",
+                "on_session_finalize",
+            }
+        ),
+    ),
+)
+@pytest.mark.parametrize("reason", ("session_expired", "new_session"))
+@pytest.mark.parametrize("with_post", (False, True))
+def test_upgraded_host_finalizes_legacy_lifecycle_with_current_hooks(
+    tmp_path, legacy_hooks, reason, with_post
+):
+    components, _locks, _bus = injected_bundle(tmp_path / "host")
+
+    def legacy_context(hook, source_id, turn_id=None):
+        source_kind = {
+            "pre_gateway_dispatch": "private_inbound",
+            "on_session_start": "session_start",
+            "post_llm_call": "assistant_response",
+        }.get(hook, "system")
+        return SessionContext(
+            session_id="legacy-session",
+            lifecycle_id="legacy-session",
+            source_id=source_id,
+            turn_id=turn_id,
+            source_kind=source_kind,
+            observed_at=datetime(2026, 9, 1, 19, 0, tzinfo=UTC),
+            fresh=hook in {"pre_gateway_dispatch", "on_session_start"},
+            supported_hooks=legacy_hooks,
+        )
+
+    if "pre_gateway_dispatch" in legacy_hooks:
+        components.session.record_hook(
+            legacy_context("pre_gateway_dispatch", "legacy-gateway"),
+            "pre_gateway_dispatch",
+        )
+    components.session.record_hook(
+        legacy_context("on_session_start", "legacy-session"),
+        "on_session_start",
+    )
+    components.session.record_hook(
+        legacy_context("pre_llm_call", "legacy-turn", "legacy-turn"),
+        "pre_llm_call",
+    )
+    if with_post:
+        components.session.record_hook(
+            legacy_context("post_llm_call", "legacy-turn", "legacy-turn"),
+            "post_llm_call",
+            settled=True,
+        )
+
+    runtime = MoonbiteRuntime({}, components=components)
+    runtime.record_hermes_session_finalize(
+        {
+            "session_id": "legacy-session",
+            "reason": reason,
+            "old_session_id": "legacy-session",
+            "new_session_id": "new-session" if reason == "new_session" else None,
+        }
+    )
+
+    snapshot = components.session.snapshot("legacy-session")
+    assert snapshot is not None
+    assert snapshot.finalized is True
+    assert snapshot.supported_hooks == legacy_hooks
+    assert snapshot.open_turn_id is None
+    assert snapshot.settled_turn_ids == (("legacy-turn",) if with_post else ())
+    assert snapshot.abandoned_turn_ids == (() if with_post else ("legacy-turn",))
+    assert [
+        row["reason"]
+        for row in components.session.ledger.rows()
+        if row["kind"] == "turn_terminal"
+    ] == ([] if with_post else ["host_session_finalized"])
 
 
 def test_plugin_new_session_finalize_closes_old_session_only(tmp_path):

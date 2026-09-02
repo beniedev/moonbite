@@ -138,7 +138,7 @@ def test_full_path_requires_settled_turn_before_finalize(tmp_path) -> None:
     receipts.append(
         store.record_host_turn_end(
             context("end", source_kind="system", turn_id="turn-1"),
-            "host_turn_completed_without_post",
+            "host_turn_completed",
         )
     )
     receipts.append(
@@ -181,7 +181,7 @@ def test_cli_like_order_can_omit_gateway(tmp_path) -> None:
             turn_id="turn-1",
             supported_hooks=supported,
         ),
-        "host_turn_completed_without_post",
+        "host_turn_completed",
     )
     receipt = store.record_hook(
         context("finalize", source_kind="system", supported_hooks=supported),
@@ -196,7 +196,7 @@ def test_cli_like_order_can_omit_gateway(tmp_path) -> None:
     (
         "host_turn_failed",
         "host_turn_interrupted",
-        "host_turn_completed_without_post",
+        "host_turn_completed",
         "host_turn_incomplete",
     ),
 )
@@ -219,6 +219,26 @@ def test_host_turn_end_is_terminal_without_faking_post(tmp_path, reason) -> None
     assert replay.deduplicated is True
 
 
+def test_legacy_completed_terminal_reason_remains_readable(tmp_path) -> None:
+    store = open_turn_store(tmp_path)
+    end = context(
+        "end",
+        source_kind="system",
+        turn_id="turn-1",
+        supported_hooks=FINALIZE_HOOKS,
+    )
+
+    store.record_host_turn_end(end, "host_turn_completed_without_post")
+    replay = SessionLifecycleStore(tmp_path).replay()
+
+    assert replay[0].abandoned_turn_ids == ("turn-1",)
+    assert [
+        row["reason"]
+        for row in store.ledger.rows()
+        if row["kind"] == "turn_terminal"
+    ] == ["host_turn_completed_without_post"]
+
+
 def test_host_turn_end_rejects_conflicting_terminal_classification(tmp_path) -> None:
     store = open_turn_store(tmp_path)
     end = context(
@@ -231,7 +251,7 @@ def test_host_turn_end_rejects_conflicting_terminal_classification(tmp_path) -> 
     store.record_host_turn_end(end, "host_turn_failed")
 
     with pytest.raises(SessionLifecycleError, match="conflicts"):
-        store.record_host_turn_end(end, "host_turn_completed_without_post")
+        store.record_host_turn_end(end, "host_turn_completed")
     assert store.ledger.rows()[-1]["terminal_reason"] == "host_turn_failed"
 
 
