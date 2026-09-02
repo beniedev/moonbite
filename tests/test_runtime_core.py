@@ -184,3 +184,57 @@ def test_audit_terminal_same_label_rejects_conflicting_effect_identity(tmp_path)
             source="heartbeat",
             details={"effect_id": "effect-2"},
         )
+
+
+def test_audit_terminal_epoch_is_independent_and_legacy_rows_stay_readable(tmp_path):
+    bus = EventBus(tmp_path, clock=lambda: NOW)
+    legacy = bus.record_audit_terminal(
+        "heartbeat",
+        occurrence_id="same-source",
+        terminal="active_chat",
+        status="skipped",
+        source="heartbeat",
+    )
+    before = bus.audit.path.read_bytes()
+
+    first = bus.record_audit_terminal(
+        "heartbeat",
+        occurrence_id="same-source",
+        epoch_id="epoch-1",
+        terminal="verified",
+        status="completed",
+        source="heartbeat",
+    )
+    second = bus.record_audit_terminal(
+        "heartbeat",
+        occurrence_id="same-source",
+        epoch_id="epoch-2",
+        terminal="failed",
+        status="failed",
+        source="heartbeat",
+    )
+
+    assert bus.find_audit_terminal("heartbeat", "same-source") == legacy
+    assert bus.find_audit_terminal(
+        "heartbeat", "same-source", epoch_id="epoch-1"
+    ) == first
+    assert bus.find_audit_terminal(
+        "heartbeat", "same-source", epoch_id="epoch-2"
+    ) == second
+    assert bus.audit.path.read_bytes().startswith(before)
+    assert "epoch_id" not in legacy.payload
+    assert first.payload["epoch_id"] == "epoch-1"
+    assert second.payload["epoch_id"] == "epoch-2"
+
+    for invalid in ("", 1):
+        with pytest.raises(ValueError, match="epoch_id"):
+            bus.find_audit_terminal("heartbeat", "same-source", epoch_id=invalid)
+        with pytest.raises(ValueError, match="epoch_id"):
+            bus.record_audit_terminal(
+                "heartbeat",
+                occurrence_id="another-source",
+                epoch_id=invalid,
+                terminal="verified",
+                status="completed",
+                source="heartbeat",
+            )

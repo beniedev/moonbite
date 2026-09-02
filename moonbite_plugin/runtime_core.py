@@ -357,18 +357,32 @@ class EventBus:
             payload={"status": status, **({} if details is None else dict(details))},
             created_at=self.clock(),
         )
+        # ``epoch_id=None`` is the legacy identity, not an explicit field.
+        # Keep non-terminal rows in the old shape so public telemetry does not
+        # manufacture an epoch merely because a result serializer included a
+        # nullable field.
+        if event.payload.get("epoch_id") is None:
+            event.payload.pop("epoch_id", None)
         self.audit.append(event.to_dict())
         return event
 
     def find_audit_terminal(
-        self, action: str, occurrence_id: str
+        self,
+        action: str,
+        occurrence_id: str,
+        *,
+        epoch_id: str | None = None,
     ) -> EventEnvelope | None:
-        """Find one canonical terminal for an exact public occurrence."""
+        """Find one canonical terminal for an exact occurrence and epoch."""
 
         if type(action) is not str or not action.strip():
             raise ValueError("audit action must be non-empty")
         if type(occurrence_id) is not str or not occurrence_id.strip():
             raise ValueError("audit occurrence_id must be non-empty")
+        if epoch_id is not None and (
+            type(epoch_id) is not str or not epoch_id.strip()
+        ):
+            raise ValueError("audit epoch_id must be non-empty when provided")
         found: EventEnvelope | None = None
         for row in self.audit.rows():
             event = EventEnvelope.from_dict(row)
@@ -376,6 +390,16 @@ class EventBus:
                 continue
             payload = event.payload
             if payload.get("occurrence_id") != occurrence_id:
+                continue
+            stored_epoch = payload.get("epoch_id")
+            if stored_epoch is not None and (
+                type(stored_epoch) is not str or not stored_epoch.strip()
+            ):
+                raise StateError("audit epoch_id is invalid")
+            # Legacy rows omit epoch_id and therefore belong only to the
+            # legacy (None) identity.  An explicit epoch must never replay or
+            # conflict with an old no-epoch terminal.
+            if stored_epoch != epoch_id:
                 continue
             terminal = payload.get("terminal")
             if terminal is None:
@@ -392,6 +416,7 @@ class EventBus:
         action: str,
         *,
         occurrence_id: str,
+        epoch_id: str | None = None,
         terminal: str,
         status: str,
         source: str,
@@ -400,14 +425,19 @@ class EventBus:
         """Append one canonical terminal audit for an exact occurrence.
 
         Existing terminal evidence is returned unchanged.  A different
-        terminal for the same occurrence is a durable integrity conflict and
-        fails closed; non-terminal audit rows remain ordinary telemetry.
+        terminal for the same occurrence and epoch is a durable integrity
+        conflict and fails closed; non-terminal audit rows remain ordinary
+        telemetry.
         """
 
         if type(action) is not str or not action.strip():
             raise ValueError("audit action must be non-empty")
         if type(occurrence_id) is not str or not occurrence_id.strip():
             raise ValueError("audit occurrence_id must be non-empty")
+        if epoch_id is not None and (
+            type(epoch_id) is not str or not epoch_id.strip()
+        ):
+            raise ValueError("audit epoch_id must be non-empty when provided")
         if type(terminal) is not str or not terminal.strip():
             raise ValueError("audit terminal must be non-empty")
         if type(status) is not str or not status.strip():
@@ -417,6 +447,7 @@ class EventBus:
             ("status", status),
             ("occurrence_id", occurrence_id),
             ("terminal", terminal),
+            ("epoch_id", epoch_id),
         ):
             if field_name in extras and extras[field_name] != expected:
                 raise ValueError(f"audit {field_name} conflicts with terminal identity")
@@ -427,6 +458,8 @@ class EventBus:
             "terminal": terminal,
             **extras,
         }
+        if epoch_id is not None:
+            payload["epoch_id"] = epoch_id
         event = EventEnvelope(
             kind=f"audit.{action}",
             source=source,
@@ -440,6 +473,13 @@ class EventBus:
                 return False
             existing_payload = existing.payload
             if existing_payload.get("occurrence_id") != occurrence_id:
+                return False
+            existing_epoch = existing_payload.get("epoch_id")
+            if existing_epoch is not None and (
+                type(existing_epoch) is not str or not existing_epoch.strip()
+            ):
+                raise StateError("audit epoch_id is invalid")
+            if existing_epoch != epoch_id:
                 return False
             existing_terminal = existing_payload.get("terminal")
             if existing_terminal is None:

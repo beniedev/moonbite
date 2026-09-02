@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from moonbite_plugin.autonomy import (
+    ActivityResult,
     ActivityProvider,
     AllowAutonomyJudge,
     AutonomyDecision,
@@ -20,6 +21,19 @@ from moonbite_plugin.effects import EffectLedger, EffectReceipt
 from moonbite_plugin.runtime_core import EventBus
 
 NOW = datetime(2026, 8, 22, 19, 0, tzinfo=timezone.utc)
+
+
+def test_terminal_identity_rejects_conflicting_source_fields():
+    with pytest.raises(ValueError, match="conflicting_source_event_id"):
+        AutonomyEngine._terminal_identity(
+            ActivityResult(
+                "skipped",
+                None,
+                "blocked",
+                source_event_id="source-1",
+                canonical_event_id="source-2",
+            )
+        )
 
 
 def receipt_for(request: AutonomyExecutionRequest, *, receipt_id: str = "receipt-1"):
@@ -222,6 +236,126 @@ def test_strict_receipt_is_the_only_completed_result(tmp_path):
     assert seen[0].epoch_id == "epoch-1"
     assert seen[0].content_length > 0
     assert seen[0].attempt == 1
+
+
+def test_autonomy_epoch_scopes_terminal_and_preserves_legacy_identity(tmp_path):
+    calls = []
+
+    def run(request):
+        calls.append(request)
+        return receipt_for(request, receipt_id=f"receipt-{len(calls)}")
+
+    engine, _controls = make_engine(
+        tmp_path, [ActivityProvider("chosen", run)]
+    )
+    source = "same-source"
+    legacy = engine.run_once(settings(), facts={"source_event_id": source})
+    first = engine.run_once(
+        settings(), facts={"source_event_id": source, "epoch_id": "epoch-1"}
+    )
+    second = engine.run_once(
+        settings(), facts={"source_event_id": source, "epoch_id": "epoch-2"}
+    )
+    duplicate = engine.run_once(
+        settings(), facts={"source_event_id": source, "epoch_id": "epoch-1"}
+    )
+
+    assert [legacy.epoch_id, first.epoch_id, second.epoch_id] == [
+        None,
+        "epoch-1",
+        "epoch-2",
+    ]
+    assert duplicate.effect_id == first.effect_id
+    assert len(calls) == 3
+    legacy_record = engine.effect_ledger.get(legacy.effect_id)
+    assert legacy_record.idempotency_key == (
+        f"autonomy:chosen:{source}:autonomy:{NOW.date().isoformat()}"
+    )
+    assert first.idempotency_key != second.idempotency_key
+    terminals = [
+        event
+        for event in engine.bus.read_audit()
+        if event.payload.get("occurrence_id") == source
+        and event.payload.get("terminal") is not None
+    ]
+    assert len(terminals) == 3
+    assert "epoch_id" not in terminals[0].payload
+    assert {event.payload["epoch_id"] for event in terminals[1:]} == {
+        "epoch-1",
+        "epoch-2",
+    }
+
+
+@pytest.mark.parametrize(
+    "blocker,expected_reason",
+    [
+        ("active_chat", "active_chat"),
+        ("control", "controlled_by:operator"),
+        ("provider", "no_eligible_provider"),
+    ],
+)
+def test_autonomy_no_effect_terminals_keep_epoch_identity(
+    tmp_path, blocker, expected_reason
+):
+    calls = []
+
+    def run(_request):
+        calls.append(True)
+        return pytest.fail("no-effect terminal must not run a provider")
+
+    engine, controls = make_engine(tmp_path, [ActivityProvider("chosen", run)])
+    if blocker == "control":
+        controls.put(feature="autonomy", mode="pause", source="operator")
+    selected_settings = settings("missing") if blocker == "provider" else settings()
+    source = "no-effect-source"
+
+    def facts(epoch=None):
+        value = {"source_event_id": source}
+        if epoch is not None:
+            value["epoch_id"] = epoch
+        if blocker == "active_chat":
+            value["active_chat"] = True
+        return value
+
+    legacy = engine.run_once(selected_settings, facts=facts())
+    first = engine.run_once(selected_settings, facts=facts("epoch-1"))
+    second = engine.run_once(selected_settings, facts=facts("epoch-2"))
+    duplicate = engine.run_once(selected_settings, facts=facts("epoch-1"))
+
+    assert calls == []
+    assert [legacy.reason, first.reason, second.reason] == [
+        expected_reason,
+        expected_reason,
+        expected_reason,
+    ]
+    assert [legacy.source_event_id, first.source_event_id, second.source_event_id] == [
+        source,
+        source,
+        source,
+    ]
+    assert [legacy.canonical_event_id, first.canonical_event_id, second.canonical_event_id] == [
+        source,
+        source,
+        source,
+    ]
+    assert [legacy.epoch_id, first.epoch_id, second.epoch_id] == [
+        None,
+        "epoch-1",
+        "epoch-2",
+    ]
+    assert (duplicate.reason, duplicate.epoch_id) == (expected_reason, "epoch-1")
+    terminals = [
+        event
+        for event in engine.bus.read_audit()
+        if event.payload.get("occurrence_id") == source
+        and event.payload.get("terminal") is not None
+    ]
+    assert len(terminals) == 3
+    assert "epoch_id" not in terminals[0].payload
+    assert {event.payload["epoch_id"] for event in terminals[1:]} == {
+        "epoch-1",
+        "epoch-2",
+    }
 
 
 def test_verified_autonomy_occurrence_terminal_is_reused(tmp_path):
@@ -716,6 +850,58 @@ def test_control_and_active_chat_are_before_judge(tmp_path):
     assert engine.run_once(settings()).status == "skipped"
     assert judge.calls == 0
     assert engine.bus.read_events() == []
+
+
+def test_autonomy_lock_race_keeps_explicit_identity_without_claiming_terminal(tmp_path):
+    class BusyLocks:
+        @contextmanager
+        def try_exclusive(self, _name):
+            yield False
+
+    engine, _controls = make_engine(
+        tmp_path,
+        [ActivityProvider("chosen", lambda _request: pytest.fail("runner called"))],
+        locks=BusyLocks(),
+    )
+    result = engine.run_once(
+        settings(),
+        facts={"source_event_id": "busy-source", "epoch_id": "epoch-1"},
+    )
+
+    assert (result.status, result.reason, result.source_event_id, result.epoch_id) == (
+        "skipped",
+        "execution_in_progress",
+        "busy-source",
+        "epoch-1",
+    )
+    audit = engine.bus.read_audit()[-1].payload
+    assert audit["occurrence_id"] == "busy-source"
+    assert audit["source_event_id"] == "busy-source"
+    assert audit["epoch_id"] == "epoch-1"
+    assert "terminal" not in audit
+
+
+def test_autonomy_lock_race_reports_malformed_identity(tmp_path):
+    class BusyLocks:
+        @contextmanager
+        def try_exclusive(self, _name):
+            yield False
+
+    engine, _controls = make_engine(
+        tmp_path,
+        [ActivityProvider("chosen", lambda _request: pytest.fail("runner called"))],
+        locks=BusyLocks(),
+    )
+    result = engine.run_once(
+        settings(), facts={"source_event_id": 7, "epoch_id": "epoch-1"}
+    )
+
+    assert result.status == "failed"
+    assert result.reason == "invalid_source_event_id"
+    assert result.source_event_id == result.canonical_event_id == result.run_id
+    audit = engine.bus.read_audit()[-1].payload
+    assert audit["status"] == "failed"
+    assert audit["terminal"] == "failed"
 
 
 def test_prejudge_autonomy_terminal_replays_without_judge(tmp_path):

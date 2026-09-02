@@ -591,6 +591,13 @@ class HeartbeatResult:
     snapshot: Mapping[str, Any] | None = None
     degraded: bool = False
     projection_errors: tuple[str, ...] = ()
+    epoch_id: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.epoch_id is not None and (
+            type(self.epoch_id) is not str or not self.epoch_id.strip()
+        ):
+            raise ValueError("heartbeat epoch_id must be non-empty when provided")
 
     @property
     def code(self) -> HeartbeatReasonCode | None:
@@ -612,6 +619,7 @@ class HeartbeatResult:
             "reason": self.reason,
             "reason_code": None if self.reason_code is None else self.reason_code.value,
             "candidate_id": self.candidate_id,
+            "epoch_id": self.epoch_id,
             "gate": self.gate.__dict__,
             "decision": None if self.decision is None else self.decision.to_dict(),
             "delivery": None if self.delivery is None else self.delivery.to_dict(),
@@ -1739,7 +1747,9 @@ class HeartbeatCadence:
             self._save(state)
 
     @staticmethod
-    def _effect_ref_key(source_event_id: str, kind: str) -> str:
+    def _effect_ref_key(
+        source_event_id: str, kind: str, epoch_id: str | None = None
+    ) -> str:
         if (
             type(source_event_id) is not str
             or not source_event_id.strip()
@@ -1747,12 +1757,22 @@ class HeartbeatCadence:
             or not kind.strip()
         ):
             raise ValueError("effect reference identity is invalid")
-        return f"{kind}:{source_event_id}"
+        if epoch_id is not None and (
+            type(epoch_id) is not str or not epoch_id.strip()
+        ):
+            raise ValueError("effect reference epoch is invalid")
+        key = f"{kind}:{source_event_id}"
+        return key if epoch_id is None else f"{key}:{epoch_id}"
 
     def remember_effect_ref(
-        self, source_event_id: str, kind: str, effect_id: str
+        self,
+        source_event_id: str,
+        kind: str,
+        effect_id: str,
+        *,
+        epoch_id: str | None = None,
     ) -> None:
-        key = self._effect_ref_key(source_event_id, kind)
+        key = self._effect_ref_key(source_event_id, kind, epoch_id)
         if type(effect_id) is not str or not effect_id.strip():
             raise ValueError("effect reference id is invalid")
         with file_lock(self.lock_path):
@@ -1763,8 +1783,14 @@ class HeartbeatCadence:
             state["effect_refs"] = _compact_tail(refs, _EFFECT_REF_MAX)
             self._save(state)
 
-    def effect_ref(self, source_event_id: str, kind: str) -> str | None:
-        key = self._effect_ref_key(source_event_id, kind)
+    def effect_ref(
+        self,
+        source_event_id: str,
+        kind: str,
+        *,
+        epoch_id: str | None = None,
+    ) -> str | None:
+        key = self._effect_ref_key(source_event_id, kind, epoch_id)
         if not self.path.exists():
             return None
         with file_lock(self.lock_path):
@@ -2617,7 +2643,50 @@ class HeartbeatEngine:
             return "failed"
         return None
 
+    @staticmethod
+    def _public_epoch_from_effect(record: Any) -> Any:
+        """Return the explicit epoch while hiding the legacy ledger default."""
+
+        epoch_id = getattr(record, "epoch_id", None)
+        if epoch_id is None:
+            return None
+        if epoch_id != "heartbeat":
+            return epoch_id
+        source = getattr(record, "source_event_id", None)
+        kind = getattr(record, "kind", None)
+        key = getattr(record, "idempotency_key", None)
+        if (
+            type(source) is str
+            and type(kind) is str
+            and type(key) is str
+            and kind.startswith("heartbeat_")
+        ):
+            legacy = f"heartbeat:{source}:{kind.removeprefix('heartbeat_')}"
+            if key in {legacy, legacy + _DELEGATED_DELIVERY_IDEMPOTENCY_SUFFIX}:
+                return None
+        return epoch_id
+
+    def _result_public_epoch(self, result: HeartbeatResult) -> str | None:
+        """Recover explicit terminal epoch without promoting legacy defaults."""
+
+        epoch_id = result.epoch_id
+        for effect in result.effects:
+            candidate_epoch: Any = None
+            if effect.receipt is not None:
+                candidate_epoch = effect.receipt.epoch_id
+                if candidate_epoch == "heartbeat":
+                    candidate_epoch = None
+            if candidate_epoch is None:
+                continue
+            if type(candidate_epoch) is not str or not candidate_epoch.strip():
+                raise ValueError("heartbeat epoch_id must be non-empty when provided")
+            if epoch_id is not None and epoch_id != candidate_epoch:
+                raise StateError("heartbeat epoch identity conflict")
+            epoch_id = candidate_epoch
+        return epoch_id
+
     def _finish(self, result: HeartbeatResult) -> HeartbeatResult:
+        result = replace(result, epoch_id=self._result_public_epoch(result))
         projection_errors = list(result.projection_errors)
         terminal = self._canonical_terminal(result)
         try:
@@ -2631,14 +2700,19 @@ class HeartbeatEngine:
                     details=details,
                 )
             else:
-                self.bus.record_audit_terminal(
-                    "heartbeat",
-                    occurrence_id=result.candidate_id,
-                    terminal=terminal,
-                    status=result.status,
-                    source="heartbeat",
-                    details=details,
-                )
+                record_terminal = self.bus.record_audit_terminal
+                terminal_kwargs = {
+                    "occurrence_id": result.candidate_id,
+                    "terminal": terminal,
+                    "status": result.status,
+                    "source": "heartbeat",
+                    "details": details,
+                }
+                if _accepts_keyword(record_terminal, "epoch_id"):
+                    terminal_kwargs["epoch_id"] = result.epoch_id
+                elif result.epoch_id is not None:
+                    raise StateError("heartbeat audit epoch is unsupported")
+                record_terminal("heartbeat", **terminal_kwargs)
         except StateError as exc:
             # A conflicting terminal is an integrity failure, not a benign
             # audit projection error.  Never report the new result as truth.
@@ -2702,6 +2776,7 @@ class HeartbeatEngine:
         audit: bool = True,
         include_snapshot: bool = True,
         projection_errors: tuple[str, ...] = (),
+        epoch_id: str | None = None,
     ) -> HeartbeatResult:
         effect_projection_errors = tuple(
             error
@@ -2725,16 +2800,24 @@ class HeartbeatEngine:
             self._snapshot() if include_snapshot else None,
             bool(all_projection_errors),
             all_projection_errors,
+            epoch_id,
         )
         if not audit:
             return result
         return self._finish(result)
 
-    def _existing_terminal_result(self, candidate_id: str) -> HeartbeatResult | None:
+    def _existing_terminal_result(
+        self, candidate_id: str, *, epoch_id: str | None = None
+    ) -> HeartbeatResult | None:
         finder = getattr(self.bus, "find_audit_terminal", None)
         if not callable(finder):
             return None
-        event = finder("heartbeat", candidate_id)
+        if _accepts_keyword(finder, "epoch_id"):
+            event = finder("heartbeat", candidate_id, epoch_id=epoch_id)
+        elif epoch_id is None:
+            event = finder("heartbeat", candidate_id)
+        else:
+            raise StateError("heartbeat audit epoch is unsupported")
         if event is None:
             return None
         payload = event.payload
@@ -2753,12 +2836,14 @@ class HeartbeatEngine:
         terminal = payload.get("terminal")
         if type(terminal) is not str or not terminal.strip():
             raise StateError("heartbeat terminal audit has invalid terminal")
+        effect_epoch = epoch_id or "heartbeat"
         if self._effect_owner_exists() and self.effect_ledger is not None:
             matching = [
                 record
                 for record in self.effect_ledger.records()
                 if record.kind in {"heartbeat_delivery", "heartbeat_wake"}
                 and record.source_event_id == candidate_id
+                and record.epoch_id == effect_epoch
             ]
             audit_effect_id = payload.get("effect_id")
             if audit_effect_id is not None:
@@ -2789,13 +2874,21 @@ class HeartbeatEngine:
                     record.state not in {"verified", "failed"} for record in matching
                 ):
                     raise StateError("heartbeat audit effect conflict")
+                real_failure = any(
+                    record.state == "failed"
+                    and record.reason != "intentional_silence"
+                    for record in matching
+                )
+                intentional_silence = any(
+                    record.state == "failed"
+                    and record.reason == "intentional_silence"
+                    for record in matching
+                )
                 expected = (
-                    "intentional_silence"
-                    if any(
-                        record.reason == "intentional_silence" for record in matching
-                    )
-                    else "failed"
-                    if any(record.state == "failed" for record in matching)
+                    "failed"
+                    if real_failure
+                    else "intentional_silence"
+                    if intentional_silence
                     else "verified"
                 )
                 if terminal != expected:
@@ -2826,6 +2919,7 @@ class HeartbeatEngine:
             reason_code=reason_code,
             degraded=payload.get("degraded") is True,
             projection_errors=(),
+            epoch_id=epoch_id,
         )
 
     @staticmethod
@@ -2841,6 +2935,15 @@ class HeartbeatEngine:
         # attempt; schedulers that need replay must provide candidate_id or
         # source_event_id explicitly.
         return new_id("heartbeat_attempt")
+
+    @staticmethod
+    def _candidate_epoch(candidate: HeartbeatCandidate) -> str | None:
+        value = candidate.context.get("epoch_id")
+        if value is None:
+            return None
+        if type(value) is not str or not value.strip():
+            raise ValueError("epoch_id must be a non-empty string")
+        return value
 
     @staticmethod
     def _has_explicit_occurrence(candidate: HeartbeatCandidate) -> bool:
@@ -3284,6 +3387,7 @@ class HeartbeatEngine:
             for candidate in self.effect_ledger.records()
             if candidate.kind in {"heartbeat_delivery", "heartbeat_wake"}
             and candidate.source_event_id == record.source_event_id
+            and candidate.epoch_id == record.epoch_id
         )
         if not siblings or all(
             candidate.effect_id != record.effect_id for candidate in siblings
@@ -3291,11 +3395,24 @@ class HeartbeatEngine:
             raise StateError("heartbeat occurrence effect is missing")
         if any(candidate.state not in {"verified", "failed"} for candidate in siblings):
             return
+        # A real failed sibling must remain visible even when another sibling
+        # intentionally silenced delivery.  Silence is only the aggregate
+        # terminal when no sibling failed.
+        real_failure = any(
+            candidate.state == "failed"
+            and candidate.reason != "intentional_silence"
+            for candidate in siblings
+        )
+        intentional_silence = any(
+            candidate.state == "failed"
+            and candidate.reason == "intentional_silence"
+            for candidate in siblings
+        )
         terminal = (
-            "intentional_silence"
-            if any(candidate.reason == "intentional_silence" for candidate in siblings)
-            else "failed"
-            if any(candidate.state == "failed" for candidate in siblings)
+            "failed"
+            if real_failure
+            else "intentional_silence"
+            if intentional_silence
             else "verified"
         )
         effect_ids = sorted(candidate.effect_id for candidate in siblings)
@@ -3312,20 +3429,26 @@ class HeartbeatEngine:
         }
         if len(effect_ids) == 1:
             details["effect_id"] = effect_ids[0]
-        self.bus.record_audit_terminal(
-            "heartbeat",
-            occurrence_id=record.source_event_id,
-            terminal=terminal,
-            status=(
+        record_terminal = self.bus.record_audit_terminal
+        terminal_kwargs = {
+            "occurrence_id": record.source_event_id,
+            "terminal": terminal,
+            "status": (
                 "intentional_silence"
                 if terminal == "intentional_silence"
                 else "failed"
                 if terminal == "failed"
                 else "completed"
             ),
-            source="heartbeat",
-            details=details,
-        )
+            "source": "heartbeat",
+            "details": details,
+        }
+        public_epoch = self._public_epoch_from_effect(record)
+        if _accepts_keyword(record_terminal, "epoch_id"):
+            terminal_kwargs["epoch_id"] = public_epoch
+        elif public_epoch is not None:
+            raise StateError("heartbeat audit epoch is unsupported")
+        record_terminal("heartbeat", **terminal_kwargs)
 
     def _fail_effect(
         self,
@@ -3644,7 +3767,8 @@ class HeartbeatEngine:
             or candidate.context.get("event_id")
             or candidate.candidate_id
         )
-        epoch = candidate.context.get("epoch_id", "heartbeat")
+        public_epoch = self._candidate_epoch(candidate)
+        epoch = public_epoch or "heartbeat"
         if (
             type(source) is not str
             or not source.strip()
@@ -3658,6 +3782,8 @@ class HeartbeatEngine:
             )
         try:
             idempotency_key = f"heartbeat:{source}:{kind}"
+            if public_epoch is not None:
+                idempotency_key += f":{public_epoch}"
             if kind == "delivery" and decision.delivery_mode == "delegated":
                 idempotency_key += _DELEGATED_DELIVERY_IDEMPOTENCY_SUFFIX
             record = self.effect_ledger.begin_intent(
@@ -3679,7 +3805,17 @@ class HeartbeatEngine:
         remember = getattr(self.cadence, "remember_effect_ref", None)
         if callable(remember):
             try:
-                remember(source, f"heartbeat_{kind}", record.effect_id)
+                ref_kwargs = (
+                    {"epoch_id": public_epoch}
+                    if _accepts_keyword(remember, "epoch_id")
+                    else {}
+                )
+                remember(
+                    source,
+                    f"heartbeat_{kind}",
+                    record.effect_id,
+                    **ref_kwargs,
+                )
             except Exception as exc:
                 return EffectResult(
                     False,
@@ -3842,6 +3978,8 @@ class HeartbeatEngine:
             or candidate.context.get("event_id")
             or candidate.candidate_id
         )
+        public_epoch = self._candidate_epoch(candidate)
+        effect_epoch = public_epoch or "heartbeat"
         selected: dict[str, EffectRecord] = {}
         precomputed: dict[str, EffectResult] = {}
         terminals: Mapping[str, Any] = {}
@@ -3860,7 +3998,16 @@ class HeartbeatEngine:
         if callable(effect_ref) and callable(ledger_get):
             for kind in ("delivery", "wake"):
                 try:
-                    effect_id = effect_ref(source, f"heartbeat_{kind}")
+                    ref_kwargs = (
+                        {"epoch_id": public_epoch}
+                        if _accepts_keyword(effect_ref, "epoch_id")
+                        else {}
+                    )
+                    effect_id = effect_ref(
+                        source,
+                        f"heartbeat_{kind}",
+                        **ref_kwargs,
+                    )
                 except (AttributeError, TypeError, ValueError):
                     effect_id = None
                 if effect_id is None:
@@ -3921,6 +4068,11 @@ class HeartbeatEngine:
                     record = ledger_get(effect_id)
                 except Exception as exc:
                     raise StateError("effect ledger replay failed") from exc
+                if record is not None and (
+                    record.source_event_id != source
+                    or record.epoch_id != effect_epoch
+                ):
+                    continue
                 if record is not None:
                     selected[kind] = record
         if not precomputed and callable(
@@ -3931,7 +4083,10 @@ class HeartbeatEngine:
             except Exception as exc:
                 raise StateError("effect ledger replay failed") from exc
             for record in pending:
-                if record.source_event_id != source:
+                if (
+                    record.source_event_id != source
+                    or record.epoch_id != effect_epoch
+                ):
                     continue
                 if record.kind == "heartbeat_delivery":
                     selected.setdefault("delivery", record)
@@ -3961,8 +4116,18 @@ class HeartbeatEngine:
         if not isinstance(candidate, HeartbeatCandidate):
             raise TypeError("candidate must be a HeartbeatCandidate")
         candidate_id = self._candidate_id(candidate)
+        try:
+            candidate_epoch = self._candidate_epoch(candidate)
+        except ValueError:
+            return self._result(
+                "failed",
+                "candidate_invalid",
+                candidate_id,
+                GateResult(False, "candidate", "candidate_invalid", None),
+                code=HeartbeatReasonCode.CANDIDATE_INVALID,
+            )
         existing_terminal = (
-            self._existing_terminal_result(candidate_id)
+            self._existing_terminal_result(candidate_id, epoch_id=candidate_epoch)
             if self._has_explicit_occurrence(candidate)
             else None
         )
@@ -3985,6 +4150,7 @@ class HeartbeatEngine:
                 candidate_id,
                 GateResult(False, "candidate", reason, None),
                 code=HeartbeatReasonCode.CANDIDATE_INVALID,
+                epoch_id=candidate_epoch,
             )
         effective = HeartbeatCandidate(
             candidate.kind,
@@ -4012,6 +4178,7 @@ class HeartbeatEngine:
                     candidate_id,
                     GateResult(False, "execution_lock", "execution_in_progress", None),
                     code=HeartbeatReasonCode.EXECUTION_LOCK,
+                    epoch_id=candidate_epoch,
                 )
             return self._run_locked(
                 effective,
@@ -4032,8 +4199,23 @@ class HeartbeatEngine:
     ) -> HeartbeatResult:
         candidate_id = candidate.candidate_id
         gate = self._control()
-        if not gate.allowed:
+        try:
+            public_epoch = self._candidate_epoch(candidate)
+        except ValueError:
             return self._result(
+                "failed",
+                "candidate_invalid",
+                candidate_id,
+                gate,
+                code=HeartbeatReasonCode.CANDIDATE_INVALID,
+            )
+
+        def make_result(*args: Any, **kwargs: Any) -> HeartbeatResult:
+            kwargs.setdefault("epoch_id", public_epoch)
+            return self._result(*args, **kwargs)
+
+        if not gate.allowed:
+            return make_result(
                 "skipped",
                 gate.reason,
                 candidate_id,
@@ -4049,7 +4231,7 @@ class HeartbeatEngine:
                 expires = _optional_time(candidate.context["expires_at"], "expires_at")
                 assert expires is not None
                 if expires <= now:
-                    return self._result(
+                    return make_result(
                         "skipped",
                         "candidate_expired",
                         candidate_id,
@@ -4066,7 +4248,7 @@ class HeartbeatEngine:
                 reconciled = self._reconcile_pending(now)
                 if reconciled is not None:
                     reason, _count = reconciled
-                    return self._result(
+                    return make_result(
                         "requeued" if reason == "expired_effect" else "pending",
                         reason,
                         candidate_id,
@@ -4083,7 +4265,7 @@ class HeartbeatEngine:
                     )
             due, next_due = self._due(candidate, now, policy)
             if not events and not (policy.profile == "daily_anchor" and due):
-                return self._result(
+                return make_result(
                     "neutral",
                     "no_event",
                     candidate_id,
@@ -4100,7 +4282,7 @@ class HeartbeatEngine:
                 except AttributeError:
                     pass
             if not due:
-                return self._result(
+                return make_result(
                     "skipped",
                     "cadence_not_due",
                     candidate_id,
@@ -4110,7 +4292,7 @@ class HeartbeatEngine:
                 )
             blocked, blocked_reason, until = self._cooldown(candidate, now, policy)
             if blocked:
-                return self._result(
+                return make_result(
                     "skipped",
                     "manual_snooze"
                     if blocked_reason == "manual_snooze"
@@ -4123,7 +4305,7 @@ class HeartbeatEngine:
             if "recent_contact" not in policy.bypass:
                 contact, _at = self._contact(candidate, now)
                 if contact is not None:
-                    return self._result(
+                    return make_result(
                         "skipped",
                         contact,
                         candidate_id,
@@ -4139,7 +4321,7 @@ class HeartbeatEngine:
             if "active_chat" not in policy.bypass and self._active_chat(
                 candidate, active_chat
             ):
-                return self._result(
+                return make_result(
                     "skipped",
                     "active_chat",
                     candidate_id,
@@ -4160,7 +4342,7 @@ class HeartbeatEngine:
             if busy is not None and type(busy) is not bool:
                 raise _CandidateInvalidError("activity_busy must be a boolean")
             if busy is True:
-                return self._result(
+                return make_result(
                     "skipped",
                     "activity_busy",
                     candidate_id,
@@ -4185,7 +4367,7 @@ class HeartbeatEngine:
                 except AttributeError:
                     next_judge = None
                 except Exception:
-                    return self._result(
+                    return make_result(
                         "failed",
                         "cadence_state_error",
                         candidate_id,
@@ -4193,7 +4375,7 @@ class HeartbeatEngine:
                         code=HeartbeatReasonCode.CADENCE_ERROR,
                         decision=decision,
                     )
-                return self._result(
+                return make_result(
                     "allowed",
                     "maintenance",
                     candidate_id,
@@ -4215,7 +4397,7 @@ class HeartbeatEngine:
                         ),
                         HeartbeatReasonCode.EFFECT_ERROR,
                     )
-                    return self._result(
+                    return make_result(
                         "failed",
                         "effect_failed",
                         candidate_id,
@@ -4226,7 +4408,7 @@ class HeartbeatEngine:
                         next_judge_at=next_due,
                     )
                 if all(x.verified for x in effects):
-                    return self._result(
+                    return make_result(
                         "completed",
                         "effects_verified",
                         candidate_id,
@@ -4241,7 +4423,7 @@ class HeartbeatEngine:
                     if any(x.terminal == "requeued" for x in effects)
                     else "awaiting_receipt"
                 )
-                return self._result(
+                return make_result(
                     "requeued" if reason == "expired_effect" else "pending",
                     reason,
                     candidate_id,
@@ -4256,7 +4438,7 @@ class HeartbeatEngine:
             reconciled = self._reconcile_pending(now)
             if reconciled is not None:
                 reason, _count = reconciled
-                return self._result(
+                return make_result(
                     "requeued" if reason == "expired_effect" else "pending",
                     reason,
                     candidate_id,
@@ -4272,7 +4454,7 @@ class HeartbeatEngine:
                     ),
                 )
         except _CandidateInvalidError:
-            return self._result(
+            return make_result(
                 "skipped",
                 "candidate_invalid",
                 candidate_id,
@@ -4293,7 +4475,7 @@ class HeartbeatEngine:
                     HeartbeatReasonCode.CANDIDATE_INVALID,
                     "heartbeat_input_error",
                 )
-            return self._result(
+            return make_result(
                 "failed",
                 reason,
                 candidate_id,
@@ -4304,7 +4486,7 @@ class HeartbeatEngine:
         try:
             raw = self.judge.decide(candidate)
         except Exception as exc:
-            return self._result(
+            return make_result(
                 "failed",
                 f"judge_error:{type(exc).__name__}",
                 candidate_id,
@@ -4314,7 +4496,7 @@ class HeartbeatEngine:
         try:
             decision = self._validate_judge(raw)
         except Exception:
-            return self._result(
+            return make_result(
                 "failed",
                 "judge_malformed",
                 candidate_id,
@@ -4328,7 +4510,7 @@ class HeartbeatEngine:
                 try:
                     anchor_epoch = daily_anchor_epoch(now)
                 except Exception:
-                    return self._result(
+                    return make_result(
                         "failed",
                         "cadence_state_error",
                         candidate_id,
@@ -4356,7 +4538,7 @@ class HeartbeatEngine:
             try:
                 next_judge = mark_judge(**mark_kwargs)
             except Exception:
-                return self._result(
+                return make_result(
                     "failed",
                     "cadence_state_error",
                     candidate_id,
@@ -4366,7 +4548,7 @@ class HeartbeatEngine:
                 )
         if not decision.wake_main and not decision.dm_user:
             if decision.allow_autonomy is True or decision.maintenance is True:
-                return self._result(
+                return make_result(
                     "allowed",
                     "allowed",
                     candidate_id,
@@ -4375,7 +4557,7 @@ class HeartbeatEngine:
                     decision=decision,
                     next_judge_at=next_judge,
                 )
-            return self._result(
+            return make_result(
                 "skipped",
                 decision.reason,
                 candidate_id,
@@ -4404,7 +4586,7 @@ class HeartbeatEngine:
                 ),
                 HeartbeatReasonCode.EFFECT_ERROR,
             )
-            return self._result(
+            return make_result(
                 "failed",
                 "effect_failed",
                 candidate_id,
@@ -4416,7 +4598,7 @@ class HeartbeatEngine:
                 next_judge_at=next_judge,
             )
         if all(x.verified for x in effects):
-            return self._result(
+            return make_result(
                 "completed",
                 "effects_verified",
                 candidate_id,
@@ -4427,7 +4609,7 @@ class HeartbeatEngine:
                 wake=wake,
                 next_judge_at=next_judge,
             )
-        return self._result(
+        return make_result(
             "pending",
             "effects_accepted_unverified",
             candidate_id,

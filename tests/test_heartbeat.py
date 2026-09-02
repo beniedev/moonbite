@@ -291,6 +291,143 @@ def test_effect_exception_still_produces_terminal_audit(tmp_path):
     assert bus.read_audit()[-1].payload["status"] == "failed"
 
 
+def test_heartbeat_epoch_scopes_effects_and_legacy_terminal_identity(tmp_path):
+    class ReceiptSink:
+        def __init__(self):
+            self.calls = 0
+
+        def wake(self, _candidate, _decision, intent=None):
+            self.calls += 1
+            return EffectReceipt(
+                receipt_id=f"receipt-{self.calls}",
+                event_id=intent.source_event_id,
+                observed_at=NOW,
+                content_sha256=intent.content_sha256,
+                content_length=intent.content_length,
+                epoch_id=intent.epoch_id,
+            )
+
+    sink = ReceiptSink()
+    runtime, _controls, bus, cadence = engine(
+        tmp_path,
+        Judge(JudgeDecision(True, False, "wake")),
+        sink,
+    )
+
+    def candidate(epoch=None):
+        context = {
+            "events": ["event"],
+            "due": True,
+            "source_event_id": "same-source",
+        }
+        if epoch is not None:
+            context["epoch_id"] = epoch
+        return HeartbeatCandidate("care_poke", context, candidate_id="same-source")
+
+    legacy = runtime.run(candidate())
+    cadence.resume()
+    first = runtime.run(candidate("epoch-1"))
+    cadence.resume()
+    second = runtime.run(candidate("epoch-2"))
+    duplicate = runtime.run(candidate("epoch-1"))
+
+    assert [legacy.epoch_id, first.epoch_id, second.epoch_id] == [
+        None,
+        "epoch-1",
+        "epoch-2",
+    ]
+    assert (duplicate.status, duplicate.epoch_id) == ("completed", "epoch-1")
+    assert sink.calls == 3
+    records = runtime.effect_ledger.records()
+    keys = {record.epoch_id: record.idempotency_key for record in records}
+    assert keys["heartbeat"] == "heartbeat:same-source:wake"
+    assert keys["epoch-1"] == "heartbeat:same-source:wake:epoch-1"
+    assert keys["epoch-2"] == "heartbeat:same-source:wake:epoch-2"
+    terminals = [
+        event
+        for event in bus.read_audit()
+        if event.payload.get("occurrence_id") == "same-source"
+        and event.payload.get("terminal") is not None
+    ]
+    assert len(terminals) == 3
+    assert "epoch_id" not in terminals[0].payload
+    assert {event.payload["epoch_id"] for event in terminals[1:]} == {
+        "epoch-1",
+        "epoch-2",
+    }
+
+
+@pytest.mark.parametrize(
+    "blocker,expected_reason",
+    [
+        ("active_chat", "active_chat"),
+        ("control", "controlled_by:operator"),
+        ("recent_contact", "recent_private_inbound"),
+    ],
+)
+def test_heartbeat_no_effect_terminals_keep_epoch_identity(
+    tmp_path, blocker, expected_reason
+):
+    runtime, controls, bus, _cadence = engine(
+        tmp_path,
+        Judge(JudgeDecision(True, False, "would wake")),
+        Sink(),
+    )
+    if blocker == "control":
+        controls.put(feature="heartbeat", mode="pause", source="operator")
+    source = "no-effect-source"
+
+    def candidate(epoch=None):
+        context = {
+            "events": ["event"],
+            "due": True,
+            "source_event_id": source,
+        }
+        if epoch is not None:
+            context["epoch_id"] = epoch
+        if blocker == "active_chat":
+            context["active_chat"] = True
+        elif blocker == "recent_contact":
+            context["recent_private_inbound_at"] = NOW
+        return HeartbeatCandidate("care_poke", context, candidate_id=source)
+
+    legacy = runtime.run(candidate())
+    first = runtime.run(candidate("epoch-1"))
+    second = runtime.run(candidate("epoch-2"))
+    duplicate = runtime.run(candidate("epoch-1"))
+
+    assert [legacy.reason, first.reason, second.reason] == [
+        expected_reason,
+        expected_reason,
+        expected_reason,
+    ]
+    assert [legacy.candidate_id, first.candidate_id, second.candidate_id] == [
+        source,
+        source,
+        source,
+    ]
+    assert [legacy.epoch_id, first.epoch_id, second.epoch_id] == [
+        None,
+        "epoch-1",
+        "epoch-2",
+    ]
+    assert duplicate.status == "skipped"
+    assert duplicate.epoch_id == "epoch-1"
+    assert runtime.effect_ledger.records() == ()
+    terminals = [
+        event
+        for event in bus.read_audit()
+        if event.payload.get("occurrence_id") == source
+        and event.payload.get("terminal") is not None
+    ]
+    assert len(terminals) == 3
+    assert "epoch_id" not in terminals[0].payload
+    assert {event.payload["epoch_id"] for event in terminals[1:]} == {
+        "epoch-1",
+        "epoch-2",
+    }
+
+
 @pytest.mark.parametrize("settlement", ["verified", "intentional_silence", "failed"])
 def test_delegated_settlement_terminal_is_exact_once(tmp_path, settlement):
     class DelegatedSink:
@@ -362,6 +499,48 @@ def test_delegated_settlement_terminal_is_exact_once(tmp_path, settlement):
     assert len(terminals) == 1
     assert terminals[0].payload["terminal"] == settlement
     assert terminals[0].payload["effect_ids"] == sorted([effect_id, wake_id])
+
+
+def test_multi_effect_failure_wins_over_intentional_silence(tmp_path):
+    class MixedSink:
+        def deliver(self, _candidate, _decision, _intent=None):
+            return EffectResult(True, "queued")
+
+        def wake(self, _candidate, _decision, _intent=None):
+            return EffectResult(False, "rejected")
+
+    runtime, _controls, bus, _cadence = engine(
+        tmp_path,
+        Judge(
+            JudgeDecision(
+                True,
+                True,
+                "contact",
+                "hello",
+                delivery_mode="delegated",
+            )
+        ),
+        MixedSink(),
+    )
+    candidate = HeartbeatCandidate(
+        "care_poke",
+        {"events": ["event"], "due": True, "source_event_id": "mixed"},
+        candidate_id="mixed",
+    )
+
+    initial = runtime.run(candidate)
+    runtime.reconcile_heartbeat_delivery(
+        initial.delivery.effect_id, "intentional_silence"
+    )
+
+    terminals = [
+        event
+        for event in bus.read_audit()
+        if event.payload.get("occurrence_id") == "mixed"
+        and event.payload.get("terminal") is not None
+    ]
+    assert len(terminals) == 1
+    assert terminals[0].payload["terminal"] == "failed"
 
 
 def test_accepted_but_unverified_wake_is_pending(tmp_path):
