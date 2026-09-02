@@ -107,6 +107,45 @@ def test_register_passes_injected_conversation_bridge(monkeypatch, tmp_path):
     assert bridge.receipts[0].context.session_id == "bridge-session"
 
 
+def test_registered_subagent_stop_closes_child_turn(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
+    ctx = FakeContext()
+    runtime = register(ctx)
+
+    ctx.hooks["on_session_start"](session_id="child-session")
+    ctx.hooks["pre_llm_call"](
+        session_id="child-session",
+        turn_id="child-turn",
+    )
+    ctx.hooks["subagent_stop"](
+        child_session_id="child-session",
+        child_status="timeout",
+        parent_turn_id="ignored",
+        summary="ignored",
+        goal="ignored",
+        tool_history="ignored",
+    )
+
+    snapshot = runtime.session.snapshot("child-session")
+    assert snapshot.open_turn_id is None
+    assert snapshot.abandoned_turn_ids == ("child-turn",)
+    assert snapshot.settled_turn_ids == ()
+    assert [
+        row["hook"] for row in runtime.session.ledger.rows() if row["kind"] == "hook"
+    ] == [
+        "on_session_start",
+        "pre_llm_call",
+        "subagent_stop",
+    ]
+    assert [
+        row["reason"]
+        for row in runtime.session.ledger.rows()
+        if row["kind"] == "turn_terminal"
+    ] == [
+        "host_turn_failed",
+    ]
+
+
 def test_register_passes_memory_injection_seams(monkeypatch, tmp_path):
     import moonbite_plugin.plugin as plugin_module
 

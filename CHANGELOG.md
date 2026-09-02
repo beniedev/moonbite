@@ -10,10 +10,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - **Session recovery:** `hermes moonbite session status` lists exact open turns, and `session repair` appends an idempotent `abandoned` terminal for the specified current turn without fabricating a successful model response.
+- **HermesHostAdapter:** the public integration boundary now consumes Hermes `on_session_end` and normalizes successful, failed, interrupted, incomplete, session-rotation, and shutdown exits into canonical lifecycle evidence. The pinned Hermes 0.20.5 commit and official v0.21.0 release share the same tested contract.
+- **Subagent terminal fallback:** the seventh manifest hook, `subagent_stop`, uses only child session identity and bounded status to close a non-success one-shot child turn in the existing canonical terminal ledger; completed children remain owned by their own post/end evidence.
 
 ### Fixed
 
-- **Orphaned turns:** a new `pre_llm_call` safely supersedes an older turn whose `post_llm_call` was omitted, preserving append-only audit history while preventing the Conversation Gate from remaining permanently active.
+- **Orphaned turns:** `on_session_end` now closes a turn whose success-only `post_llm_call` was omitted; a new `pre_llm_call` remains the crash-recovery fallback, preventing the Conversation Gate from remaining permanently active without a TTL.
+- **Compression lifecycle correlation:** if Hermes rotates `session_id` during compression, Moonbite uses the stable `turn_id` and durable lifecycle ledger to attach post/end callbacks to the original turn; ambiguous evidence fails closed.
 
 ### Compatibility
 

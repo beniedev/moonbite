@@ -12,7 +12,7 @@ if [[ -z "$uv_bin" ]]; then
   exit 2
 fi
 
-if [[ ! -d "$hermes_repo/.git" ]]; then
+if ! git -C "$hermes_repo" rev-parse --git-dir >/dev/null 2>&1; then
   git clone --depth 1 https://github.com/NousResearch/hermes-agent.git "$hermes_repo"
 fi
 

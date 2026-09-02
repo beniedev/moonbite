@@ -20,7 +20,7 @@ as well as how to set up a local development and testing environment.
 | Operating System | Linux (including Ubuntu 24.04 and WSL2 on native Linux filesystem) or macOS. Native Windows is **unsupported** due to mandatory POSIX `fcntl` file locks. |
 | Python | `>=3.11,<3.15` (Python 3.11, 3.12, 3.13, or 3.14 for Moonbite; pinned Hermes checkout supports 3.11–3.13). |
 | Package Manager | [`uv`](https://docs.astral.sh/uv/) (recommended) or standard Python virtual environment tooling. |
-| Target Hermes Agent | Pinned official Hermes Agent commit `987064caa4f8845f605ac7346fed5b72fddfb21c`. |
+| Target Hermes Agent | Required CLI/Gateway range: `v2026.8.19` (`fcbd1076a93841fa88855acce810e342a5b78101`) through `v2026.8.31` (`29112bef099274229cadff79cdff7bf7b99c4b77`). |
 | Filesystem | On WSL2, use the native Linux filesystem (e.g. `~`), **not** Windows mounts such as `/mnt/c`. |
 
 ---
@@ -132,19 +132,23 @@ Confirm that the output reports `ok: true`, `network_probe: "not_performed"`, `w
 
 ### 2.7 Manifest hooks lifecycle
 
-Moonbite registers exactly 5 lifecycle hooks in Hermes (in actual `HOOK_ORDER`):
+Moonbite registers exactly 7 lifecycle hooks in Hermes (in actual `HOOK_ORDER`):
 1. `pre_gateway_dispatch`: Runs before message authorization; provides a pre-authorization host context seam. Without an explicit typed host resolver, it acts as a no-op and never reads or records unauthorized message content.
 2. `on_session_start`: Fires when a session starts; records normalized session-start lifecycle telemetry when resolvable context is available.
 3. `pre_llm_call`: Fires before an LLM call; records the lifecycle step and may attach fresh Panel Afterglow or enabled Memory recall as bounded, untrusted context (never as instructions).
 4. `post_llm_call`: Fires only when Hermes has a non-empty final response and the turn was not interrupted; records a completed post-model turn.
-5. `on_session_finalize`: Fires when a session finishes; records normalized session finalization.
+5. `on_session_end`: Fires at every `run_conversation` exit; records canonical terminal evidence for failure, interruption, or a completed turn that had no successful post callback.
+6. `on_session_finalize`: Fires at a session boundary; records normalized rotation, expiry, or shutdown evidence.
+7. `subagent_stop`: For a non-success child, reads only `child_session_id` and `child_status` and closes that child's unique open turn. A completed child is a no-op.
 
 ### 2.8 Recover an orphaned turn
 
-Hermes may omit `post_llm_call` for an interrupted or empty-final-response
-turn. Moonbite does not treat the missing callback as success. When the next
-`pre_llm_call` arrives for the same lifecycle, Moonbite first appends an
-`abandoned` terminal for the old turn, then opens the new turn.
+Hermes omits `post_llm_call` for an interrupted or empty-final-response turn,
+but still emits `on_session_end`; delegated children also emit `subagent_stop`.
+Moonbite does not treat the missing post as success: HermesHostAdapter maps
+non-success host evidence to one `abandoned` terminal.
+A later `pre_llm_call` still repairs an older open turn when the process died
+before any terminal callback could run.
 
 For a session that has no new traffic, inspect the exact current IDs before
 repairing it:
@@ -235,16 +239,19 @@ uv pip install -e '.[dev]'
 Never use a live Hermes profile for plugin development or test runs. Validate against an isolated checkout using the contract test script:
 
 ```bash
-# Clone the pinned Hermes repository into a sibling directory
+# Clone the Hermes repository into a sibling directory
 git clone https://github.com/NousResearch/hermes-agent.git ../hermes-agent
-git -C ../hermes-agent fetch --depth 1 origin 987064caa4f8845f605ac7346fed5b72fddfb21c
-git -C ../hermes-agent checkout --detach 987064caa4f8845f605ac7346fed5b72fddfb21c
-
-# Run contract verification with isolated test home
-HERMES_REPO=../hermes-agent \
-HERMES_EXPECTED_COMMIT=987064caa4f8845f605ac7346fed5b72fddfb21c \
-MOONBITE_TEST_HOME=.hermes-test \
-./scripts/test-hermes-contract.sh
+for commit in \
+  fcbd1076a93841fa88855acce810e342a5b78101 \
+  29112bef099274229cadff79cdff7bf7b99c4b77
+do
+  git -C ../hermes-agent fetch --depth 1 origin "$commit"
+  git -C ../hermes-agent checkout --detach FETCH_HEAD
+  HERMES_REPO=../hermes-agent \
+  HERMES_EXPECTED_COMMIT="$commit" \
+  MOONBITE_TEST_HOME=".hermes-test-$commit" \
+  ./scripts/test-hermes-contract.sh
+done
 ```
 
 ---

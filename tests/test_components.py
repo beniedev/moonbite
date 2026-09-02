@@ -34,6 +34,18 @@ class SyntheticSession:
     def record_hook(self, *_args, **_kwargs):
         return None
 
+    def record_host_turn_end(self, *_args, **_kwargs):
+        return None
+
+    def record_host_child_stop(self, *_args, **_kwargs):
+        return None
+
+    def record_host_shutdown(self, *_args, **_kwargs):
+        return None
+
+    def record_host_finalize(self, *_args, **_kwargs):
+        return None
+
     def snapshot(self, *_args, **_kwargs):
         return None
 
@@ -180,6 +192,25 @@ def test_effect_owner_requires_public_read_ports(tmp_path, method):
     effects = SyntheticEffects()
     setattr(effects, method, None)
     values["effects"] = effects
+
+    with pytest.raises(RuntimeComponentsError, match=method):
+        RuntimeComponents(**values)
+
+
+@pytest.mark.parametrize(
+    "method",
+    [
+        "record_host_turn_end",
+        "record_host_child_stop",
+        "record_host_shutdown",
+        "record_host_finalize",
+    ],
+)
+def test_session_owner_requires_canonical_terminal_ports(tmp_path, method):
+    values = bundle_kwargs(tmp_path)
+    session = SyntheticSession()
+    setattr(session, method, None)
+    values["session"] = session
 
     with pytest.raises(RuntimeComponentsError, match=method):
         RuntimeComponents(**values)

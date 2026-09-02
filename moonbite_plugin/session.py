@@ -29,7 +29,22 @@ SESSION_TURN_TERMINAL_SCHEMA = "moon.session.turn_terminal.v1"
 SESSION_TURN_TERMINAL_KIND = "turn_terminal"
 TURN_TERMINAL_OUTCOMES = frozenset({"abandoned"})
 TURN_TERMINAL_REASONS = frozenset(
-    {"superseded_by_new_pre", "operator_repair", "host_session_finalized"}
+    {
+        "superseded_by_new_pre",
+        "operator_repair",
+        "host_session_finalized",
+        "host_shutdown",
+        "host_turn_completed_without_post",
+        "host_turn_failed",
+        "host_turn_incomplete",
+        "host_turn_interrupted",
+    }
+)
+CHILD_STOP_TERMINAL_REASONS = frozenset(
+    {
+        "host_turn_failed",
+        "host_turn_interrupted",
+    }
 )
 
 HOOK_ORDER = (
@@ -37,7 +52,9 @@ HOOK_ORDER = (
     "on_session_start",
     "pre_llm_call",
     "post_llm_call",
+    "on_session_end",
     "on_session_finalize",
+    "subagent_stop",
 )
 HOOKS = frozenset(HOOK_ORDER)
 SUPPORTED_HOOKS = HOOKS
@@ -74,6 +91,7 @@ _ROW_FIELDS = frozenset(
         "settled",
     }
 )
+_TERMINAL_CALLBACK_ROW_FIELDS = _ROW_FIELDS | {"terminal_reason"}
 _TERMINAL_ROW_FIELDS = frozenset(
     {
         "schema_version",
@@ -348,13 +366,14 @@ class _Callback:
     hook: str
     settled: bool
     event_id: str
+    terminal_reason: str | None = None
 
     @property
     def key(self) -> tuple[str, str, str | None]:
         return (self.hook, self.context.source_id, self.context.turn_id)
 
     def to_row(self) -> dict[str, Any]:
-        return {
+        row = {
             "schema_version": SESSION_LIFECYCLE_SCHEMA,
             "kind": SESSION_LIFECYCLE_KIND,
             "event_id": self.event_id,
@@ -362,6 +381,9 @@ class _Callback:
             "hook": self.hook,
             "settled": self.settled,
         }
+        if self.terminal_reason is not None:
+            row["terminal_reason"] = self.terminal_reason
+        return row
 
 
 @dataclass(slots=True)
@@ -418,6 +440,7 @@ def _same_callback_identity(left: _Callback, right: _Callback) -> bool:
         and left.context.fresh == right.context.fresh
         and left.context.supported_hooks == right.context.supported_hooks
         and left.settled == right.settled
+        and left.terminal_reason == right.terminal_reason
     )
 
 
@@ -459,10 +482,14 @@ class SessionLifecycleStore:
             raise SessionLifecycleError(
                 "post_llm_call requires source_kind=assistant_response"
             )
+        if hook == "on_session_end" and context.source_kind != "system":
+            raise SessionLifecycleError("on_session_end requires source_kind=system")
         if hook == "on_session_finalize" and context.source_kind != "system":
             raise SessionLifecycleError(
                 "on_session_finalize requires source_kind=system"
             )
+        if hook == "subagent_stop" and context.source_kind != "system":
+            raise SessionLifecycleError("subagent_stop requires source_kind=system")
         if hook in {"pre_gateway_dispatch", "pre_llm_call"} and context.source_kind in {
             "session_start",
             "assistant_response",
@@ -563,6 +590,37 @@ class SessionLifecycleStore:
                 state.settled_turn_ids.append(turn_id)
                 state.current_turn_id = None
 
+        elif callback.hook == "on_session_end":
+            turn_id = context.turn_id
+            if turn_id is None:
+                raise SessionLifecycleError("on_session_end requires turn_id")
+            turn = state.turns.get(turn_id)
+            if turn is None:
+                raise SessionLifecycleError("on_session_end requires pre_llm_call")
+            if turn.outcome is None:
+                raise SessionLifecycleError(
+                    "on_session_end requires canonical turn terminal evidence"
+                )
+
+        elif callback.hook == "subagent_stop":
+            turn_id = context.turn_id
+            if turn_id is None:
+                raise SessionLifecycleError("subagent_stop requires turn_id")
+            if callback.terminal_reason not in CHILD_STOP_TERMINAL_REASONS:
+                raise SessionLifecycleError(
+                    "subagent_stop requires a child terminal reason"
+                )
+            turn = state.turns.get(turn_id)
+            terminal = state.terminals.get(turn_id)
+            if turn is None or terminal is None or turn.outcome != "abandoned":
+                raise SessionLifecycleError(
+                    "subagent_stop requires canonical non-success terminal evidence"
+                )
+            if terminal.reason != callback.terminal_reason:
+                raise SessionLifecycleError(
+                    "subagent_stop conflicts with existing terminal evidence"
+                )
+
         elif callback.hook == "on_session_finalize":
             if state.finalized:
                 raise SessionLifecycleError("on_session_finalize already recorded")
@@ -599,7 +657,8 @@ class SessionLifecycleStore:
 
     @staticmethod
     def _callback_from_row(row: Mapping[str, Any]) -> _Callback:
-        if set(row) != _ROW_FIELDS:
+        row_fields = set(row)
+        if row_fields != _ROW_FIELDS and row_fields != _TERMINAL_CALLBACK_ROW_FIELDS:
             raise SessionLifecycleError("session lifecycle row has invalid fields")
         if row["schema_version"] != SESSION_LIFECYCLE_SCHEMA:
             raise SessionLifecycleError(
@@ -619,6 +678,21 @@ class SessionLifecycleStore:
             ) from exc
         if type(hook) is not str or hook not in HOOKS:
             raise SessionLifecycleError("session lifecycle row hook is invalid")
+        terminal_reason = row.get("terminal_reason")
+        if terminal_reason is not None and (
+            hook not in {"on_session_end", "subagent_stop"}
+            or type(terminal_reason) is not str
+            or terminal_reason not in TURN_TERMINAL_REASONS
+            or not terminal_reason.startswith("host_turn_")
+        ):
+            raise SessionLifecycleError("session lifecycle terminal_reason is invalid")
+        if (
+            hook == "subagent_stop"
+            and terminal_reason not in CHILD_STOP_TERMINAL_REASONS
+        ):
+            raise SessionLifecycleError(
+                "session lifecycle child terminal_reason is invalid"
+            )
         raw_turn_id = row["turn_id"]
         if raw_turn_id is not None and type(raw_turn_id) is not str:
             raise SessionLifecycleError("session lifecycle row turn_id is invalid")
@@ -659,6 +733,7 @@ class SessionLifecycleStore:
             hook=hook,
             settled=row["settled"],
             event_id=event_id,
+            terminal_reason=terminal_reason,
         )
 
     @staticmethod
@@ -956,6 +1031,279 @@ class SessionLifecycleStore:
                 reason="operator_repair",
                 superseded_by_turn_id=None,
                 observed_at=effective_observed_at,
+            )
+            self._apply_terminal(state, terminal)
+            self.ledger.append(terminal.to_row())
+            return self._terminal_receipt(terminal, state, deduplicated=False)
+
+    def record_host_turn_end(
+        self,
+        context: SessionContext,
+        terminal_reason: str,
+    ) -> SessionHookReceipt | SessionTurnTerminalReceipt | None:
+        """Record an exact host turn end, abandoning only a still-open turn."""
+
+        self._validate_inputs(context, "on_session_end", False)
+        if (
+            terminal_reason not in TURN_TERMINAL_REASONS
+            or not terminal_reason.startswith("host_turn_")
+        ):
+            raise SessionLifecycleError("unsupported host turn terminal reason")
+        callback = _Callback(
+            context=context,
+            hook="on_session_end",
+            settled=False,
+            event_id=new_id("session_hook"),
+            terminal_reason=terminal_reason,
+        )
+        with file_lock(self.mutation_lock):
+            states = self._replay_unlocked()
+            state = states.get(context.lifecycle_id)
+            if state is None:
+                return None
+
+            turn_id = context.turn_id
+            assert turn_id is not None
+            turn = state.turns.get(turn_id)
+            if turn is None:
+                raise SessionLifecycleError("on_session_end requires pre_llm_call")
+
+            records_hook = "on_session_end" in state.supported_hooks
+            existing_callback = next(
+                (
+                    item
+                    for item in state.callbacks.values()
+                    if item.hook == "on_session_end" and item.context.turn_id == turn_id
+                ),
+                None,
+            )
+            if existing_callback is not None:
+                if not _same_callback_identity(existing_callback, callback):
+                    raise SessionLifecycleError(
+                        "on_session_end conflicts with existing terminal evidence"
+                    )
+                return self._receipt(existing_callback, state, deduplicated=True)
+
+            existing_terminal = state.terminals.get(turn_id)
+            if existing_terminal is not None:
+                if existing_terminal.reason != terminal_reason:
+                    raise SessionLifecycleError(
+                        "on_session_end conflicts with existing terminal evidence"
+                    )
+                if not records_hook:
+                    return self._terminal_receipt(
+                        existing_terminal, state, deduplicated=True
+                    )
+
+            if (
+                turn.outcome == "completed"
+                and terminal_reason != "host_turn_completed_without_post"
+            ):
+                raise SessionLifecycleError(
+                    "on_session_end conflicts with settled turn evidence"
+                )
+
+            terminal: SessionTurnTerminal | None = None
+            if turn.outcome is None:
+                if state.current_turn_id != turn_id:
+                    raise SessionLifecycleError(
+                        "on_session_end turn does not match the current open turn"
+                    )
+                terminal = SessionTurnTerminal(
+                    schema_version=SESSION_TURN_TERMINAL_SCHEMA,
+                    event_id=new_id("session_turn_terminal"),
+                    session_id=state.session_id,
+                    lifecycle_id=state.lifecycle_id,
+                    turn_id=turn_id,
+                    outcome="abandoned",
+                    reason=terminal_reason,
+                    superseded_by_turn_id=None,
+                    observed_at=context.observed_at,
+                )
+                self._apply_terminal(state, terminal)
+
+            if not records_hook:
+                if terminal is None:
+                    return None
+                self.ledger.append(terminal.to_row())
+                return self._terminal_receipt(terminal, state, deduplicated=False)
+
+            self._apply(state, callback, allow_duplicate=False)
+            if terminal is not None:
+                self.ledger.append(terminal.to_row())
+            self.ledger.append(callback.to_row())
+            return self._receipt(callback, state, deduplicated=False)
+
+    def record_host_child_stop(
+        self,
+        child_session_id: str,
+        terminal_reason: str,
+        observed_at: datetime | None = None,
+    ) -> SessionHookReceipt | SessionTurnTerminalReceipt | None:
+        """Close the unique open child turn reported by Hermes.
+
+        A child stop has no parent turn identity.  The child session id is
+        therefore resolved against exactly one durable lifecycle while holding
+        the same mutation lock used by every other lifecycle mutation.
+        """
+
+        _reference(child_session_id, "child_session_id")
+        if terminal_reason not in CHILD_STOP_TERMINAL_REASONS:
+            raise SessionLifecycleError("unsupported child terminal reason")
+        effective_observed_at = utc_now() if observed_at is None else observed_at
+        if not isinstance(effective_observed_at, datetime):
+            raise TypeError("observed_at must be a datetime")
+        effective_observed_at = as_utc(effective_observed_at)
+
+        with file_lock(self.mutation_lock):
+            states = self._replay_unlocked()
+            matches = [
+                state
+                for state in states.values()
+                if state.session_id == child_session_id
+            ]
+            if len(matches) > 1:
+                raise SessionLifecycleError(
+                    "child_session_id matches multiple Moonbite session lifecycles"
+                )
+            if not matches:
+                return None
+            state = matches[0]
+
+            child_callbacks = [
+                callback
+                for callback in state.callbacks.values()
+                if callback.hook == "subagent_stop"
+            ]
+            if len(child_callbacks) > 1:
+                raise SessionLifecycleError(
+                    "child_session_id has multiple subagent_stop callbacks"
+                )
+            if child_callbacks:
+                callback = child_callbacks[0]
+                if callback.terminal_reason != terminal_reason:
+                    raise SessionLifecycleError(
+                        "subagent_stop conflicts with existing terminal evidence"
+                    )
+                turn_id = callback.context.turn_id
+                if turn_id is None:
+                    raise SessionLifecycleError(
+                        "subagent_stop callback has no child turn"
+                    )
+                terminal = state.terminals.get(turn_id)
+                turn = state.turns.get(turn_id)
+                if (
+                    terminal is None
+                    or turn is None
+                    or turn.outcome != "abandoned"
+                    or terminal.reason != terminal_reason
+                ):
+                    raise SessionLifecycleError(
+                        "subagent_stop callback conflicts with terminal evidence"
+                    )
+                return self._receipt(callback, state, deduplicated=True)
+
+            turn_id = state.current_turn_id
+            if turn_id is None:
+                if len(state.turns) != 1:
+                    raise SessionLifecycleError(
+                        "child_session_id does not identify a unique one-shot turn"
+                    )
+                turn_id = next(iter(state.turns))
+            turn = state.turns.get(turn_id)
+            if turn is None:
+                raise SessionLifecycleError("child turn is not present in lifecycle")
+            terminal = state.terminals.get(turn_id)
+            terminal_created = False
+            if turn.outcome == "completed":
+                raise SessionLifecycleError(
+                    "subagent_stop conflicts with settled turn evidence"
+                )
+            if turn.outcome is None:
+                if state.current_turn_id != turn_id:
+                    raise SessionLifecycleError(
+                        "child turn is not the current open turn"
+                    )
+                terminal = SessionTurnTerminal(
+                    schema_version=SESSION_TURN_TERMINAL_SCHEMA,
+                    event_id=new_id("session_turn_terminal"),
+                    session_id=state.session_id,
+                    lifecycle_id=state.lifecycle_id,
+                    turn_id=turn_id,
+                    outcome="abandoned",
+                    reason=terminal_reason,
+                    superseded_by_turn_id=None,
+                    observed_at=effective_observed_at,
+                )
+                self._apply_terminal(state, terminal)
+                terminal_created = True
+            elif terminal is None or terminal.reason != terminal_reason:
+                raise SessionLifecycleError(
+                    "subagent_stop conflicts with existing terminal evidence"
+                )
+
+            if state.finalized:
+                return self._terminal_receipt(
+                    terminal,
+                    state,
+                    deduplicated=True,
+                )
+
+            records_hook = "subagent_stop" in state.supported_hooks
+            if not records_hook:
+                if terminal_created:
+                    self.ledger.append(terminal.to_row())
+                return self._terminal_receipt(
+                    terminal,
+                    state,
+                    deduplicated=not terminal_created,
+                )
+
+            callback_context = SessionContext(
+                session_id=state.session_id,
+                lifecycle_id=state.lifecycle_id,
+                source_id=child_session_id,
+                turn_id=turn_id,
+                source_kind="system",
+                observed_at=effective_observed_at,
+                fresh=False,
+                supported_hooks=state.supported_hooks,
+            )
+            callback = _Callback(
+                context=callback_context,
+                hook="subagent_stop",
+                settled=False,
+                event_id=new_id("session_hook"),
+                terminal_reason=terminal_reason,
+            )
+            self._apply(state, callback, allow_duplicate=False)
+            if terminal_created:
+                self.ledger.append(terminal.to_row())
+            self.ledger.append(callback.to_row())
+            return self._receipt(callback, state, deduplicated=False)
+
+    def record_host_shutdown(
+        self,
+        context: SessionContext,
+    ) -> SessionTurnTerminalReceipt | None:
+        """Close only an in-flight turn while preserving the reusable session."""
+
+        self._validate_inputs(context, "on_session_finalize", False)
+        with file_lock(self.mutation_lock):
+            state = self._replay_unlocked().get(context.lifecycle_id)
+            if state is None or state.current_turn_id is None:
+                return None
+            turn_id = state.current_turn_id
+            terminal = SessionTurnTerminal(
+                schema_version=SESSION_TURN_TERMINAL_SCHEMA,
+                event_id=new_id("session_turn_terminal"),
+                session_id=state.session_id,
+                lifecycle_id=state.lifecycle_id,
+                turn_id=turn_id,
+                outcome="abandoned",
+                reason="host_shutdown",
+                superseded_by_turn_id=None,
+                observed_at=context.observed_at,
             )
             self._apply_terminal(state, terminal)
             self.ledger.append(terminal.to_row())

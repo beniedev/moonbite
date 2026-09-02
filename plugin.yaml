@@ -20,4 +20,6 @@ provides_hooks:
   - on_session_start
   - pre_llm_call
   - post_llm_call
+  - on_session_end
   - on_session_finalize
+  - subagent_stop

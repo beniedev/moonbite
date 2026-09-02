@@ -882,6 +882,12 @@ def register_runtime(
     def post_llm_call(**kwargs: Any) -> None:
         runtime.record_session_hook("post_llm_call", kwargs, settled=True)
 
+    def on_session_end(**kwargs: Any) -> None:
+        runtime.record_hermes_turn_end(kwargs)
+
+    def subagent_stop(**kwargs: Any) -> None:
+        runtime.record_hermes_subagent_stop(kwargs)
+
     def on_session_finalize(**kwargs: Any) -> None:
         runtime.record_hermes_session_finalize(kwargs)
 
@@ -890,7 +896,9 @@ def register_runtime(
         "on_session_start": on_session_start,
         "pre_llm_call": pre_llm_call,
         "post_llm_call": post_llm_call,
+        "on_session_end": on_session_end,
         "on_session_finalize": on_session_finalize,
+        "subagent_stop": subagent_stop,
     }
     for hook_name in HOOK_ORDER:
         if hook_name in plan.hook_names:

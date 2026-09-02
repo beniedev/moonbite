@@ -11,32 +11,58 @@ or undocumented implementation fields.
 | macOS | Supported | Uses the same POSIX code path; covered by the CI matrix, which must be green for release. |
 | Python | `>=3.11,<3.15` | Supports Python 3.11, 3.12, 3.13, 3.14 (pinned Hermes checkout supports 3.11–3.13). |
 | Native Windows | Unsupported | POSIX `fcntl` file locks are required for process synchronization. |
-| Hermes Baseline | `987064caa4f8845f605ac7346fed5b72fddfb21c` | Exact recorded known-good commit; required CI validation job. |
+| Hermes v0.20.5 minimum | `v2026.8.19` / `fcbd1076a93841fa88855acce810e342a5b78101` | Required CLI/Gateway compatibility lane. |
+| Hermes v0.21.0 current | `v2026.8.31` / `29112bef099274229cadff79cdff7bf7b99c4b77` | Required CLI/Gateway compatibility lane; Desktop is out of scope. |
 | Current Upstream Hermes | Dynamic | Resolved and printed by scheduled/manual drift CI. See the latest workflow log for the tested SHA. |
 
 ---
 
 ## 1. Verified Surface & Lifecycle Hooks
 
-Moonbite registers exactly 10 tools, 16 CLI commands, 1 slash command (`/moon`), and 5 manifest hooks.
+Moonbite registers exactly 10 tools, 16 CLI commands, 1 slash command (`/moon`), and 7 manifest hooks.
 
-The 5 manifest hooks are registered in strict `HOOK_ORDER`:
+The 7 manifest hooks are registered in strict `HOOK_ORDER`:
 1. `pre_gateway_dispatch`: Fires before message authorization, providing a pre-auth host context seam. Without an explicit typed host resolver, Moonbite treats this as a no-op and never reads or records unauthorized message content.
 2. `on_session_start`: Fires when a session initializes; records normalized session-start lifecycle telemetry when resolvable context is available.
 3. `pre_llm_call`: Fires immediately before model invocation; records lifecycle step and optionally attaches fresh Panel Afterglow or enabled Memory recall as bounded, untrusted context (never as instructions).
 4. `post_llm_call`: Fires only for a non-empty, non-interrupted final response; records a completed post-model turn.
-5. `on_session_finalize`: Fires when a session finishes; records normalized session finalization.
+5. `on_session_end`: Fires for every completed `run_conversation` path and maps success, failure, interruption, or incomplete exit into canonical terminal evidence without storing free-text exit details.
+6. `on_session_finalize`: Fires when a session finishes; records normalized session rotation, expiry, or shutdown evidence.
+7. `subagent_stop`: Uses only `child_session_id` and `child_status`; a non-success stop closes that child's unique open turn without reading its summary, goal, or tool history. A completed child is a no-op because its own post/end callbacks carry success.
 
 The outer manifest (`plugin.yaml`) retains `manifest_version: 1` and `kind: standalone` because the pinned Hermes installer accepts only v1 manifests.
 
 ### Turn liveness contract
 
 Moonbite does not require `post_llm_call` to fire for every `pre_llm_call`.
-A later pre-model hook records the previous open turn as `abandoned` under the
-same mutation lock before opening its successor. Operators can inspect open
-turns with `hermes moonbite session status` and append the same non-success
-terminal with an exact-ID `session repair` command. Both paths preserve the
-append-only ledger and never manufacture a completed response.
+HermesHostAdapter consumes the unconditional `on_session_end` callback and the
+non-success `subagent_stop` fallback. Both converge on the same canonical
+terminal row under the same mutation lock; neither manufactures a successful
+post. A later pre-model hook remains a crash-recovery fallback. Operators can inspect open turns with
+`hermes moonbite session status` and use exact-ID `session repair` only when no
+host terminal was delivered. Every path preserves the append-only ledger and
+never manufactures a completed response.
+
+Legacy Hermes compression can rotate `session_id` after `pre_llm_call` while
+keeping `turn_id` and `task_id` stable. For `post_llm_call` and
+`on_session_end`, HermesHostAdapter therefore correlates that stable `turn_id`
+against Moonbite's durable lifecycle ledger and writes the callback to the
+original lifecycle. Missing evidence remains neutral; ambiguous matches fail
+closed. This uses no recency timer or process-local correlation cache.
+
+The next pre-model callback may use the rotated session ID without a matching
+`on_session_start`. HermesHostAdapter then starts a new canonical lifecycle at
+that real `pre_llm_call`; it does not invent a start callback. When an upgrade
+attaches to an existing five- or six-hook Moonbite lifecycle, the adapter
+preserves its recorded capabilities and writes only the canonical terminal row
+for a newly available host terminal. This releases liveness without rewriting
+old rows or claiming that the old lifecycle registered a newer hook.
+
+Hermes v0.21.0 bounds ordinary plugin hook callbacks with a 30-second host
+timeout, while `subagent_stop` preserves caller-thread serialization. Moonbite's
+lifecycle callbacks only normalize bounded identifiers and perform local
+append-only state transitions; model calls and delivery remain outside those
+callbacks.
 
 `settled_turn_ids` continues to contain completed turns only. An abandoned
 turn no longer holds the active-chat gate forever, but remains unsettled and
@@ -57,14 +83,21 @@ Moonbite binary at a state directory after a v4 cadence write.
 - **Atomic Operations & Locks:** State persistence uses atomic JSON writes and POSIX `fcntl.flock` locks on `*.lock` files.
 - **Fail-Closed Boundary:** Hermes-specific behavior stays at `moonbite_plugin.hermes_adapter` and the plugin registration boundary. If a required capability is absent on the host, Moonbite fails closed with a structured error.
 
-Before a release candidate, manually repeat the pinned contract check on WSL2's native Linux filesystem (not `/mnt/c`):
+Before a release candidate, manually repeat the required contract check for both
+commits on WSL2's native Linux filesystem (not `/mnt/c`):
 
 ```bash
-git -C ../hermes-agent fetch --depth 1 origin 987064caa4f8845f605ac7346fed5b72fddfb21c
-git -C ../hermes-agent checkout --detach 987064caa4f8845f605ac7346fed5b72fddfb21c
-HERMES_REPO=../hermes-agent \
-HERMES_EXPECTED_COMMIT=987064caa4f8845f605ac7346fed5b72fddfb21c \
-MOONBITE_TEST_HOME=.hermes-test ./scripts/test-hermes-contract.sh
+for commit in \
+  fcbd1076a93841fa88855acce810e342a5b78101 \
+  29112bef099274229cadff79cdff7bf7b99c4b77
+do
+  git -C ../hermes-agent fetch --depth 1 origin "$commit"
+  git -C ../hermes-agent checkout --detach FETCH_HEAD
+  HERMES_REPO=../hermes-agent \
+  HERMES_EXPECTED_COMMIT="$commit" \
+  MOONBITE_TEST_HOME=".hermes-test-$commit" \
+  ./scripts/test-hermes-contract.sh
+done
 ```
 
 ---

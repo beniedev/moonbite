@@ -32,7 +32,15 @@ REQUIRED_STATE_DOMAINS = frozenset(
 RESERVED_STATE_DOMAINS = frozenset()
 MAX_OWNER_ID_BYTES = 256
 STANDALONE_OWNER_ID = "moonbite-standalone"
-SESSION_OWNER_METHODS = ("record_hook", "snapshot", "replay")
+SESSION_OWNER_METHODS = (
+    "record_hook",
+    "record_host_turn_end",
+    "record_host_child_stop",
+    "record_host_shutdown",
+    "record_host_finalize",
+    "snapshot",
+    "replay",
+)
 EFFECT_OWNER_METHODS = (
     "begin_intent",
     "mark_pending",

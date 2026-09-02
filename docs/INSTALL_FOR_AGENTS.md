@@ -60,7 +60,7 @@ Before modifying any configuration, agents should formulate and present a struct
 {
   "schema_version": "moonbite.setup_plan.v1",
   "source_commit": "<40-character-commit-sha>",
-  "hermes_commit": "987064caa4f8845f605ac7346fed5b72fddfb21c",
+  "hermes_commit": "<required-hermes-commit>",
   "target_profile": null,
   "preset": null,
   "owner_decisions_required": [
@@ -95,7 +95,9 @@ Before modifying any configuration, agents should formulate and present a struct
     "on_session_start",
     "pre_llm_call",
     "post_llm_call",
-    "on_session_finalize"
+    "on_session_end",
+    "on_session_finalize",
+    "subagent_stop"
   ],
   "smoke_tests": [
     "hermes plugins doctor moonbite --ci",
