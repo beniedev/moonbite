@@ -113,6 +113,14 @@ def record_active_chat(runtime, session_id="session-active"):
     )
 
 
+class ConversationGateStub:
+    def __init__(self, active_chat):
+        self.active_chat = active_chat
+
+    def snapshots(self):
+        return [{"active_chat": self.active_chat}]
+
+
 def private_exposure_context(
     *, session_id: str = "session-private", turn_id: str = "turn-private"
 ) -> ExposureContext:
@@ -124,6 +132,41 @@ def private_exposure_context(
         NOW,
         0,
     )
+
+
+@pytest.mark.parametrize(
+    "host_active,derived_active,expected_status,expected_reason",
+    [
+        (True, False, "skipped", "active_chat"),
+        (False, True, "skipped", "active_chat"),
+        (False, False, "skipped", "no_eligible_provider"),
+        ("invalid", False, "failed", "active_chat_invalid"),
+    ],
+)
+def test_run_autonomy_merges_host_and_conversation_active_chat(
+    tmp_path, host_active, derived_active, expected_status, expected_reason
+):
+    runtime = MoonbiteRuntime(
+        {"modules": {"autonomy": True}},
+        root=tmp_path,
+        conversation_bridge=ConversationGateStub(derived_active),
+    )
+    result = runtime.run_autonomy(
+        facts={
+            "active_chat": host_active,
+            "source_event_id": "merge-source",
+            "epoch_id": "merge-epoch",
+        }
+    )
+
+    assert (result.status, result.reason) == (expected_status, expected_reason)
+    assert result.source_event_id == result.canonical_event_id == "merge-source"
+    assert result.epoch_id == "merge-epoch"
+    assert runtime.effects.records() == ()
+    audit = runtime.bus.read_audit()[-1].payload
+    assert audit["occurrence_id"] == "merge-source"
+    assert audit["source_event_id"] == "merge-source"
+    assert audit["epoch_id"] == "merge-epoch"
 
 
 def test_diary_synthesis_opens_exact_evidence_then_appends(tmp_path):

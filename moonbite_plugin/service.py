@@ -953,9 +953,35 @@ class MoonbiteRuntime:
         if not self.config["modules"]["autonomy"]:
             raise RuntimeError("autonomy module is disabled")
         effective_facts = {} if facts is None else dict(facts)
-        active_chat = self._conversation_active_chat()
-        effective_facts["active_chat"] = active_chat
-        effective_facts["chat_active"] = active_chat
+        derived_active_chat = self._conversation_active_chat()
+        explicit_active_chat = [
+            effective_facts[key]
+            for key in ("active_chat", "chat_active")
+            if key in effective_facts
+        ]
+        invalid_active_chat_key = next(
+            (
+                key
+                for key in ("active_chat", "chat_active")
+                if key in effective_facts and type(effective_facts[key]) is not bool
+            ),
+            _MISSING,
+        )
+        if invalid_active_chat_key is not _MISSING:
+            invalid_active_chat = effective_facts[invalid_active_chat_key]
+            # Preserve the existing AutonomyEngine schema validation.  In
+            # particular, do not let a derived ``True`` short-circuit an
+            # invalid caller value before the engine can fail closed.
+            if invalid_active_chat_key == "chat_active":
+                # Keep the engine's alias-specific error reachable even when
+                # the other alias or the derived gate is true.
+                effective_facts["active_chat"] = False
+            effective_facts.setdefault("active_chat", invalid_active_chat)
+            effective_facts.setdefault("chat_active", invalid_active_chat)
+        else:
+            active_chat = bool(derived_active_chat) or any(explicit_active_chat)
+            effective_facts["active_chat"] = active_chat
+            effective_facts["chat_active"] = active_chat
         result = self.autonomy.run_once(
             self.config["autonomy"]["providers"], facts=effective_facts
         )
