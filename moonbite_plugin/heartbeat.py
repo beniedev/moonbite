@@ -1190,24 +1190,33 @@ class HeartbeatCadence:
         return changed
 
     def _recent_from_state(
-        self, state: Mapping[str, Any], now: datetime
+        self,
+        state: Mapping[str, Any],
+        now: datetime,
+        *,
+        include_verified_visible: bool = True,
     ) -> tuple[str | None, datetime | None]:
         items: list[tuple[str, datetime]] = []
-        for contacts_key, label in (
-            ("private_contacts", "recent_private_inbound"),
-            ("verified_visible_contacts", "recent_verified_visible_contact"),
-        ):
+        contact_sources = [("private_contacts", "recent_private_inbound")]
+        overflow_sources = [
+            ("private_contact_overflow_until", "recent_private_inbound")
+        ]
+        if include_verified_visible:
+            contact_sources.append(
+                ("verified_visible_contacts", "recent_verified_visible_contact")
+            )
+            overflow_sources.append(
+                (
+                    "verified_visible_overflow_until",
+                    "recent_verified_visible_contact",
+                )
+            )
+        for contacts_key, label in contact_sources:
             for raw in state[contacts_key].values():
                 parsed = _optional_time(raw, contacts_key)
                 if parsed is not None and parsed + self.recent_contact_window > now:
                     items.append((label, parsed))
-        for overflow_key, label in (
-            ("private_contact_overflow_until", "recent_private_inbound"),
-            (
-                "verified_visible_overflow_until",
-                "recent_verified_visible_contact",
-            ),
-        ):
+        for overflow_key, label in overflow_sources:
             expiry = _optional_time(state.get(overflow_key), overflow_key)
             if expiry is not None and expiry > now:
                 items.append((label, expiry - self.recent_contact_window))
@@ -1806,6 +1815,28 @@ class HeartbeatCadence:
             state = self._load()
             self._prune_contact_state(state, effective_now)
             return self._recent_from_state(state, effective_now)
+
+    def recent_private_inbound(
+        self, *, now: datetime | None = None
+    ) -> tuple[str | None, datetime | None]:
+        """Return only recent user-originated private contact.
+
+        Verified outbound delivery remains part of ``recent_contact`` so a
+        heartbeat can avoid repeated messages, but it is not user-presence
+        evidence for autonomy admission.
+        """
+
+        effective_now = self._now(now)
+        if not self.path.exists():
+            return None, None
+        with file_lock(self.lock_path):
+            state = self._load()
+            self._prune_contact_state(state, effective_now)
+            return self._recent_from_state(
+                state,
+                effective_now,
+                include_verified_visible=False,
+            )
 
     def snapshot(self, *, now: datetime | None = None) -> dict[str, Any]:
         effective_now = self._now(now)

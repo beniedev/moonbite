@@ -1825,6 +1825,11 @@ def test_delivery_only_refreshes_visible_contact_wake_only_does_not(tmp_path):
     delivery = delivery_runtime.run(candidate)
     assert (delivery.status, delivery.delivery.verified) == ("completed", True)
     assert delivery_cadence.snapshot()["verified_visible_effects"]
+    assert delivery_cadence.recent_contact(now=NOW) == (
+        "recent_verified_visible_contact",
+        NOW,
+    )
+    assert delivery_cadence.recent_private_inbound(now=NOW) == (None, None)
 
     mixed_runtime, _controls, _bus, mixed_cadence = engine(
         tmp_path / "mixed",
