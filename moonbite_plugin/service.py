@@ -35,6 +35,7 @@ from .heartbeat import (
     SilentJudge,
     WakeSink,
 )
+from .hermes_adapter import HermesHostAdapter, SessionHookMappingError
 from .memory import (
     DiaryWriter,
     ExternalRetriever,
@@ -53,8 +54,13 @@ from .memory_orchestration import (
 )
 from .observer import HealthSnapshot, ObservationFact, Observer, ScheduleProof
 from .platforms import PlatformInfo, detect_platform, state_root
-from .runtime_core import StateError, ensure_bounded_text, new_id, parse_time, utc_now
-from .session import HOOK_ORDER, SessionContext, SessionHookReceipt
+from .runtime_core import StateError, new_id, parse_time, utc_now
+from .session import (
+    HOOK_ORDER,
+    SessionContext,
+    SessionHookReceipt,
+    SessionTurnTerminalReceipt,
+)
 from .scenarios import ConfigResolution, resolve_config
 
 logger = logging.getLogger(__name__)
@@ -65,30 +71,9 @@ SUPPORTED_SESSION_HOOKS = frozenset(SESSION_HOOK_ORDER)
 DEFAULT_SESSION_HOOKS = frozenset(
     hook for hook in SUPPORTED_SESSION_HOOKS if hook != "pre_gateway_dispatch"
 )
-_DEFINITIVE_HERMES_FINALIZE_REASONS = frozenset({"new_session", "session_expired"})
 SessionContextResolver = Callable[
     [str, Mapping[str, Any], frozenset[str]], SessionContext | None
 ]
-
-
-class SessionHookMappingError(ValueError):
-    """Raised when public Hermes kwargs cannot form a safe session context."""
-
-
-def _hook_reference(value: Any, label: str) -> str:
-    if type(value) is not str or not value.strip():
-        raise SessionHookMappingError(f"{label} is required for session hook mapping")
-    try:
-        ensure_bounded_text(value, label, max_bytes=256)
-    except ValueError as exc:
-        raise SessionHookMappingError(str(exc)) from exc
-    return value
-
-
-def _optional_hook_reference(value: Any, label: str) -> str | None:
-    if value is None:
-        return None
-    return _hook_reference(value, label)
 
 
 _MISSING = object()
@@ -258,6 +243,7 @@ class MoonbiteRuntime:
             raise RuntimeComponentsError(
                 "session_context_resolver must be callable or None"
             )
+        self.hermes_host_adapter = HermesHostAdapter()
         self.session_context_resolver = session_context_resolver
         self._last_session_hook_error: dict[str, str] | None = None
         self.providers = ProviderRegistry()
@@ -335,61 +321,51 @@ class MoonbiteRuntime:
             "error": type(error).__name__,
         }
 
-    @staticmethod
-    def _default_session_context(
-        hook: str, kwargs: Mapping[str, Any]
+    def _resolve_session_context(
+        self, hook: str, payload: Mapping[str, Any]
     ) -> SessionContext | None:
-        """Map stable public Hermes IDs without inspecting message bodies."""
-
-        if hook == "pre_gateway_dispatch":
-            # The public gateway callback has no authorized session ID and runs
-            # before auth.  A caller-owned resolver may opt in explicitly.
-            return None
-
-        session_id = _hook_reference(kwargs.get("session_id"), "session_id")
-        lifecycle_id = session_id
-        observed_at = utc_now()
-
-        if hook == "on_session_start":
-            return SessionContext(
-                session_id=session_id,
-                lifecycle_id=lifecycle_id,
-                source_id=session_id,
-                source_kind="session_start",
-                observed_at=observed_at,
-                fresh=True,
-                supported_hooks=DEFAULT_SESSION_HOOKS,
+        if self.session_context_resolver is None:
+            context = self.hermes_host_adapter.session_context(
+                hook, payload, DEFAULT_SESSION_HOOKS
             )
-
-        if hook in {"pre_llm_call", "post_llm_call"}:
-            turn_id = _hook_reference(kwargs.get("turn_id"), "turn_id")
-            task_id = _optional_hook_reference(kwargs.get("task_id"), "task_id")
-            source_id = task_id or turn_id
-            return SessionContext(
-                session_id=session_id,
-                lifecycle_id=lifecycle_id,
-                source_id=source_id,
-                turn_id=turn_id,
-                source_kind=(
-                    "assistant_response" if hook == "post_llm_call" else "system"
-                ),
-                observed_at=observed_at,
-                fresh=False,
-                supported_hooks=DEFAULT_SESSION_HOOKS,
+        else:
+            context = self.session_context_resolver(
+                hook, payload, SUPPORTED_SESSION_HOOKS
             )
-
-        if hook == "on_session_finalize":
-            return SessionContext(
-                session_id=session_id,
-                lifecycle_id=lifecycle_id,
-                source_id=session_id,
-                source_kind="system",
-                observed_at=observed_at,
-                fresh=False,
-                supported_hooks=DEFAULT_SESSION_HOOKS,
+        if context is not None and not isinstance(context, SessionContext):
+            raise SessionHookMappingError(
+                "session_context_resolver must return SessionContext or None"
             )
+        if context is not None and hook in {
+            "pre_llm_call",
+            "post_llm_call",
+            "on_session_end",
+            "on_session_finalize",
+        }:
+            snapshots = self.session.replay()
+            if hook == "pre_llm_call":
+                context = self.hermes_host_adapter.pre_turn_context(context, snapshots)
+            elif hook == "on_session_finalize":
+                context = self.hermes_host_adapter.correlate_lifecycle(
+                    context, snapshots
+                )
+            else:
+                context = self.hermes_host_adapter.correlate_turn(context, snapshots)
+        return context
 
-        raise SessionHookMappingError(f"unsupported session hook: {hook!r}")
+    def _project_session_receipt(self, hook: str, receipt: SessionHookReceipt):
+        try:
+            if self.conversation_bridge is not None:
+                self.conversation_bridge.observe(receipt)
+            if receipt.context.counts_as_private_contact:
+                self.cadence.record_private_contact(receipt)
+        except Exception as exc:
+            # The session owner already accepted this receipt. Projection
+            # retries are safe because both consumers are idempotent.
+            self._remember_session_hook_error(hook, exc)
+            raise
+        self._last_session_hook_error = None
+        return receipt
 
     def record_session_hook(
         self,
@@ -397,7 +373,6 @@ class MoonbiteRuntime:
         kwargs: Mapping[str, Any] | None = None,
         *,
         settled: bool = False,
-        _record_host_finalize: bool = False,
     ):
         """Map one public hook and append it to the injected session owner.
 
@@ -409,82 +384,192 @@ class MoonbiteRuntime:
 
         payload = {} if kwargs is None else kwargs
         try:
-            if self.session_context_resolver is None and hook == "on_session_finalize":
-                raw_session_id = payload.get("session_id")
-                if raw_session_id is None or (
-                    type(raw_session_id) is str and not raw_session_id.strip()
-                ):
-                    return None
-                session_id = _hook_reference(raw_session_id, "session_id")
-                if self.session.snapshot(session_id) is None:
-                    # Hermes can finalize a session that never reached its
-                    # first turn (for example /new during setup).  There is
-                    # no lifecycle to close and therefore nothing to record.
-                    return None
-            if self.session_context_resolver is None:
-                context = self._default_session_context(hook, payload)
-            else:
-                context = self.session_context_resolver(
-                    hook, payload, SUPPORTED_SESSION_HOOKS
-                )
+            context = self._resolve_session_context(hook, payload)
             if context is None:
                 return None
-            if not isinstance(context, SessionContext):
-                raise SessionHookMappingError(
-                    "session_context_resolver must return SessionContext or None"
-                )
             event = payload.get("event")
             if hook == "pre_gateway_dispatch" and getattr(event, "internal", False):
                 # Internal/system events are never contact, even when a
                 # resolver is present.
                 return None
-            if _record_host_finalize:
-                record_host_finalize = getattr(
-                    self.session, "record_host_finalize", None
-                )
-                if callable(record_host_finalize):
-                    receipt = record_host_finalize(context)
-                else:
-                    receipt = self.session.record_hook(context, hook, settled=settled)
-            else:
-                receipt = self.session.record_hook(context, hook, settled=settled)
+            if (
+                hook == "on_session_finalize"
+                and self.session.snapshot(context.lifecycle_id) is None
+            ):
+                # Hermes can finalize a session that never reached a first turn.
+                return None
+            receipt = self.session.record_hook(context, hook, settled=settled)
         except SessionHookMappingError as exc:
             self._remember_session_hook_error(hook, exc)
             return None
         except Exception as exc:
             self._remember_session_hook_error(hook, exc)
             raise
+        return self._project_session_receipt(hook, receipt)
+
+    def record_hermes_turn_end(
+        self, kwargs: Mapping[str, Any] | None = None
+    ) -> SessionHookReceipt | SessionTurnTerminalReceipt | None:
+        """Normalize Hermes' unconditional turn end into canonical evidence."""
+
+        hook = "on_session_end"
+        payload = {} if kwargs is None else kwargs
         try:
-            if self.conversation_bridge is not None:
-                self.conversation_bridge.observe(receipt)
-            if receipt.context.counts_as_private_contact:
-                self.cadence.record_private_contact(receipt)
+            fallback_context = self.hermes_host_adapter.session_end_shutdown_fallback(
+                payload,
+                supported_hooks=DEFAULT_SESSION_HOOKS,
+            )
+            if fallback_context is not None:
+                if self.session_context_resolver is not None:
+                    fallback_context = self.session_context_resolver(
+                        hook,
+                        payload,
+                        SUPPORTED_SESSION_HOOKS,
+                    )
+                    if fallback_context is None:
+                        raise SessionHookMappingError(
+                            "session_context_resolver did not map the on_session_end shutdown fallback"
+                        )
+                    if not isinstance(fallback_context, SessionContext):
+                        raise SessionHookMappingError(
+                            "session_context_resolver must return SessionContext or None"
+                        )
+                snapshots = self.session.replay()
+                fallback_context = self.hermes_host_adapter.correlate_lifecycle(
+                    fallback_context,
+                    snapshots,
+                )
+                if not any(
+                    snapshot.lifecycle_id == fallback_context.lifecycle_id
+                    for snapshot in snapshots
+                ):
+                    raise SessionHookMappingError(
+                        "on_session_end shutdown fallback did not match a durable lifecycle"
+                    )
+                record_host_shutdown = getattr(
+                    self.session, "record_host_shutdown", None
+                )
+                if not callable(record_host_shutdown):
+                    raise RuntimeComponentsError(
+                        "session owner is missing record_host_shutdown"
+                    )
+                receipt = record_host_shutdown(fallback_context)
+                self._last_session_hook_error = None
+                return receipt
+
+            context = self._resolve_session_context(hook, payload)
+            if context is None:
+                return None
+            terminal = self.hermes_host_adapter.turn_terminal(
+                payload,
+                supported_hooks=context.supported_hooks,
+                context=context,
+            )
+            record_host_turn_end = getattr(self.session, "record_host_turn_end", None)
+            if not callable(record_host_turn_end):
+                raise RuntimeComponentsError(
+                    "session owner is missing record_host_turn_end"
+                )
+            receipt = record_host_turn_end(terminal.context, terminal.reason)
+            if receipt is None:
+                return None
+        except SessionHookMappingError as exc:
+            self._remember_session_hook_error(hook, exc)
+            return None
         except Exception as exc:
-            # The session owner has already durably accepted this receipt. A
-            # projection failure must remain visible so the host can retry;
-            # ConversationBridge.observe is idempotent on that retry.
             self._remember_session_hook_error(hook, exc)
             raise
+        if isinstance(receipt, SessionHookReceipt):
+            return self._project_session_receipt(hook, receipt)
+        if not isinstance(receipt, SessionTurnTerminalReceipt):
+            raise RuntimeComponentsError(
+                "session owner returned an invalid host turn terminal receipt"
+            )
         self._last_session_hook_error = None
         return receipt
 
-    def record_hermes_session_finalize(
+    def record_hermes_subagent_stop(
         self, kwargs: Mapping[str, Any] | None = None
-    ) -> SessionHookReceipt | None:
-        """Route only definitive Hermes finalization reasons to host close."""
+    ) -> SessionHookReceipt | SessionTurnTerminalReceipt | None:
+        """Normalize Hermes child-stop fallback into canonical evidence."""
 
+        hook = "subagent_stop"
         payload = {} if kwargs is None else kwargs
-        reason = payload.get("reason")
-        if type(reason) is str and reason == "shutdown":
+        try:
+            child_stop = self.hermes_host_adapter.subagent_stop_terminal(payload)
+            if child_stop is None:
+                self._last_session_hook_error = None
+                return None
+            record_host_child_stop = getattr(
+                self.session, "record_host_child_stop", None
+            )
+            if not callable(record_host_child_stop):
+                raise RuntimeComponentsError(
+                    "session owner is missing record_host_child_stop"
+                )
+            receipt = record_host_child_stop(
+                child_stop.child_session_id,
+                child_stop.reason,
+            )
+        except SessionHookMappingError as exc:
+            self._remember_session_hook_error(hook, exc)
             return None
-        definitive = (
-            type(reason) is str and reason in _DEFINITIVE_HERMES_FINALIZE_REASONS
-        )
-        return self.record_session_hook(
-            "on_session_finalize",
-            payload,
-            _record_host_finalize=definitive,
-        )
+        except Exception as exc:
+            self._remember_session_hook_error(hook, exc)
+            raise
+        if receipt is None:
+            self._last_session_hook_error = None
+            return None
+        if isinstance(receipt, SessionHookReceipt):
+            return self._project_session_receipt(hook, receipt)
+        if not isinstance(receipt, SessionTurnTerminalReceipt):
+            raise RuntimeComponentsError(
+                "session owner returned an invalid child terminal receipt"
+            )
+        self._last_session_hook_error = None
+        return receipt
+
+    def record_hermes_session_finalize(self, kwargs: Mapping[str, Any] | None = None):
+        """Normalize Hermes session rotation and shutdown boundaries."""
+
+        hook = "on_session_finalize"
+        payload = {} if kwargs is None else kwargs
+        try:
+            context = self._resolve_session_context(hook, payload)
+            if context is None or self.session.snapshot(context.lifecycle_id) is None:
+                return None
+            disposition = self.hermes_host_adapter.finalize_disposition(payload)
+            if disposition == "shutdown":
+                record_host_shutdown = getattr(
+                    self.session, "record_host_shutdown", None
+                )
+                if not callable(record_host_shutdown):
+                    raise RuntimeComponentsError(
+                        "session owner is missing record_host_shutdown"
+                    )
+                receipt = record_host_shutdown(context)
+                self._last_session_hook_error = None
+                return receipt
+            if disposition == "definitive":
+                record_host_finalize = getattr(
+                    self.session, "record_host_finalize", None
+                )
+                if not callable(record_host_finalize):
+                    raise RuntimeComponentsError(
+                        "session owner is missing record_host_finalize"
+                    )
+                receipt = record_host_finalize(context)
+            else:
+                receipt = self.session.record_hook(
+                    context, "on_session_finalize", settled=False
+                )
+        except SessionHookMappingError as exc:
+            self._remember_session_hook_error(hook, exc)
+            return None
+        except Exception as exc:
+            self._remember_session_hook_error(hook, exc)
+            raise
+        return self._project_session_receipt(hook, receipt)
 
     def _local_reflection(self, context) -> dict[str, Any]:
         facts = dict(context.facts)
@@ -831,13 +916,30 @@ class MoonbiteRuntime:
     ) -> dict[str, Any]:
         return self.bus.emit(kind, source=source, payload=payload).to_dict()
 
+    def _effective_active_chat(
+        self,
+        values: Mapping[str, Any],
+        *keys: str,
+    ) -> Any:
+        """Merge a host gate with the durable bridge without lowering either."""
+
+        provided = False
+        for key in keys:
+            if key not in values:
+                continue
+            value = values[key]
+            if type(value) is not bool:
+                return value
+            provided = provided or value
+        return provided or self._conversation_private_chat_active()
+
     def run_heartbeat(
         self, kind: str, *, context: Mapping[str, Any] | None = None
     ) -> HeartbeatResult:
         if not self.config["modules"]["heartbeat"]:
             raise RuntimeError("heartbeat module is disabled")
         effective_context = {} if context is None else dict(context)
-        active_chat = self._conversation_active_chat()
+        active_chat = self._effective_active_chat(effective_context, "active_chat")
         effective_context["active_chat"] = active_chat
         return self.heartbeat.run(
             HeartbeatCandidate(kind, effective_context), active_chat=active_chat
@@ -896,7 +998,11 @@ class MoonbiteRuntime:
         if not self.config["modules"]["autonomy"]:
             raise RuntimeError("autonomy module is disabled")
         effective_facts = {} if facts is None else dict(facts)
-        active_chat = self._conversation_active_chat()
+        active_chat = self._effective_active_chat(
+            effective_facts,
+            "active_chat",
+            "chat_active",
+        )
         effective_facts["active_chat"] = active_chat
         effective_facts["chat_active"] = active_chat
         result = self.autonomy.run_once(
@@ -905,8 +1011,8 @@ class MoonbiteRuntime:
         self._project_autonomy_afterglow(result)
         return result
 
-    def _conversation_active_chat(self) -> bool:
-        """Return the durable conversation gate, failing closed on uncertainty."""
+    def _conversation_chat_active(self, *, require_private: bool) -> bool:
+        """Read the durable chat gate, optionally requiring private input."""
 
         bridge = self.conversation_bridge
         if bridge is None:
@@ -926,14 +1032,43 @@ class MoonbiteRuntime:
             for snapshot in snapshots:
                 if isinstance(snapshot, Mapping):
                     value = snapshot["active_chat"]
+                    last_private_at = snapshot.get("last_private_at")
                 else:
                     value = getattr(snapshot, "active_chat")
+                    last_private_at = getattr(snapshot, "last_private_at", None)
                 if type(value) is not bool:
                     raise TypeError("conversation bridge active_chat is invalid")
+                if require_private:
+                    if isinstance(snapshot, Mapping):
+                        has_private_field = "last_private_at" in snapshot
+                    else:
+                        has_private_field = hasattr(snapshot, "last_private_at")
+                    if not has_private_field:
+                        raise TypeError(
+                            "conversation bridge last_private_at is unavailable"
+                        )
+                    if last_private_at is not None and not isinstance(
+                        last_private_at, datetime
+                    ):
+                        raise TypeError(
+                            "conversation bridge last_private_at is invalid"
+                        )
+                    if value and last_private_at is None:
+                        continue
                 active_values.append(value)
             return any(active_values)
         except Exception:
             return True
+
+    def _conversation_active_chat(self) -> bool:
+        """Return any durable active turn, failing closed on uncertainty."""
+
+        return self._conversation_chat_active(require_private=False)
+
+    def _conversation_private_chat_active(self) -> bool:
+        """Return only active conversation state backed by private input."""
+
+        return self._conversation_chat_active(require_private=True)
 
     @staticmethod
     def _afterglow_summary(result: ActivityResult) -> str:

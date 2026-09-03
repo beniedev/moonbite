@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass, replace
 from datetime import date
 import inspect
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 from .autonomy import AutonomyContext, AutonomyDecision
 from .heartbeat import (
@@ -14,6 +15,328 @@ from .heartbeat import (
     JudgeDecision,
 )
 from .memory import DiaryDraft
+from .runtime_core import ensure_bounded_text, utc_now
+from .session import SessionContext, SessionLifecycleSnapshot
+
+
+_DEFINITIVE_FINALIZE_REASONS = frozenset({"new_session", "session_expired"})
+_TURN_TERMINAL_REASONS = frozenset(
+    {
+        "host_turn_completed",
+        # Keep accepting this legacy label so old lifecycle rows remain
+        # readable; new host callbacks use the neutral reason above.
+        "host_turn_completed_without_post",
+        "host_turn_failed",
+        "host_turn_incomplete",
+        "host_turn_interrupted",
+    }
+)
+_CHILD_STOP_STATUSES = frozenset(
+    {
+        "completed",
+        "interrupted",
+        "failed",
+        "error",
+        "timeout",
+    }
+)
+
+
+class SessionHookMappingError(ValueError):
+    """Raised when public Hermes hook kwargs cannot form canonical evidence."""
+
+
+def _hook_reference(value: Any, label: str) -> str:
+    if type(value) is not str or not value.strip():
+        raise SessionHookMappingError(f"{label} is required for session hook mapping")
+    try:
+        ensure_bounded_text(value, label, max_bytes=256)
+    except ValueError as exc:
+        raise SessionHookMappingError(str(exc)) from exc
+    return value
+
+
+def _optional_hook_reference(value: Any, label: str) -> str | None:
+    if value is None or (type(value) is str and not value.strip()):
+        return None
+    return _hook_reference(value, label)
+
+
+@dataclass(frozen=True, slots=True)
+class HermesTurnTerminal:
+    """Canonical terminal classification derived from one Hermes turn end."""
+
+    context: SessionContext
+    reason: str
+
+    def __post_init__(self) -> None:
+        if self.reason not in _TURN_TERMINAL_REASONS:
+            raise ValueError("unsupported Hermes turn terminal reason")
+
+
+@dataclass(frozen=True, slots=True)
+class HermesChildStop:
+    """Bounded child-stop evidence accepted from Hermes."""
+
+    child_session_id: str
+    reason: str
+
+    @property
+    def terminal_reason(self) -> str:
+        return self.reason
+
+
+class HermesHostAdapter:
+    """The sole raw Hermes lifecycle compatibility boundary for Moonbite."""
+
+    def __init__(self, *, clock: Callable[[], Any] = utc_now):
+        if not callable(clock):
+            raise TypeError("clock must be callable")
+        self.clock = clock
+
+    def session_context(
+        self,
+        hook: str,
+        kwargs: Mapping[str, Any],
+        supported_hooks: frozenset[str],
+    ) -> SessionContext | None:
+        if hook == "pre_gateway_dispatch":
+            # This hook runs before authorization and has no stable session ID.
+            return None
+
+        session_id = _hook_reference(kwargs.get("session_id"), "session_id")
+        observed_at = self.clock()
+
+        if hook == "on_session_start":
+            return SessionContext(
+                session_id=session_id,
+                lifecycle_id=session_id,
+                source_id=session_id,
+                source_kind="session_start",
+                observed_at=observed_at,
+                fresh=True,
+                supported_hooks=supported_hooks,
+            )
+
+        if hook in {"pre_llm_call", "post_llm_call", "on_session_end"}:
+            turn_id = _hook_reference(kwargs.get("turn_id"), "turn_id")
+            task_id = _optional_hook_reference(kwargs.get("task_id"), "task_id")
+            return SessionContext(
+                session_id=session_id,
+                lifecycle_id=session_id,
+                source_id=task_id or turn_id,
+                turn_id=turn_id,
+                source_kind=(
+                    "assistant_response" if hook == "post_llm_call" else "system"
+                ),
+                observed_at=observed_at,
+                fresh=False,
+                supported_hooks=supported_hooks,
+            )
+
+        if hook == "on_session_finalize":
+            return SessionContext(
+                session_id=session_id,
+                lifecycle_id=session_id,
+                source_id=session_id,
+                source_kind="system",
+                observed_at=observed_at,
+                fresh=False,
+                supported_hooks=supported_hooks,
+            )
+
+        raise SessionHookMappingError(f"unsupported session hook: {hook!r}")
+
+    def session_end_shutdown_fallback(
+        self,
+        kwargs: Mapping[str, Any],
+        *,
+        supported_hooks: frozenset[str],
+    ) -> SessionContext | None:
+        """Map Hermes' identifier-poor interrupted shutdown fallback.
+
+        CLI and TUI shutdown paths can emit ``on_session_end`` without a
+        usable turn identifier.  This context identifies only the durable
+        lifecycle; the session owner resolves and closes its real open turn.
+        """
+
+        raw_turn_id = kwargs.get("turn_id")
+        if raw_turn_id is not None:
+            if type(raw_turn_id) is not str:
+                raise SessionHookMappingError(
+                    "turn_id must be text for on_session_end mapping"
+                )
+            if raw_turn_id.strip():
+                return None
+
+        completed = kwargs.get("completed")
+        interrupted = kwargs.get("interrupted")
+        failed = kwargs.get("failed")
+        if failed is not None and type(failed) is not bool:
+            raise SessionHookMappingError(
+                "failed must be a bool for on_session_end mapping"
+            )
+        if completed is not False or interrupted is not True or failed is True:
+            return None
+
+        session_id = _hook_reference(kwargs.get("session_id"), "session_id")
+        return SessionContext(
+            session_id=session_id,
+            lifecycle_id=session_id,
+            source_id=session_id,
+            source_kind="system",
+            observed_at=self.clock(),
+            fresh=False,
+            supported_hooks=supported_hooks,
+        )
+
+    def turn_terminal(
+        self,
+        kwargs: Mapping[str, Any],
+        *,
+        supported_hooks: frozenset[str],
+        context: SessionContext | None = None,
+    ) -> HermesTurnTerminal:
+        if context is None:
+            context = self.session_context("on_session_end", kwargs, supported_hooks)
+        if not isinstance(context, SessionContext):
+            raise SessionHookMappingError("on_session_end requires session context")
+        for field in ("completed", "failed", "interrupted"):
+            if type(kwargs.get(field)) is not bool:
+                raise SessionHookMappingError(
+                    f"{field} is required for on_session_end mapping"
+                )
+        _hook_reference(kwargs.get("turn_exit_reason"), "turn_exit_reason")
+        if kwargs["interrupted"]:
+            reason = "host_turn_interrupted"
+        elif kwargs["failed"]:
+            reason = "host_turn_failed"
+        elif kwargs["completed"]:
+            reason = "host_turn_completed"
+        else:
+            reason = "host_turn_incomplete"
+        return HermesTurnTerminal(context=context, reason=reason)
+
+    def subagent_stop_terminal(
+        self, kwargs: Mapping[str, Any]
+    ) -> HermesChildStop | None:
+        """Normalize Hermes child-stop status without inspecting child content."""
+
+        child_session_id = _hook_reference(
+            kwargs.get("child_session_id"), "child_session_id"
+        )
+        child_status = _hook_reference(kwargs.get("child_status"), "child_status")
+        if child_status not in _CHILD_STOP_STATUSES:
+            raise SessionHookMappingError(f"unsupported child_status: {child_status!r}")
+        if child_status == "completed":
+            return None
+        reason = (
+            "host_turn_interrupted"
+            if child_status == "interrupted"
+            else "host_turn_failed"
+        )
+        return HermesChildStop(child_session_id=child_session_id, reason=reason)
+
+    @staticmethod
+    def correlate_turn(
+        context: SessionContext,
+        snapshots: tuple[SessionLifecycleSnapshot, ...],
+    ) -> SessionContext:
+        """Resolve a rotated Hermes session ID from durable turn evidence."""
+
+        if context.turn_id is None:
+            return context
+        candidates = [
+            snapshot
+            for snapshot in snapshots
+            if context.turn_id == snapshot.open_turn_id
+            or context.turn_id in snapshot.terminal_turn_ids
+            or context.turn_id in snapshot.settled_turn_ids
+            or context.turn_id in snapshot.abandoned_turn_ids
+        ]
+        if not candidates:
+            return context
+        if len(candidates) != 1:
+            raise SessionHookMappingError(
+                "turn_id matches multiple Moonbite session lifecycles"
+            )
+        snapshot = candidates[0]
+        return replace(
+            context,
+            session_id=snapshot.session_id,
+            lifecycle_id=snapshot.lifecycle_id,
+            supported_hooks=snapshot.supported_hooks,
+        )
+
+    @staticmethod
+    def correlate_lifecycle(
+        context: SessionContext,
+        snapshots: tuple[SessionLifecycleSnapshot, ...],
+    ) -> SessionContext:
+        """Reuse durable lifecycle identity and capabilities for session hooks."""
+
+        matches = [
+            snapshot
+            for snapshot in snapshots
+            if snapshot.lifecycle_id == context.lifecycle_id
+        ]
+        if not matches:
+            return context
+        if len(matches) != 1:
+            raise SessionHookMappingError(
+                "session_id matches multiple Moonbite session lifecycles"
+            )
+        snapshot = matches[0]
+        return replace(
+            context,
+            session_id=snapshot.session_id,
+            lifecycle_id=snapshot.lifecycle_id,
+            supported_hooks=snapshot.supported_hooks,
+        )
+
+    @staticmethod
+    def pre_turn_context(
+        context: SessionContext,
+        snapshots: tuple[SessionLifecycleSnapshot, ...],
+    ) -> SessionContext:
+        """Reuse an existing lifecycle or attach after a host session rotation."""
+
+        matches = [
+            snapshot
+            for snapshot in snapshots
+            if snapshot.lifecycle_id == context.lifecycle_id
+        ]
+        if len(matches) > 1:
+            raise SessionHookMappingError(
+                "session_id matches multiple Moonbite session lifecycles"
+            )
+        if matches:
+            snapshot = matches[0]
+            return replace(
+                context,
+                session_id=snapshot.session_id,
+                lifecycle_id=snapshot.lifecycle_id,
+                supported_hooks=snapshot.supported_hooks,
+            )
+        # Hermes legacy compression can rotate session_id without firing a
+        # matching on_session_start. A pre-model hook is enough to start the
+        # new canonical lifecycle; no synthetic start callback is recorded.
+        return replace(
+            context,
+            supported_hooks=context.supported_hooks - {"on_session_start"},
+        )
+
+    @staticmethod
+    def finalize_disposition(kwargs: Mapping[str, Any]) -> str:
+        reason = kwargs.get("reason")
+        if reason is None:
+            return "ordinary"
+        reason = _hook_reference(reason, "reason")
+        if reason == "shutdown":
+            return "shutdown"
+        if reason in _DEFINITIVE_FINALIZE_REASONS:
+            return "definitive"
+        return "ordinary"
 
 
 HEARTBEAT_DECISION_SCHEMA = {

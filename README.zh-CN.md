@@ -107,11 +107,12 @@ Hermes 则继续管模型、工具、调度和投递。
 
 Moonbite 不包含调度器、后台服务、凭据存储、网络浏览器、模型路由器或消息
 渠道。这些能力以及原始会话历史与搜索都由宿主负责。Hermes 宿主适配器
-（host adapter）精确注册 10 个工具与 5 个生命周期 Hooks；完整接口见
+（host adapter）精确注册 10 个工具与 7 个生命周期 Hooks；完整接口见
 [SETUP.md](SETUP.md) 与 [plugin.yaml](plugin.yaml)。
 
-五个 Hooks 分别是 `pre_gateway_dispatch`、`on_session_start`、
-`pre_llm_call`、`post_llm_call` 与 `on_session_finalize`。
+七个 Hooks 分别是 `pre_gateway_dispatch`、`on_session_start`、
+`pre_llm_call`、`post_llm_call`、`on_session_end`、`on_session_finalize` 与
+`subagent_stop`。
 
 默认配置下：
 

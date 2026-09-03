@@ -113,11 +113,12 @@ execution, and delivery. The main agent keeps final interpretive authority.
 Moonbite does not include a scheduler, daemon, credential store, network
 browser, model router, or messaging channel. The host owns those capabilities,
 along with raw session history and search. The Hermes adapter registers exactly
-10 tools and 5 lifecycle hooks; their exact interfaces are documented in
+10 tools and 7 lifecycle hooks; their exact interfaces are documented in
 [SETUP.md](SETUP.md) and [plugin.yaml](plugin.yaml).
 
 The hooks are `pre_gateway_dispatch`, `on_session_start`, `pre_llm_call`,
-`post_llm_call`, and `on_session_finalize`.
+`post_llm_call`, `on_session_end`, `on_session_finalize`, and
+`subagent_stop`.
 
 With the default configuration:
 

@@ -43,10 +43,19 @@ jobs:
       - run: pytest
       - run: python -m pip wheel --disable-pip-version-check --no-deps --wheel-dir "$RUNNER_TEMP/wheels" .
 
-  hermes-pinned:
+  hermes-required:
+    name: ${{ matrix.lane }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - lane: hermes-min
+            commit: fcbd1076a93841fa88855acce810e342a5b78101
+          - lane: hermes-current
+            commit: 29112bef099274229cadff79cdff7bf7b99c4b77
     runs-on: ubuntu-latest
     env:
-      HERMES_PINNED_COMMIT: 987064caa4f8845f605ac7346fed5b72fddfb21c
+      HERMES_REQUIRED_COMMIT: ${{ matrix.commit }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
@@ -56,16 +65,16 @@ jobs:
       - run: |
           git init "$RUNNER_TEMP/hermes-agent"
           git -C "$RUNNER_TEMP/hermes-agent" remote add origin https://github.com/NousResearch/hermes-agent.git
-          git -C "$RUNNER_TEMP/hermes-agent" fetch --depth 1 origin "$HERMES_PINNED_COMMIT"
+          git -C "$RUNNER_TEMP/hermes-agent" fetch --depth 1 origin "$HERMES_REQUIRED_COMMIT"
           git -C "$RUNNER_TEMP/hermes-agent" checkout --detach FETCH_HEAD
-      - run: HERMES_REPO="$RUNNER_TEMP/hermes-agent" HERMES_EXPECTED_COMMIT="$HERMES_PINNED_COMMIT" MOONBITE_TEST_HOME="$RUNNER_TEMP/hermes-home" ./scripts/test-hermes-contract.sh
-      - run: HERMES_REPO="$RUNNER_TEMP/hermes-agent" HERMES_EXPECTED_COMMIT="$HERMES_PINNED_COMMIT" MOONBITE_TEST_HOME="$RUNNER_TEMP/clean-install-home" ./scripts/test-clean-install.sh
-      - run: HERMES_REPO="$RUNNER_TEMP/hermes-agent" HERMES_EXPECTED_COMMIT="$HERMES_PINNED_COMMIT" ./scripts/test-clean-wheel.sh
+      - run: HERMES_REPO="$RUNNER_TEMP/hermes-agent" HERMES_EXPECTED_COMMIT="$HERMES_REQUIRED_COMMIT" MOONBITE_TEST_HOME="$RUNNER_TEMP/hermes-home" ./scripts/test-hermes-contract.sh
+      - run: HERMES_REPO="$RUNNER_TEMP/hermes-agent" HERMES_EXPECTED_COMMIT="$HERMES_REQUIRED_COMMIT" MOONBITE_TEST_HOME="$RUNNER_TEMP/clean-install-home" ./scripts/test-clean-install.sh
+      - run: HERMES_REPO="$RUNNER_TEMP/hermes-agent" HERMES_EXPECTED_COMMIT="$HERMES_REQUIRED_COMMIT" ./scripts/test-clean-wheel.sh
 
-  hermes-pinned-macos:
+  hermes-current-macos:
     runs-on: macos-latest
     env:
-      HERMES_PINNED_COMMIT: 987064caa4f8845f605ac7346fed5b72fddfb21c
+      HERMES_REQUIRED_COMMIT: 29112bef099274229cadff79cdff7bf7b99c4b77
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
@@ -75,10 +84,10 @@ jobs:
       - run: |
           git init "$RUNNER_TEMP/hermes-agent"
           git -C "$RUNNER_TEMP/hermes-agent" remote add origin https://github.com/NousResearch/hermes-agent.git
-          git -C "$RUNNER_TEMP/hermes-agent" fetch --depth 1 origin "$HERMES_PINNED_COMMIT"
+          git -C "$RUNNER_TEMP/hermes-agent" fetch --depth 1 origin "$HERMES_REQUIRED_COMMIT"
           git -C "$RUNNER_TEMP/hermes-agent" checkout --detach FETCH_HEAD
-      - run: HERMES_REPO="$RUNNER_TEMP/hermes-agent" HERMES_EXPECTED_COMMIT="$HERMES_PINNED_COMMIT" MOONBITE_TEST_HOME="$RUNNER_TEMP/clean-install-home" ./scripts/test-clean-install.sh
-      - run: HERMES_REPO="$RUNNER_TEMP/hermes-agent" HERMES_EXPECTED_COMMIT="$HERMES_PINNED_COMMIT" ./scripts/test-clean-wheel.sh
+      - run: HERMES_REPO="$RUNNER_TEMP/hermes-agent" HERMES_EXPECTED_COMMIT="$HERMES_REQUIRED_COMMIT" MOONBITE_TEST_HOME="$RUNNER_TEMP/clean-install-home" ./scripts/test-clean-install.sh
+      - run: HERMES_REPO="$RUNNER_TEMP/hermes-agent" HERMES_EXPECTED_COMMIT="$HERMES_REQUIRED_COMMIT" ./scripts/test-clean-wheel.sh
 
   hermes-latest-drift:
     if: github.event_name == 'schedule'

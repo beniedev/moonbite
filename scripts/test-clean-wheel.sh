@@ -7,7 +7,8 @@ expected_hermes="${HERMES_EXPECTED_COMMIT:-}"
 uv_bin="${UV_BIN:-$(command -v uv || true)}"
 python_bin="${PYTHON_BIN:-python3}"
 
-if [[ -z "$uv_bin" || ! -d "$hermes_repo/.git" ]]; then
+if [[ -z "$uv_bin" ]] \
+  || ! git -C "$hermes_repo" rev-parse --git-dir >/dev/null 2>&1; then
   echo "uv and an isolated HERMES_REPO checkout are required" >&2
   exit 2
 fi

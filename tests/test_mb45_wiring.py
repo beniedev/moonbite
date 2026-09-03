@@ -34,7 +34,11 @@ from moonbite_plugin.session import (
     SessionContext,
     SessionLifecycleError,
     SessionLifecycleStore,
+    SessionTurnTerminalReceipt,
 )
+
+
+NOW = datetime(2026, 9, 1, 19, 0, tzinfo=UTC)
 
 
 class RecordingLocks:
@@ -254,6 +258,64 @@ def test_concrete_conversation_bridge_must_use_injected_session_and_effect_owner
 
 
 def test_caller_active_chat_cannot_lower_durable_active_chat_gate(tmp_path):
+    class PrivateTurnBridge:
+        @staticmethod
+        def snapshots():
+            return [SimpleNamespace(active_chat=True, last_private_at=NOW)]
+
+    runtime = MoonbiteRuntime(
+        {
+            "modules": {"heartbeat": True, "autonomy": True},
+            "heartbeat": {
+                "kinds": {
+                    "fixture": {
+                        "enabled": True,
+                        "profile": "routine",
+                        "judge": "required",
+                        "host_only": False,
+                        "bypass": [],
+                    }
+                }
+            },
+        },
+        root=tmp_path,
+        autonomy_judge=AllowAutonomyJudge(),
+        conversation_bridge=PrivateTurnBridge(),
+    )
+
+    heartbeat = runtime.run_heartbeat(
+        "fixture", context={"source_event_id": "event-active", "active_chat": False}
+    )
+    autonomy = runtime.run_autonomy(facts={"active_chat": False, "chat_active": False})
+
+    assert heartbeat.reason == "active_chat"
+    assert autonomy.reason == "active_chat"
+
+
+def test_internal_open_turn_without_private_input_is_not_chat_presence(tmp_path):
+    class InternalTurnBridge:
+        @staticmethod
+        def snapshots():
+            return [SimpleNamespace(active_chat=True, last_private_at=None)]
+
+    runtime = MoonbiteRuntime(
+        {"modules": {"autonomy": True}},
+        root=tmp_path,
+        conversation_bridge=InternalTurnBridge(),
+    )
+
+    result = runtime.run_autonomy(
+        facts={
+            "active_chat": False,
+            "source_event_id": "internal-turn-source",
+            "epoch_id": "internal-turn-epoch",
+        }
+    )
+
+    assert (result.status, result.reason) == ("skipped", "no_eligible_provider")
+
+
+def test_caller_active_chat_cannot_be_lowered_by_idle_durable_bridge(tmp_path):
     runtime = MoonbiteRuntime(
         {
             "modules": {"heartbeat": True, "autonomy": True},
@@ -272,15 +334,12 @@ def test_caller_active_chat_cannot_lower_durable_active_chat_gate(tmp_path):
         root=tmp_path,
         autonomy_judge=AllowAutonomyJudge(),
     )
-    runtime.record_session_hook("on_session_start", {"session_id": "active"})
-    runtime.record_session_hook(
-        "pre_llm_call", {"session_id": "active", "turn_id": "turn-active"}
-    )
 
     heartbeat = runtime.run_heartbeat(
-        "fixture", context={"source_event_id": "event-active", "active_chat": False}
+        "fixture",
+        context={"source_event_id": "event-host-active", "active_chat": True},
     )
-    autonomy = runtime.run_autonomy(facts={"active_chat": False, "chat_active": False})
+    autonomy = runtime.run_autonomy(facts={"active_chat": True, "chat_active": True})
 
     assert heartbeat.reason == "active_chat"
     assert autonomy.reason == "active_chat"
@@ -515,13 +574,24 @@ def test_registered_session_hooks_are_ordered_and_default_source_isolation(tmp_p
         model="fixture",
         platform="cli",
     )
+    context.hooks["on_session_end"](
+        session_id="session-fixture",
+        task_id="task-fixture",
+        turn_id="turn-fixture",
+        completed=True,
+        failed=False,
+        interrupted=False,
+        turn_exit_reason="text_response(stop)",
+        model="fixture",
+        platform="cli",
+    )
     context.hooks["on_session_finalize"](
         session_id="session-fixture", platform="cli", reason="fixture"
     )
 
     snapshot = components.session.snapshot("session-fixture")
     assert snapshot is not None
-    assert snapshot.hooks == HOOK_ORDER[1:]
+    assert snapshot.hooks == HOOK_ORDER[1:-1]
     assert snapshot.private_contact_count == 0
     assert not components.panel.path.exists()
     assert "private body" not in components.session.ledger.path.read_text(
@@ -559,7 +629,7 @@ def test_plugin_session_expired_finalize_closes_open_turn(tmp_path, reason, comp
     ] == ([] if complete else ["host_session_finalized"])
 
 
-def test_plugin_shutdown_finalize_is_noop_and_successor_pre_repairs_old_turn(tmp_path):
+def test_plugin_shutdown_closes_only_open_turn_and_session_remains_reusable(tmp_path):
     components, _locks, _bus = injected_bundle(tmp_path / "host")
     context = RecordingContext()
     register(context, components=components)
@@ -583,7 +653,481 @@ def test_plugin_shutdown_finalize_is_noop_and_successor_pre_repairs_old_turn(tmp
         row["reason"]
         for row in components.session.ledger.rows()
         if row["kind"] == "turn_terminal"
-    ] == ["superseded_by_new_pre"]
+    ] == ["host_shutdown"]
+
+
+@pytest.mark.parametrize(
+    ("flags", "expected_reason"),
+    (
+        ((False, True, False), "host_turn_failed"),
+        ((False, False, True), "host_turn_interrupted"),
+        ((True, False, False), "host_turn_completed"),
+    ),
+)
+def test_plugin_on_session_end_closes_turn_without_fake_post(
+    tmp_path, flags, expected_reason
+):
+    components, _locks, _bus = injected_bundle(tmp_path / "host")
+    context = RecordingContext()
+    register(context, components=components)
+    completed, failed, interrupted = flags
+
+    context.hooks["on_session_start"](session_id="session-fixture")
+    context.hooks["pre_llm_call"](
+        session_id="session-fixture", task_id="task-fixture", turn_id="turn-fixture"
+    )
+    context.hooks["on_session_end"](
+        session_id="session-fixture",
+        task_id="task-fixture",
+        turn_id="turn-fixture",
+        completed=completed,
+        failed=failed,
+        interrupted=interrupted,
+        turn_exit_reason="contract-exit",
+        model="fixture",
+        platform="cli",
+    )
+
+    snapshot = components.session.snapshot("session-fixture")
+    assert snapshot.open_turn_id is None
+    assert snapshot.settled_turn_ids == ()
+    assert snapshot.abandoned_turn_ids == ("turn-fixture",)
+    assert snapshot.hooks[-1] == "on_session_end"
+    assert [
+        row["reason"]
+        for row in components.session.ledger.rows()
+        if row["kind"] == "turn_terminal"
+    ] == [expected_reason]
+
+
+@pytest.mark.parametrize(
+    "payload",
+    (
+        {
+            "session_id": "session-fixture",
+            "task_id": "",
+            "turn_id": "",
+            "api_request_id": "",
+            "completed": False,
+            "interrupted": True,
+            "reason": "keyboard_interrupt",
+            "platform": "cli",
+        },
+        {
+            "session_id": "session-fixture",
+            "completed": False,
+            "interrupted": True,
+            "reason": "shutdown",
+            "platform": "cli",
+        },
+        {
+            "session_id": "session-fixture",
+            "completed": False,
+            "interrupted": True,
+            "platform": "tui",
+        },
+    ),
+)
+def test_plugin_identifier_poor_session_end_closes_durable_open_turn_once(
+    tmp_path, payload
+):
+    components, _locks, _bus = injected_bundle(tmp_path / "host")
+    context = RecordingContext()
+    runtime = register(context, components=components)
+
+    context.hooks["on_session_start"](session_id="session-fixture")
+    context.hooks["pre_llm_call"](session_id="session-fixture", turn_id="durable-turn")
+    context.hooks["on_session_end"](**payload)
+    context.hooks["on_session_end"](**payload)
+
+    snapshot = components.session.snapshot("session-fixture")
+    terminal_rows = [
+        row
+        for row in components.session.ledger.rows()
+        if row["kind"] == "turn_terminal"
+    ]
+    hook_rows = [
+        row for row in components.session.ledger.rows() if row["kind"] == "hook"
+    ]
+    assert snapshot is not None
+    assert snapshot.open_turn_id is None
+    assert snapshot.finalized is False
+    assert snapshot.abandoned_turn_ids == ("durable-turn",)
+    assert len(terminal_rows) == 1
+    assert terminal_rows[0]["turn_id"] == "durable-turn"
+    assert terminal_rows[0]["reason"] == "host_shutdown"
+    assert "on_session_end" not in [row["hook"] for row in hook_rows]
+    assert runtime.last_session_hook_error is None
+
+    context.hooks["on_session_finalize"](
+        session_id="session-fixture", reason="shutdown"
+    )
+    assert (
+        len(
+            [
+                row
+                for row in components.session.ledger.rows()
+                if row["kind"] == "turn_terminal"
+            ]
+        )
+        == 1
+    )
+
+
+def test_identifier_poor_session_end_does_not_guess_another_lifecycle(tmp_path):
+    components, _locks, _bus = injected_bundle(tmp_path / "host")
+    context = RecordingContext()
+    runtime = register(context, components=components)
+
+    context.hooks["on_session_start"](session_id="known-session")
+    context.hooks["pre_llm_call"](session_id="known-session", turn_id="durable-turn")
+    context.hooks["on_session_end"](
+        session_id="unknown-session",
+        completed=False,
+        interrupted=True,
+        platform="tui",
+    )
+
+    snapshot = components.session.snapshot("known-session")
+    assert snapshot is not None
+    assert snapshot.open_turn_id == "durable-turn"
+    assert not [
+        row
+        for row in components.session.ledger.rows()
+        if row["kind"] == "turn_terminal"
+    ]
+    assert runtime.last_session_hook_error == {
+        "hook": "on_session_end",
+        "error": "SessionHookMappingError",
+    }
+
+
+def test_identifier_poor_session_end_uses_injected_lifecycle_mapping(tmp_path):
+    def resolver(hook, kwargs, supported_hooks):
+        return SessionContext(
+            session_id="canonical-session",
+            lifecycle_id="canonical-lifecycle",
+            source_id=kwargs.get("task_id") or f"{hook}:canonical",
+            turn_id=kwargs.get("turn_id") or None,
+            source_kind="session_start" if hook == "on_session_start" else "system",
+            observed_at=NOW,
+            fresh=False,
+            supported_hooks=frozenset(supported_hooks),
+        )
+
+    components, _locks, _bus = injected_bundle(tmp_path / "host")
+    runtime = MoonbiteRuntime(
+        {},
+        components=components,
+        session_context_resolver=resolver,
+    )
+    runtime.record_session_hook("pre_gateway_dispatch", {"session_id": "host-session"})
+    runtime.record_session_hook("on_session_start", {"session_id": "host-session"})
+    runtime.record_session_hook(
+        "pre_llm_call",
+        {
+            "session_id": "host-session",
+            "task_id": "host-task",
+            "turn_id": "durable-turn",
+        },
+    )
+
+    receipt = runtime.record_hermes_turn_end(
+        {
+            "session_id": "host-session",
+            "completed": False,
+            "interrupted": True,
+            "platform": "tui",
+        }
+    )
+
+    snapshot = components.session.snapshot("canonical-lifecycle")
+    assert receipt is not None
+    assert receipt.turn_id == "durable-turn"
+    assert receipt.reason == "host_shutdown"
+    assert snapshot is not None
+    assert snapshot.open_turn_id is None
+    assert snapshot.finalized is False
+    assert runtime.last_session_hook_error is None
+
+
+def test_turn_end_releases_durable_active_chat_gate(tmp_path):
+    def resolver(hook, kwargs, supported_hooks):
+        return SessionContext(
+            session_id="session-fixture",
+            lifecycle_id="session-fixture",
+            source_id=kwargs.get("task_id") or f"{hook}:fixture",
+            turn_id=kwargs.get("turn_id"),
+            source_kind=(
+                "private_inbound"
+                if hook == "pre_gateway_dispatch"
+                else "session_start"
+                if hook == "on_session_start"
+                else "assistant_response"
+                if hook == "post_llm_call"
+                else "system"
+            ),
+            observed_at=datetime(2026, 9, 1, 19, 0, tzinfo=UTC),
+            fresh=hook == "pre_gateway_dispatch",
+            supported_hooks=frozenset(supported_hooks),
+        )
+
+    runtime = MoonbiteRuntime({}, root=tmp_path, session_context_resolver=resolver)
+    runtime.record_session_hook(
+        "pre_gateway_dispatch", {"event": SimpleNamespace(internal=False)}
+    )
+    runtime.record_session_hook("on_session_start", {"session_id": "session-fixture"})
+    runtime.record_session_hook(
+        "pre_llm_call",
+        {
+            "session_id": "session-fixture",
+            "task_id": "task-fixture",
+            "turn_id": "turn-fixture",
+        },
+    )
+    assert runtime.conversation_bridge.snapshots()[0].active_chat is True
+
+    runtime.record_hermes_turn_end(
+        {
+            "session_id": "session-fixture",
+            "task_id": "task-fixture",
+            "turn_id": "turn-fixture",
+            "completed": False,
+            "failed": True,
+            "interrupted": False,
+            "turn_exit_reason": "provider_error",
+        }
+    )
+
+    snapshot = runtime.conversation_bridge.snapshots()[0]
+    assert snapshot.open_turn_id is None
+    assert snapshot.active_chat is False
+
+
+@pytest.mark.parametrize("with_post", (False, True))
+def test_compression_session_rotation_correlates_terminal_to_original_turn(
+    tmp_path, with_post
+):
+    runtime = MoonbiteRuntime({}, root=tmp_path)
+    runtime.record_session_hook("on_session_start", {"session_id": "session-old"})
+    runtime.record_session_hook(
+        "pre_llm_call",
+        {
+            "session_id": "session-old",
+            "task_id": "task-fixture",
+            "turn_id": "turn-fixture",
+        },
+    )
+    if with_post:
+        runtime.record_session_hook(
+            "post_llm_call",
+            {
+                "session_id": "session-new",
+                "task_id": "task-fixture",
+                "turn_id": "turn-fixture",
+            },
+            settled=True,
+        )
+    runtime.record_hermes_turn_end(
+        {
+            "session_id": "session-new",
+            "task_id": "task-fixture",
+            "turn_id": "turn-fixture",
+            "completed": with_post,
+            "failed": not with_post,
+            "interrupted": False,
+            "turn_exit_reason": (
+                "text_response(stop)" if with_post else "compression_failure"
+            ),
+        }
+    )
+
+    original = runtime.session.snapshot("session-old")
+    assert runtime.session.snapshot("session-new") is None
+    assert original.open_turn_id is None
+    assert original.settled_turn_ids == (("turn-fixture",) if with_post else ())
+    assert original.abandoned_turn_ids == (() if with_post else ("turn-fixture",))
+    assert original.hooks[-1] == "on_session_end"
+
+    runtime.record_session_hook(
+        "pre_llm_call",
+        {
+            "session_id": "session-new",
+            "task_id": "task-next",
+            "turn_id": "turn-next",
+        },
+    )
+    runtime.record_hermes_turn_end(
+        {
+            "session_id": "session-new",
+            "task_id": "task-next",
+            "turn_id": "turn-next",
+            "completed": False,
+            "failed": True,
+            "interrupted": False,
+            "turn_exit_reason": "provider_error",
+        }
+    )
+    rotated = runtime.session.snapshot("session-new")
+    assert "on_session_start" not in rotated.supported_hooks
+    assert rotated.open_turn_id is None
+    assert rotated.abandoned_turn_ids == ("turn-next",)
+
+
+def test_upgraded_host_closes_and_reuses_legacy_five_hook_lifecycle(tmp_path):
+    components, _locks, _bus = injected_bundle(tmp_path / "host")
+    legacy_hooks = frozenset(
+        {
+            "pre_gateway_dispatch",
+            "on_session_start",
+            "pre_llm_call",
+            "post_llm_call",
+            "on_session_finalize",
+        }
+    )
+
+    def legacy_context(hook, turn_id=None):
+        return SessionContext(
+            session_id="legacy-session",
+            lifecycle_id="legacy-session",
+            source_id=turn_id or "legacy-session",
+            turn_id=turn_id,
+            source_kind="session_start" if hook == "on_session_start" else "system",
+            observed_at=datetime(2026, 9, 1, 19, 0, tzinfo=UTC),
+            fresh=hook == "on_session_start",
+            supported_hooks=legacy_hooks,
+        )
+
+    components.session.record_hook(
+        legacy_context("pre_gateway_dispatch"), "pre_gateway_dispatch"
+    )
+    components.session.record_hook(
+        legacy_context("on_session_start"), "on_session_start"
+    )
+    components.session.record_hook(
+        legacy_context("pre_llm_call", "legacy-turn"), "pre_llm_call"
+    )
+    runtime = MoonbiteRuntime({}, components=components)
+
+    terminal = runtime.record_hermes_turn_end(
+        {
+            "session_id": "legacy-session",
+            "task_id": "legacy-task",
+            "turn_id": "legacy-turn",
+            "completed": False,
+            "failed": True,
+            "interrupted": False,
+            "turn_exit_reason": "provider_error",
+        }
+    )
+
+    assert isinstance(terminal, SessionTurnTerminalReceipt)
+    snapshot = components.session.snapshot("legacy-session")
+    assert snapshot.open_turn_id is None
+    assert snapshot.abandoned_turn_ids == ("legacy-turn",)
+    assert "on_session_end" not in snapshot.hooks
+
+    runtime.record_session_hook(
+        "pre_llm_call",
+        {
+            "session_id": "legacy-session",
+            "task_id": "legacy-task-next",
+            "turn_id": "legacy-turn-next",
+        },
+    )
+    assert components.session.snapshot("legacy-session").open_turn_id == (
+        "legacy-turn-next"
+    )
+
+
+@pytest.mark.parametrize(
+    "legacy_hooks",
+    (
+        frozenset(
+            {
+                "pre_gateway_dispatch",
+                "on_session_start",
+                "pre_llm_call",
+                "post_llm_call",
+                "on_session_finalize",
+            }
+        ),
+        frozenset(
+            {
+                "on_session_start",
+                "pre_llm_call",
+                "post_llm_call",
+                "on_session_finalize",
+            }
+        ),
+    ),
+)
+@pytest.mark.parametrize("reason", ("session_expired", "new_session"))
+@pytest.mark.parametrize("with_post", (False, True))
+def test_upgraded_host_finalizes_legacy_lifecycle_with_current_hooks(
+    tmp_path, legacy_hooks, reason, with_post
+):
+    components, _locks, _bus = injected_bundle(tmp_path / "host")
+
+    def legacy_context(hook, source_id, turn_id=None):
+        source_kind = {
+            "pre_gateway_dispatch": "private_inbound",
+            "on_session_start": "session_start",
+            "post_llm_call": "assistant_response",
+        }.get(hook, "system")
+        return SessionContext(
+            session_id="legacy-session",
+            lifecycle_id="legacy-session",
+            source_id=source_id,
+            turn_id=turn_id,
+            source_kind=source_kind,
+            observed_at=datetime(2026, 9, 1, 19, 0, tzinfo=UTC),
+            fresh=hook in {"pre_gateway_dispatch", "on_session_start"},
+            supported_hooks=legacy_hooks,
+        )
+
+    if "pre_gateway_dispatch" in legacy_hooks:
+        components.session.record_hook(
+            legacy_context("pre_gateway_dispatch", "legacy-gateway"),
+            "pre_gateway_dispatch",
+        )
+    components.session.record_hook(
+        legacy_context("on_session_start", "legacy-session"),
+        "on_session_start",
+    )
+    components.session.record_hook(
+        legacy_context("pre_llm_call", "legacy-turn", "legacy-turn"),
+        "pre_llm_call",
+    )
+    if with_post:
+        components.session.record_hook(
+            legacy_context("post_llm_call", "legacy-turn", "legacy-turn"),
+            "post_llm_call",
+            settled=True,
+        )
+
+    runtime = MoonbiteRuntime({}, components=components)
+    runtime.record_hermes_session_finalize(
+        {
+            "session_id": "legacy-session",
+            "reason": reason,
+            "old_session_id": "legacy-session",
+            "new_session_id": "new-session" if reason == "new_session" else None,
+        }
+    )
+
+    snapshot = components.session.snapshot("legacy-session")
+    assert snapshot is not None
+    assert snapshot.finalized is True
+    assert snapshot.supported_hooks == legacy_hooks
+    assert snapshot.open_turn_id is None
+    assert snapshot.settled_turn_ids == (("legacy-turn",) if with_post else ())
+    assert snapshot.abandoned_turn_ids == (() if with_post else ("legacy-turn",))
+    assert [
+        row["reason"]
+        for row in components.session.ledger.rows()
+        if row["kind"] == "turn_terminal"
+    ] == ([] if with_post else ["host_session_finalized"])
 
 
 def test_plugin_new_session_finalize_closes_old_session_only(tmp_path):
@@ -621,7 +1165,7 @@ def test_plugin_new_session_finalize_closes_old_session_only(tmp_path):
     assert new_snapshot.abandoned_turn_ids == ()
 
 
-@pytest.mark.parametrize("reason", (None, "other", ["shutdown"]))
+@pytest.mark.parametrize("reason", (None, "other"))
 def test_plugin_non_definitive_hermes_finalize_keeps_bare_fail_closed_behavior(
     tmp_path, reason
 ):
@@ -641,19 +1185,7 @@ def test_plugin_non_definitive_hermes_finalize_keeps_bare_fail_closed_behavior(
     assert all(row["kind"] != "turn_terminal" for row in rows)
 
 
-@pytest.mark.parametrize(
-    ("reason", "extra"),
-    (
-        ("session_expired", {}),
-        (
-            "new_session",
-            {"old_session_id": "session-fixture", "new_session_id": "session-new"},
-        ),
-    ),
-)
-def test_definitive_finalize_falls_back_for_legacy_session_owner(
-    tmp_path, reason, extra
-):
+def test_runtime_requires_canonical_terminal_capabilities(tmp_path):
     components, _locks, _bus = injected_bundle(tmp_path / "host")
     underlying_session = components.session
     legacy_session = SimpleNamespace(
@@ -661,20 +1193,11 @@ def test_definitive_finalize_falls_back_for_legacy_session_owner(
         snapshot=underlying_session.snapshot,
         replay=underlying_session.replay,
     )
-    components = replace(components, session=legacy_session)
-    context = RecordingContext()
-    register(context, components=components)
-
-    context.hooks["on_session_start"](session_id="session-fixture")
-    context.hooks["pre_llm_call"](session_id="session-fixture", turn_id="turn-fixture")
-    with pytest.raises(SessionLifecycleError, match="settled"):
-        context.hooks["on_session_finalize"](
-            session_id="session-fixture", reason=reason, **extra
-        )
+    with pytest.raises(RuntimeComponentsError, match="record_host_turn_end"):
+        replace(components, session=legacy_session)
 
     rows = underlying_session.ledger.rows()
-    assert len(rows) == 2
-    assert all(row["kind"] != "turn_terminal" for row in rows)
+    assert rows == []
 
 
 def test_resolver_can_supply_authorized_private_gateway_context(tmp_path):

@@ -14,7 +14,7 @@ from .panel import PanelStore
 from .runtime_core import EventBus, FileRuntimeLocks, RuntimeLocks, ensure_bounded_text
 from .session import SessionLifecycleStore
 
-RUNTIME_COMPONENTS_SCHEMA = "moon.runtime_components.v2"
+RUNTIME_COMPONENTS_SCHEMA = "moon.runtime_components.v3"
 REQUIRED_STATE_DOMAINS = frozenset(
     {
         "event",
@@ -32,7 +32,15 @@ REQUIRED_STATE_DOMAINS = frozenset(
 RESERVED_STATE_DOMAINS = frozenset()
 MAX_OWNER_ID_BYTES = 256
 STANDALONE_OWNER_ID = "moonbite-standalone"
-SESSION_OWNER_METHODS = ("record_hook", "snapshot", "replay")
+SESSION_OWNER_METHODS = (
+    "record_hook",
+    "record_host_turn_end",
+    "record_host_child_stop",
+    "record_host_shutdown",
+    "record_host_finalize",
+    "snapshot",
+    "replay",
+)
 EFFECT_OWNER_METHODS = (
     "begin_intent",
     "mark_pending",

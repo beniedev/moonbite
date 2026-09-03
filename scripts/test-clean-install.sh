@@ -11,7 +11,8 @@ if [[ -z "$uv_bin" ]]; then
   echo "uv is required; set UV_BIN to its absolute path" >&2
   exit 2
 fi
-if [[ ! -d "$hermes_repo/.git" || ! -d "$source_repo/.git" ]]; then
+if ! git -C "$hermes_repo" rev-parse --git-dir >/dev/null 2>&1 \
+  || ! git -C "$source_repo" rev-parse --git-dir >/dev/null 2>&1; then
   echo "HERMES_REPO and MOONBITE_INSTALL_SOURCE must be Git checkouts" >&2
   exit 2
 fi
@@ -174,4 +175,4 @@ fi
 state_after="$("$python" -c 'import hashlib, sys; print(hashlib.file_digest(open(sys.argv[1], "rb"), "sha256").hexdigest())' "$state_ledger")"
 test "$state_before" = "$state_after"
 
-echo "Clean install lifecycle (approved caution): Hermes $actual_hermes, Moonbite $source_commit, disabled/enabled/disabled, 10 tools, 5 hooks, state preserved"
+echo "Clean install lifecycle (approved caution): Hermes $actual_hermes, Moonbite $source_commit, disabled/enabled/disabled, 10 tools, 7 hooks, state preserved"

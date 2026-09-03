@@ -34,6 +34,18 @@ class SyntheticSession:
     def record_hook(self, *_args, **_kwargs):
         return None
 
+    def record_host_turn_end(self, *_args, **_kwargs):
+        return None
+
+    def record_host_child_stop(self, *_args, **_kwargs):
+        return None
+
+    def record_host_shutdown(self, *_args, **_kwargs):
+        return None
+
+    def record_host_finalize(self, *_args, **_kwargs):
+        return None
+
     def snapshot(self, *_args, **_kwargs):
         return None
 
@@ -139,6 +151,14 @@ def test_standalone_passes_anchor_timezone_to_cadence(tmp_path):
     )
 
 
+def test_previous_runtime_components_schema_is_rejected(tmp_path):
+    values = bundle_kwargs(tmp_path)
+    values["schema_version"] = "moon.runtime_components.v2"
+
+    with pytest.raises(RuntimeComponentsError, match="unsupported runtime components"):
+        RuntimeComponents(**values)
+
+
 def test_injected_preserves_supplied_identities_without_creating_state_root(tmp_path):
     root = tmp_path / "host-state"
     values = bundle_kwargs(tmp_path)
@@ -180,6 +200,25 @@ def test_effect_owner_requires_public_read_ports(tmp_path, method):
     effects = SyntheticEffects()
     setattr(effects, method, None)
     values["effects"] = effects
+
+    with pytest.raises(RuntimeComponentsError, match=method):
+        RuntimeComponents(**values)
+
+
+@pytest.mark.parametrize(
+    "method",
+    [
+        "record_host_turn_end",
+        "record_host_child_stop",
+        "record_host_shutdown",
+        "record_host_finalize",
+    ],
+)
+def test_session_owner_requires_canonical_terminal_ports(tmp_path, method):
+    values = bundle_kwargs(tmp_path)
+    session = SyntheticSession()
+    setattr(session, method, None)
+    values["session"] = session
 
     with pytest.raises(RuntimeComponentsError, match=method):
         RuntimeComponents(**values)

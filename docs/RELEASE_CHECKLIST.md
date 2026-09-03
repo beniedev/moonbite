@@ -18,12 +18,14 @@ This checklist is an authoritative guide for repository owners preparing a publi
   .venv/bin/ruff format --check moonbite_plugin tests scripts/check-hermes-contract.py
   ```
 
-- [ ] **Pinned Hermes Contract Validation:**
-  Verify against official pinned Hermes commit `987064caa4f8845f605ac7346fed5b72fddfb21c`:
+- [ ] **Required Hermes Contract Matrix:**
+  Repeat the contract, clean-wheel, and clean-install checks for both official
+  commits: `fcbd1076a93841fa88855acce810e342a5b78101` (v0.20.5) and
+  `29112bef099274229cadff79cdff7bf7b99c4b77` (v0.21.0):
   ```bash
   HERMES_REPO=/path/to/hermes-agent \
-  HERMES_EXPECTED_COMMIT=987064caa4f8845f605ac7346fed5b72fddfb21c \
-  MOONBITE_TEST_HOME=.hermes-test \
+  HERMES_EXPECTED_COMMIT=<required-hermes-commit> \
+  MOONBITE_TEST_HOME=.hermes-test-<lane> \
   ./scripts/test-hermes-contract.sh
   ```
 
@@ -69,7 +71,7 @@ This checklist is an authoritative guide for repository owners preparing a publi
   Verify package contents, import origin, entry-point discovery, `register`, and opt-in loading in the repository's isolated runner:
   ```bash
   HERMES_REPO=/path/to/isolated/hermes-agent \
-  HERMES_EXPECTED_COMMIT=987064caa4f8845f605ac7346fed5b72fddfb21c \
+  HERMES_EXPECTED_COMMIT=<required-hermes-commit> \
   ./scripts/test-clean-wheel.sh
   ```
 
@@ -78,8 +80,8 @@ This checklist is an authoritative guide for repository owners preparing a publi
   enable, fresh-process surfaces, safe smoke, disable, and state retention:
   ```bash
   HERMES_REPO=/path/to/isolated/hermes-agent \
-  HERMES_EXPECTED_COMMIT=987064caa4f8845f605ac7346fed5b72fddfb21c \
-  MOONBITE_TEST_HOME=/path/to/empty/test-home \
+  HERMES_EXPECTED_COMMIT=<required-hermes-commit> \
+  MOONBITE_TEST_HOME=/path/to/empty/test-home-<lane> \
   ./scripts/test-clean-install.sh
   ```
 
