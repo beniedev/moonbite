@@ -874,13 +874,30 @@ class MoonbiteRuntime:
     ) -> dict[str, Any]:
         return self.bus.emit(kind, source=source, payload=payload).to_dict()
 
+    def _effective_active_chat(
+        self,
+        values: Mapping[str, Any],
+        *keys: str,
+    ) -> Any:
+        """Merge a host gate with the durable bridge without lowering either."""
+
+        provided = False
+        for key in keys:
+            if key not in values:
+                continue
+            value = values[key]
+            if type(value) is not bool:
+                return value
+            provided = provided or value
+        return provided or self._conversation_active_chat()
+
     def run_heartbeat(
         self, kind: str, *, context: Mapping[str, Any] | None = None
     ) -> HeartbeatResult:
         if not self.config["modules"]["heartbeat"]:
             raise RuntimeError("heartbeat module is disabled")
         effective_context = {} if context is None else dict(context)
-        active_chat = self._conversation_active_chat()
+        active_chat = self._effective_active_chat(effective_context, "active_chat")
         effective_context["active_chat"] = active_chat
         return self.heartbeat.run(
             HeartbeatCandidate(kind, effective_context), active_chat=active_chat
@@ -939,7 +956,11 @@ class MoonbiteRuntime:
         if not self.config["modules"]["autonomy"]:
             raise RuntimeError("autonomy module is disabled")
         effective_facts = {} if facts is None else dict(facts)
-        active_chat = self._conversation_active_chat()
+        active_chat = self._effective_active_chat(
+            effective_facts,
+            "active_chat",
+            "chat_active",
+        )
         effective_facts["active_chat"] = active_chat
         effective_facts["chat_active"] = active_chat
         result = self.autonomy.run_once(

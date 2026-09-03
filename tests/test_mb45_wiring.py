@@ -287,6 +287,38 @@ def test_caller_active_chat_cannot_lower_durable_active_chat_gate(tmp_path):
     assert autonomy.reason == "active_chat"
 
 
+def test_caller_active_chat_cannot_be_lowered_by_idle_durable_bridge(tmp_path):
+    runtime = MoonbiteRuntime(
+        {
+            "modules": {"heartbeat": True, "autonomy": True},
+            "heartbeat": {
+                "kinds": {
+                    "fixture": {
+                        "enabled": True,
+                        "profile": "routine",
+                        "judge": "required",
+                        "host_only": False,
+                        "bypass": [],
+                    }
+                }
+            },
+        },
+        root=tmp_path,
+        autonomy_judge=AllowAutonomyJudge(),
+    )
+
+    heartbeat = runtime.run_heartbeat(
+        "fixture",
+        context={"source_event_id": "event-host-active", "active_chat": True},
+    )
+    autonomy = runtime.run_autonomy(
+        facts={"active_chat": True, "chat_active": True}
+    )
+
+    assert heartbeat.reason == "active_chat"
+    assert autonomy.reason == "active_chat"
+
+
 def test_injected_bus_write_failure_propagates_without_local_fallback(
     tmp_path, monkeypatch
 ):
