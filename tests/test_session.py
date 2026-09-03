@@ -233,9 +233,7 @@ def test_legacy_completed_terminal_reason_remains_readable(tmp_path) -> None:
 
     assert replay[0].abandoned_turn_ids == ("turn-1",)
     assert [
-        row["reason"]
-        for row in store.ledger.rows()
-        if row["kind"] == "turn_terminal"
+        row["reason"] for row in store.ledger.rows() if row["kind"] == "turn_terminal"
     ] == ["host_turn_completed_without_post"]
 
 

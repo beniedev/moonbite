@@ -57,7 +57,7 @@ def _hook_reference(value: Any, label: str) -> str:
 
 
 def _optional_hook_reference(value: Any, label: str) -> str | None:
-    if value is None:
+    if value is None or (type(value) is str and not value.strip()):
         return None
     return _hook_reference(value, label)
 
@@ -146,6 +146,49 @@ class HermesHostAdapter:
             )
 
         raise SessionHookMappingError(f"unsupported session hook: {hook!r}")
+
+    def session_end_shutdown_fallback(
+        self,
+        kwargs: Mapping[str, Any],
+        *,
+        supported_hooks: frozenset[str],
+    ) -> SessionContext | None:
+        """Map Hermes' identifier-poor interrupted shutdown fallback.
+
+        CLI and TUI shutdown paths can emit ``on_session_end`` without a
+        usable turn identifier.  This context identifies only the durable
+        lifecycle; the session owner resolves and closes its real open turn.
+        """
+
+        raw_turn_id = kwargs.get("turn_id")
+        if raw_turn_id is not None:
+            if type(raw_turn_id) is not str:
+                raise SessionHookMappingError(
+                    "turn_id must be text for on_session_end mapping"
+                )
+            if raw_turn_id.strip():
+                return None
+
+        completed = kwargs.get("completed")
+        interrupted = kwargs.get("interrupted")
+        failed = kwargs.get("failed")
+        if failed is not None and type(failed) is not bool:
+            raise SessionHookMappingError(
+                "failed must be a bool for on_session_end mapping"
+            )
+        if completed is not False or interrupted is not True or failed is True:
+            return None
+
+        session_id = _hook_reference(kwargs.get("session_id"), "session_id")
+        return SessionContext(
+            session_id=session_id,
+            lifecycle_id=session_id,
+            source_id=session_id,
+            source_kind="system",
+            observed_at=self.clock(),
+            fresh=False,
+            supported_hooks=supported_hooks,
+        )
 
     def turn_terminal(
         self,

@@ -78,6 +78,66 @@ def test_host_adapter_completed_turn_uses_neutral_reason():
 
 
 @pytest.mark.parametrize(
+    "payload",
+    (
+        {
+            "session_id": "contract-session",
+            "task_id": "",
+            "turn_id": "",
+            "api_request_id": "",
+            "completed": False,
+            "interrupted": True,
+            "reason": "keyboard_interrupt",
+            "platform": "cli",
+        },
+        {
+            "session_id": "contract-session",
+            "completed": False,
+            "interrupted": True,
+            "reason": "shutdown",
+            "platform": "cli",
+        },
+        {
+            "session_id": "contract-session",
+            "completed": False,
+            "interrupted": True,
+            "platform": "tui",
+        },
+    ),
+)
+def test_host_adapter_maps_identifier_poor_shutdown_fallback(payload):
+    adapter = HermesHostAdapter()
+
+    context = adapter.session_end_shutdown_fallback(
+        payload,
+        supported_hooks=frozenset(HOOK_ORDER),
+    )
+
+    assert context is not None
+    assert context.session_id == "contract-session"
+    assert context.lifecycle_id == "contract-session"
+    assert context.source_id == "contract-session"
+    assert context.turn_id is None
+    with pytest.raises(ValueError, match="turn_id is required"):
+        adapter.turn_terminal(
+            payload,
+            supported_hooks=frozenset(HOOK_ORDER),
+        )
+
+
+def test_host_adapter_does_not_treat_exact_turn_end_as_shutdown_fallback():
+    adapter = HermesHostAdapter()
+
+    assert (
+        adapter.session_end_shutdown_fallback(
+            HERMES_TURN_END_PAYLOAD,
+            supported_hooks=frozenset(HOOK_ORDER),
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize(
     ("status", "reason"),
     (
         ("interrupted", "host_turn_interrupted"),

@@ -415,6 +415,48 @@ class MoonbiteRuntime:
         hook = "on_session_end"
         payload = {} if kwargs is None else kwargs
         try:
+            fallback_context = self.hermes_host_adapter.session_end_shutdown_fallback(
+                payload,
+                supported_hooks=DEFAULT_SESSION_HOOKS,
+            )
+            if fallback_context is not None:
+                if self.session_context_resolver is not None:
+                    fallback_context = self.session_context_resolver(
+                        hook,
+                        payload,
+                        SUPPORTED_SESSION_HOOKS,
+                    )
+                    if fallback_context is None:
+                        raise SessionHookMappingError(
+                            "session_context_resolver did not map the on_session_end shutdown fallback"
+                        )
+                    if not isinstance(fallback_context, SessionContext):
+                        raise SessionHookMappingError(
+                            "session_context_resolver must return SessionContext or None"
+                        )
+                snapshots = self.session.replay()
+                fallback_context = self.hermes_host_adapter.correlate_lifecycle(
+                    fallback_context,
+                    snapshots,
+                )
+                if not any(
+                    snapshot.lifecycle_id == fallback_context.lifecycle_id
+                    for snapshot in snapshots
+                ):
+                    raise SessionHookMappingError(
+                        "on_session_end shutdown fallback did not match a durable lifecycle"
+                    )
+                record_host_shutdown = getattr(
+                    self.session, "record_host_shutdown", None
+                )
+                if not callable(record_host_shutdown):
+                    raise RuntimeComponentsError(
+                        "session owner is missing record_host_shutdown"
+                    )
+                receipt = record_host_shutdown(fallback_context)
+                self._last_session_hook_error = None
+                return receipt
+
             context = self._resolve_session_context(hook, payload)
             if context is None:
                 return None
