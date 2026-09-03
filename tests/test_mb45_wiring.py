@@ -255,6 +255,11 @@ def test_concrete_conversation_bridge_must_use_injected_session_and_effect_owner
 
 
 def test_caller_active_chat_cannot_lower_durable_active_chat_gate(tmp_path):
+    class PrivateTurnBridge:
+        @staticmethod
+        def snapshots():
+            return [SimpleNamespace(active_chat=True, last_private_at=NOW)]
+
     runtime = MoonbiteRuntime(
         {
             "modules": {"heartbeat": True, "autonomy": True},
@@ -272,10 +277,7 @@ def test_caller_active_chat_cannot_lower_durable_active_chat_gate(tmp_path):
         },
         root=tmp_path,
         autonomy_judge=AllowAutonomyJudge(),
-    )
-    runtime.record_session_hook("on_session_start", {"session_id": "active"})
-    runtime.record_session_hook(
-        "pre_llm_call", {"session_id": "active", "turn_id": "turn-active"}
+        conversation_bridge=PrivateTurnBridge(),
     )
 
     heartbeat = runtime.run_heartbeat(
@@ -285,6 +287,29 @@ def test_caller_active_chat_cannot_lower_durable_active_chat_gate(tmp_path):
 
     assert heartbeat.reason == "active_chat"
     assert autonomy.reason == "active_chat"
+
+
+def test_internal_open_turn_without_private_input_is_not_chat_presence(tmp_path):
+    class InternalTurnBridge:
+        @staticmethod
+        def snapshots():
+            return [SimpleNamespace(active_chat=True, last_private_at=None)]
+
+    runtime = MoonbiteRuntime(
+        {"modules": {"autonomy": True}},
+        root=tmp_path,
+        conversation_bridge=InternalTurnBridge(),
+    )
+
+    result = runtime.run_autonomy(
+        facts={
+            "active_chat": False,
+            "source_event_id": "internal-turn-source",
+            "epoch_id": "internal-turn-epoch",
+        }
+    )
+
+    assert (result.status, result.reason) == ("skipped", "no_eligible_provider")
 
 
 def test_caller_active_chat_cannot_be_lowered_by_idle_durable_bridge(tmp_path):

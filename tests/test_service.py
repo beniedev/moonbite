@@ -114,11 +114,17 @@ def record_active_chat(runtime, session_id="session-active"):
 
 
 class ConversationGateStub:
-    def __init__(self, active_chat):
+    def __init__(self, active_chat, last_private_at=NOW):
         self.active_chat = active_chat
+        self.last_private_at = last_private_at
 
     def snapshots(self):
-        return [{"active_chat": self.active_chat}]
+        return [
+            {
+                "active_chat": self.active_chat,
+                "last_private_at": self.last_private_at,
+            }
+        ]
 
 
 def private_exposure_context(

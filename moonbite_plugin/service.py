@@ -903,7 +903,7 @@ class MoonbiteRuntime:
             if type(value) is not bool:
                 return value
             provided = provided or value
-        return provided or self._conversation_active_chat()
+        return provided or self._conversation_private_chat_active()
 
     def run_heartbeat(
         self, kind: str, *, context: Mapping[str, Any] | None = None
@@ -970,7 +970,7 @@ class MoonbiteRuntime:
         if not self.config["modules"]["autonomy"]:
             raise RuntimeError("autonomy module is disabled")
         effective_facts = {} if facts is None else dict(facts)
-        derived_active_chat = self._conversation_active_chat()
+        derived_active_chat = self._conversation_private_chat_active()
         explicit_active_chat = [
             effective_facts[key]
             for key in ("active_chat", "chat_active")
@@ -1031,8 +1031,8 @@ class MoonbiteRuntime:
             raise RuntimeError("autonomy module is disabled")
         return self.autonomy.fail(effect_id, reason)
 
-    def _conversation_active_chat(self) -> bool:
-        """Return the durable conversation gate, failing closed on uncertainty."""
+    def _conversation_chat_active(self, *, require_private: bool) -> bool:
+        """Read the durable chat gate, optionally requiring private input."""
 
         bridge = self.conversation_bridge
         if bridge is None:
@@ -1052,14 +1052,43 @@ class MoonbiteRuntime:
             for snapshot in snapshots:
                 if isinstance(snapshot, Mapping):
                     value = snapshot["active_chat"]
+                    last_private_at = snapshot.get("last_private_at")
                 else:
                     value = getattr(snapshot, "active_chat")
+                    last_private_at = getattr(snapshot, "last_private_at", None)
                 if type(value) is not bool:
                     raise TypeError("conversation bridge active_chat is invalid")
+                if require_private:
+                    if isinstance(snapshot, Mapping):
+                        has_private_field = "last_private_at" in snapshot
+                    else:
+                        has_private_field = hasattr(snapshot, "last_private_at")
+                    if not has_private_field:
+                        raise TypeError(
+                            "conversation bridge last_private_at is unavailable"
+                        )
+                    if last_private_at is not None and not isinstance(
+                        last_private_at, datetime
+                    ):
+                        raise TypeError(
+                            "conversation bridge last_private_at is invalid"
+                        )
+                    if value and last_private_at is None:
+                        continue
                 active_values.append(value)
             return any(active_values)
         except Exception:
             return True
+
+    def _conversation_active_chat(self) -> bool:
+        """Return any durable active turn, failing closed on uncertainty."""
+
+        return self._conversation_chat_active(require_private=False)
+
+    def _conversation_private_chat_active(self) -> bool:
+        """Return only active conversation state backed by private input."""
+
+        return self._conversation_chat_active(require_private=True)
 
     @staticmethod
     def _afterglow_summary(result: ActivityResult) -> str:
