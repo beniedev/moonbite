@@ -79,7 +79,7 @@ def pending_wake(
             },
         )
     )
-    effect_id = cadence.effect_ref(source, "heartbeat_wake")
+    effect_id = cadence.effect_ref(source, "heartbeat_wake", epoch_id=epoch)
     assert effect_id is not None
     record = ledger.get(effect_id)
     assert record is not None

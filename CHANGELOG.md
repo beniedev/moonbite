@@ -12,11 +12,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Session recovery:** `hermes moonbite session status` lists exact open turns, and `session repair` appends an idempotent `abandoned` terminal for the specified current turn without fabricating a successful model response.
 - **HermesHostAdapter:** the public integration boundary now consumes Hermes `on_session_end` and normalizes successful, failed, interrupted, incomplete, session-rotation, and shutdown exits into canonical lifecycle evidence. The pinned Hermes 0.20.5 commit and official v0.21.0 release share the same tested contract.
 - **Subagent terminal fallback:** the seventh manifest hook, `subagent_stop`, uses only child session identity and bounded status to close a non-success one-shot child turn in the existing canonical terminal ledger; completed children remain owned by their own post/end evidence.
+- **Proactive maintenance control:** `proactive` is the canonical group gate for Heartbeat and Autonomy. `background_costly` remains a compatibility input alias backed by the same control state.
+- **Per-activity composition:** host adapters can inject explicit `ActivityProvider` descriptors through the public runtime/registration boundary. Moonbite performs a replayable occurrence-keyed weighted selection, persists it as the effect intent, and remains the single generic control, selection, effect, audit, and afterglow owner.
 
 ### Fixed
 
 - **Orphaned turns:** `on_session_end` now closes a turn whose success-only `post_llm_call` was omitted; a new `pre_llm_call` remains the crash-recovery fallback, preventing the Conversation Gate from remaining permanently active without a TTL.
 - **Compression lifecycle correlation:** if Hermes rotates `session_id` during compression, Moonbite uses the stable `turn_id` and durable lifecycle ledger to attach post/end callbacks to the original turn; ambiguous evidence fails closed.
+- **Canonical proactive terminals:** Heartbeat and Autonomy now persist one occurrence-keyed terminal audit for pre-Judge skips and settled effects. Exact duplicates reuse that terminal before Judge/provider execution, while conflicting source or effect identity fails closed.
+- **Multi-effect Heartbeat settlement:** an occurrence with both delivery and wake effects is terminal only after every sibling effect settles; one early receipt can no longer make the whole occurrence appear complete.
 
 ### Compatibility
 

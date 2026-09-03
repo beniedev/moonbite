@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import shlex
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import date
 from typing import Any
@@ -201,8 +201,8 @@ def _setup_cli(parser: argparse.ArgumentParser) -> None:
     control.add_argument(
         "feature",
         nargs="?",
-        default="background_costly",
-        choices=("heartbeat", "autonomy", "background_costly"),
+        default="proactive",
+        choices=("heartbeat", "autonomy", "proactive", "background_costly"),
     )
     control.add_argument("--source", choices=("operator", "self"), default="operator")
     control.add_argument("--minutes", type=int)
@@ -218,6 +218,8 @@ def _setup_cli(parser: argparse.ArgumentParser) -> None:
 
     autonomy = commands.add_parser("autonomy", help="Run at most one autonomy provider")
     autonomy.add_argument("--facts", default="{}")
+    autonomy.add_argument("--occurrence-id")
+    autonomy.add_argument("--epoch-id")
 
     commands.add_parser("panel", help="Render the fresh daily-RAM projection")
     search = commands.add_parser("memory-search", help="Search cards and diary rows")
@@ -336,7 +338,12 @@ def _cli_handler(
             args.kind, context=_json_object(args.context, "context")
         ).to_dict()
     elif command == "autonomy":
-        result = runtime.run_autonomy(facts=_json_object(args.facts, "facts")).__dict__
+        facts = _json_object(args.facts, "facts")
+        if args.occurrence_id is not None:
+            facts["occurrence_id"] = args.occurrence_id
+        if args.epoch_id is not None:
+            facts["epoch_id"] = args.epoch_id
+        result = runtime.run_autonomy(facts=facts).__dict__
     elif command == "panel":
         result = runtime.get_panel()
     elif command == "memory-search":
@@ -422,9 +429,12 @@ def _slash_handler(raw_args: str, *, runtime: MoonbiteRuntime, raw_config: Any) 
     if parts == ["doctor"]:
         return _json(doctor_report(raw_config, runtime=runtime))
     action = parts[0].replace("-", "_")
+    if action == "status":
+        feature = parts[1] if len(parts) > 1 else "proactive"
+        return _json(runtime.control("status", feature=feature))
     if action not in {"pause", "resume", "quota_save"}:
-        return "Usage: /moon [status|doctor|pause|resume|quota-save] [heartbeat|autonomy|background_costly] [minutes]"
-    feature = parts[1] if len(parts) > 1 else "background_costly"
+        return "Usage: /moon [status|doctor|pause|resume|quota-save] [heartbeat|autonomy|proactive|background_costly] [minutes]"
+    feature = parts[1] if len(parts) > 1 else "proactive"
     minutes = int(parts[2]) if len(parts) > 2 else None
     return _json(
         runtime.control(action, feature=feature, source="operator", minutes=minutes)
@@ -516,7 +526,12 @@ def _register_tools(
                     },
                     "feature": {
                         "type": "string",
-                        "enum": ["heartbeat", "autonomy", "background_costly"],
+                        "enum": [
+                            "heartbeat",
+                            "autonomy",
+                            "proactive",
+                            "background_costly",
+                        ],
                     },
                     "minutes": {"type": "integer", "minimum": 1, "maximum": 1440},
                 },
@@ -524,7 +539,7 @@ def _register_tools(
             ),
             lambda args: runtime.control(
                 args["action"],
-                feature=args.get("feature", "background_costly"),
+                feature=args.get("feature", "proactive"),
                 source="self",
                 minutes=args.get("minutes"),
             ),
@@ -768,6 +783,7 @@ def build_runtime(
     memory_orchestrator: MemoryOrchestrator | None = None,
     source_registry: SourceRegistry | None = None,
     approval_adapter: Any = None,
+    activity_providers: Iterable[ActivityProvider] = (),
 ) -> MoonbiteRuntime:
     """Construct the Moonbite runtime without registering host surfaces."""
     raw_config, selected_pack = _resolve_config_inputs(ctx, raw_config, selected_pack)
@@ -798,6 +814,7 @@ def build_runtime(
         memory_orchestrator=memory_orchestrator,
         source_registry=source_registry,
         approval_adapter=approval_adapter,
+        activity_providers=activity_providers,
         resolution=resolution,
         resolution_raw_config=raw_config,
     )
@@ -940,6 +957,7 @@ def register(
     memory_orchestrator: MemoryOrchestrator | None = None,
     source_registry: SourceRegistry | None = None,
     approval_adapter: Any = None,
+    activity_providers: Iterable[ActivityProvider] = (),
     plan: RegistrationPlan | None = None,
 ) -> MoonbiteRuntime:
     raw_config, selected_pack = _resolve_config_inputs(ctx, _RAW_CONFIG_MISSING)
@@ -958,6 +976,7 @@ def register(
         memory_orchestrator=memory_orchestrator,
         source_registry=source_registry,
         approval_adapter=approval_adapter,
+        activity_providers=activity_providers,
     )
     register_runtime(
         ctx,

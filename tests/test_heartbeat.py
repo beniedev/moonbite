@@ -222,6 +222,39 @@ def test_control_gate_runs_before_judge(tmp_path):
     assert bus.read_audit()[-1].payload["status"] == "skipped"
 
 
+def test_proactive_gate_blocks_urgent_before_any_bypass_or_judge(tmp_path):
+    judge = Judge(JudgeDecision(True, True, "would_run", "hello"))
+    sink = Sink()
+    runtime, controls, bus, _cadence = engine(
+        tmp_path,
+        judge,
+        sink,
+        kind_policies={
+            "location_event": _policy(
+                profile="urgent",
+                host_only=True,
+                bypass=["recent_contact", "active_chat"],
+            )
+        },
+    )
+    controls.put(feature="proactive", mode="pause", source="operator")
+
+    result = runtime.run(
+        HeartbeatCandidate(
+            "location_event",
+            {"events": ["fixture"], "active_chat": True},
+        )
+    )
+
+    assert (result.status, result.reason, judge.calls) == (
+        "skipped",
+        "controlled_by:operator",
+        0,
+    )
+    assert sink.deliveries == sink.wakes == 0
+    assert bus.read_audit()[-1].payload["reason_code"] == "control"
+
+
 def test_judge_error_is_fail_closed_and_audited(tmp_path):
     judge = Judge(error=RuntimeError("fixture"))
     sink = Sink()
@@ -256,6 +289,258 @@ def test_effect_exception_still_produces_terminal_audit(tmp_path):
     assert result.delivery.status == "delivery_error:RuntimeError"
     assert result.wake.ok is True
     assert bus.read_audit()[-1].payload["status"] == "failed"
+
+
+def test_heartbeat_epoch_scopes_effects_and_legacy_terminal_identity(tmp_path):
+    class ReceiptSink:
+        def __init__(self):
+            self.calls = 0
+
+        def wake(self, _candidate, _decision, intent=None):
+            self.calls += 1
+            return EffectReceipt(
+                receipt_id=f"receipt-{self.calls}",
+                event_id=intent.source_event_id,
+                observed_at=NOW,
+                content_sha256=intent.content_sha256,
+                content_length=intent.content_length,
+                epoch_id=intent.epoch_id,
+            )
+
+    sink = ReceiptSink()
+    runtime, _controls, bus, cadence = engine(
+        tmp_path,
+        Judge(JudgeDecision(True, False, "wake")),
+        sink,
+    )
+
+    def candidate(epoch=None):
+        context = {
+            "events": ["event"],
+            "due": True,
+            "source_event_id": "same-source",
+        }
+        if epoch is not None:
+            context["epoch_id"] = epoch
+        return HeartbeatCandidate("care_poke", context, candidate_id="same-source")
+
+    legacy = runtime.run(candidate())
+    cadence.resume()
+    first = runtime.run(candidate("epoch-1"))
+    cadence.resume()
+    second = runtime.run(candidate("epoch-2"))
+    duplicate = runtime.run(candidate("epoch-1"))
+
+    assert [legacy.epoch_id, first.epoch_id, second.epoch_id] == [
+        None,
+        "epoch-1",
+        "epoch-2",
+    ]
+    assert (duplicate.status, duplicate.epoch_id) == ("completed", "epoch-1")
+    assert sink.calls == 3
+    records = runtime.effect_ledger.records()
+    keys = {record.epoch_id: record.idempotency_key for record in records}
+    assert keys["heartbeat"] == "heartbeat:same-source:wake"
+    assert keys["epoch-1"] == "heartbeat:same-source:wake:epoch-1"
+    assert keys["epoch-2"] == "heartbeat:same-source:wake:epoch-2"
+    terminals = [
+        event
+        for event in bus.read_audit()
+        if event.payload.get("occurrence_id") == "same-source"
+        and event.payload.get("terminal") is not None
+    ]
+    assert len(terminals) == 3
+    assert "epoch_id" not in terminals[0].payload
+    assert {event.payload["epoch_id"] for event in terminals[1:]} == {
+        "epoch-1",
+        "epoch-2",
+    }
+
+
+@pytest.mark.parametrize(
+    "blocker,expected_reason",
+    [
+        ("active_chat", "active_chat"),
+        ("control", "controlled_by:operator"),
+        ("recent_contact", "recent_private_inbound"),
+    ],
+)
+def test_heartbeat_no_effect_terminals_keep_epoch_identity(
+    tmp_path, blocker, expected_reason
+):
+    runtime, controls, bus, _cadence = engine(
+        tmp_path,
+        Judge(JudgeDecision(True, False, "would wake")),
+        Sink(),
+    )
+    if blocker == "control":
+        controls.put(feature="heartbeat", mode="pause", source="operator")
+    source = "no-effect-source"
+
+    def candidate(epoch=None):
+        context = {
+            "events": ["event"],
+            "due": True,
+            "source_event_id": source,
+        }
+        if epoch is not None:
+            context["epoch_id"] = epoch
+        if blocker == "active_chat":
+            context["active_chat"] = True
+        elif blocker == "recent_contact":
+            context["recent_private_inbound_at"] = NOW
+        return HeartbeatCandidate("care_poke", context, candidate_id=source)
+
+    legacy = runtime.run(candidate())
+    first = runtime.run(candidate("epoch-1"))
+    second = runtime.run(candidate("epoch-2"))
+    duplicate = runtime.run(candidate("epoch-1"))
+
+    assert [legacy.reason, first.reason, second.reason] == [
+        expected_reason,
+        expected_reason,
+        expected_reason,
+    ]
+    assert [legacy.candidate_id, first.candidate_id, second.candidate_id] == [
+        source,
+        source,
+        source,
+    ]
+    assert [legacy.epoch_id, first.epoch_id, second.epoch_id] == [
+        None,
+        "epoch-1",
+        "epoch-2",
+    ]
+    assert duplicate.status == "skipped"
+    assert duplicate.epoch_id == "epoch-1"
+    assert runtime.effect_ledger.records() == ()
+    terminals = [
+        event
+        for event in bus.read_audit()
+        if event.payload.get("occurrence_id") == source
+        and event.payload.get("terminal") is not None
+    ]
+    assert len(terminals) == 3
+    assert "epoch_id" not in terminals[0].payload
+    assert {event.payload["epoch_id"] for event in terminals[1:]} == {
+        "epoch-1",
+        "epoch-2",
+    }
+
+
+@pytest.mark.parametrize("settlement", ["verified", "intentional_silence", "failed"])
+def test_delegated_settlement_terminal_is_exact_once(tmp_path, settlement):
+    class DelegatedSink:
+        def deliver(self, _candidate, _decision, _intent=None):
+            return EffectResult(True, "queued")
+
+        def wake(self, _candidate, _decision, _intent=None):
+            return EffectResult(True, "queued")
+
+    runtime, _controls, bus, _cadence = engine(
+        tmp_path,
+        Judge(
+            JudgeDecision(
+                True,
+                True,
+                "contact",
+                "hello",
+                delivery_mode="delegated",
+            )
+        ),
+        DelegatedSink(),
+    )
+    candidate = HeartbeatCandidate(
+        "care_poke",
+        {"events": ["event"], "due": True, "source_event_id": "delegated"},
+        candidate_id="delegated",
+    )
+    initial = runtime.run(candidate)
+    effect_id = initial.delivery.effect_id
+    receipt = None
+    if settlement == "verified":
+        record = runtime.effect_ledger.get(effect_id)
+        receipt = EffectReceipt(
+            receipt_id="delegated-receipt",
+            event_id=record.source_event_id,
+            observed_at=NOW,
+            content_sha256=record.content_sha256,
+            content_length=record.content_length,
+            epoch_id=record.epoch_id,
+        )
+    first = runtime.reconcile_heartbeat_delivery(effect_id, settlement, receipt)
+    second = runtime.reconcile_heartbeat_delivery(effect_id, settlement, receipt)
+    assert not [
+        event
+        for event in bus.read_audit()
+        if event.payload.get("occurrence_id") == "delegated"
+        and event.payload.get("terminal") is not None
+    ]
+    wake_id = initial.wake.effect_id
+    wake_record = runtime.effect_ledger.get(wake_id)
+    wake_receipt = EffectReceipt(
+        receipt_id="wake-receipt",
+        event_id=wake_record.source_event_id,
+        observed_at=NOW,
+        content_sha256=wake_record.content_sha256,
+        content_length=wake_record.content_length,
+        epoch_id=wake_record.epoch_id,
+    )
+    runtime.reconcile_heartbeat_wake(wake_id, wake_receipt)
+    runtime.reconcile_heartbeat_wake(wake_id, wake_receipt)
+    terminals = [
+        event
+        for event in bus.read_audit()
+        if event.payload.get("occurrence_id") == "delegated"
+        and event.payload.get("terminal") is not None
+    ]
+
+    assert first.terminal == second.terminal == settlement
+    assert len(terminals) == 1
+    assert terminals[0].payload["terminal"] == settlement
+    assert terminals[0].payload["effect_ids"] == sorted([effect_id, wake_id])
+
+
+def test_multi_effect_failure_wins_over_intentional_silence(tmp_path):
+    class MixedSink:
+        def deliver(self, _candidate, _decision, _intent=None):
+            return EffectResult(True, "queued")
+
+        def wake(self, _candidate, _decision, _intent=None):
+            return EffectResult(False, "rejected")
+
+    runtime, _controls, bus, _cadence = engine(
+        tmp_path,
+        Judge(
+            JudgeDecision(
+                True,
+                True,
+                "contact",
+                "hello",
+                delivery_mode="delegated",
+            )
+        ),
+        MixedSink(),
+    )
+    candidate = HeartbeatCandidate(
+        "care_poke",
+        {"events": ["event"], "due": True, "source_event_id": "mixed"},
+        candidate_id="mixed",
+    )
+
+    initial = runtime.run(candidate)
+    runtime.reconcile_heartbeat_delivery(
+        initial.delivery.effect_id, "intentional_silence"
+    )
+
+    terminals = [
+        event
+        for event in bus.read_audit()
+        if event.payload.get("occurrence_id") == "mixed"
+        and event.payload.get("terminal") is not None
+    ]
+    assert len(terminals) == 1
+    assert terminals[0].payload["terminal"] == "failed"
 
 
 def test_accepted_but_unverified_wake_is_pending(tmp_path):
@@ -479,6 +764,58 @@ def test_automatic_cooldown_and_active_chat_gate_before_judge(tmp_path):
     assert cooldown.reason_code is HeartbeatReasonCode.COOLDOWN
     assert active.reason_code is HeartbeatReasonCode.ACTIVE_CHAT
     assert judge.calls == 0
+
+
+def test_prejudge_terminal_is_reused_for_exact_heartbeat_occurrence(tmp_path):
+    judge = Judge(JudgeDecision(True, True, "would_run", "should-not-send"))
+    sink = Sink()
+    runtime, _controls, bus, _cadence = engine(tmp_path, judge, sink)
+    candidate = HeartbeatCandidate(
+        "care_poke",
+        {"events": ["event"], "due": True, "source_event_id": "occurrence"},
+        candidate_id="occurrence",
+    )
+
+    first = runtime.run(candidate, active_chat=True)
+    duplicate = runtime.run(candidate, active_chat=False)
+    terminals = [
+        event
+        for event in bus.read_audit()
+        if event.payload.get("occurrence_id") == "occurrence"
+        and event.payload.get("terminal") is not None
+    ]
+
+    assert (first.status, first.reason_code) == (
+        "skipped",
+        HeartbeatReasonCode.ACTIVE_CHAT,
+    )
+    assert (duplicate.status, duplicate.reason_code) == (
+        "skipped",
+        HeartbeatReasonCode.ACTIVE_CHAT,
+    )
+    assert judge.calls == 0
+    assert sink.deliveries == sink.wakes == 0
+    assert len(terminals) == 1
+
+
+def test_activity_busy_is_a_public_prejudge_terminal_gate(tmp_path):
+    judge = Judge(JudgeDecision(True, True, "would-run", "should-not-send"))
+    sink = Sink()
+    runtime, _controls, bus, _cadence = engine(tmp_path, judge, sink)
+    candidate = HeartbeatCandidate(
+        "care_poke",
+        {"events": ["event"], "due": True, "source_event_id": "busy"},
+        candidate_id="busy",
+    )
+
+    result = runtime.run(candidate, activity_busy=True)
+
+    assert (result.status, result.reason_code) == (
+        "skipped",
+        HeartbeatReasonCode.ACTIVITY_BUSY,
+    )
+    assert judge.calls == 0
+    assert bus.read_audit()[-1].payload["terminal"] == "activity_busy"
 
 
 def _policy(
@@ -1488,6 +1825,11 @@ def test_delivery_only_refreshes_visible_contact_wake_only_does_not(tmp_path):
     delivery = delivery_runtime.run(candidate)
     assert (delivery.status, delivery.delivery.verified) == ("completed", True)
     assert delivery_cadence.snapshot()["verified_visible_effects"]
+    assert delivery_cadence.recent_contact(now=NOW) == (
+        "recent_verified_visible_contact",
+        NOW,
+    )
+    assert delivery_cadence.recent_private_inbound(now=NOW) == (None, None)
 
     mixed_runtime, _controls, _bus, mixed_cadence = engine(
         tmp_path / "mixed",

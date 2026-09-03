@@ -19,7 +19,9 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timedelta
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, Callable, Protocol
+from urllib.parse import quote, unquote
 
 from .control import ControlStore, GateResult, evaluate_gate
 from .effects import (
@@ -47,6 +49,7 @@ _STATUSES = frozenset(
 _COST_UNITS = {"low": 1, "medium": 2, "high": 3}
 _DEFAULT_EFFECT_TTL = timedelta(hours=1)
 _DEFAULT_EVIDENCE_CONTRACT = "effect_receipt"
+_AUTONOMY_EFFECT_ID_PREFIX = "autonomy:"
 
 
 def _bounded(value: Any, label: str, *, max_bytes: int = 512) -> str:
@@ -99,6 +102,31 @@ def _hash_text(value: Any) -> str:
     if any(character not in "0123456789abcdef" for character in value):
         raise ValueError("content_sha256 must be a 64-character lowercase hex digest")
     return value
+
+
+def _new_autonomy_effect_id(provider: str) -> str:
+    """Keep the canonical provider recoverable from the durable intent."""
+
+    encoded = quote(_bounded(provider, "provider", max_bytes=128), safe="")
+    return f"{_AUTONOMY_EFFECT_ID_PREFIX}{encoded}:{new_id('effect')}"
+
+
+def _provider_from_effect_id(value: Any) -> str | None:
+    if not isinstance(value, str) or not value.startswith(_AUTONOMY_EFFECT_ID_PREFIX):
+        return None
+    try:
+        encoded, token = value[len(_AUTONOMY_EFFECT_ID_PREFIX) :].split(":", 1)
+    except ValueError:
+        return None
+    if not encoded or not token.startswith("effect_"):
+        return None
+    provider = unquote(encoded)
+    if quote(provider, safe="") != encoded:
+        return None
+    try:
+        return _bounded(provider, "provider", max_bytes=128)
+    except (TypeError, ValueError):
+        return None
 
 
 def _positive_int(value: Any, label: str) -> int:
@@ -165,10 +193,13 @@ class ActivityResult:
     canonical_event_id: str | None = None
     audit_status: str = "recorded"
     audit_error: str | None = None
+    epoch_id: str | None = None
 
     def __post_init__(self) -> None:
         if self.status not in _STATUSES:
             raise ValueError(f"invalid activity terminal: {self.status}")
+        if self.epoch_id is not None:
+            _bounded(self.epoch_id, "epoch_id")
 
     @property
     def verified(self) -> bool:
@@ -205,6 +236,8 @@ class ActivityProvider:
     name: str
     run: Runner
     eligible: Eligibility = _always_eligible
+    # Capabilities are descriptive metadata only; eligibility remains owned by
+    # the explicit provider settings and ``eligible`` callback below.
     capabilities: frozenset[str] = frozenset()
     cost_class: str = "low"
     cost_budget: int | None = None
@@ -247,17 +280,33 @@ class ActivityProvider:
         _positive_limit(self.daily_limit, "daily_limit")
         _positive_limit(self.repeat_limit, "repeat_limit")
         _bounded(self.evidence_contract, "evidence_contract", max_bytes=64)
+        if self.evidence_contract != _DEFAULT_EVIDENCE_CONTRACT:
+            raise ValueError(
+                "evidence_contract must be the public effect_receipt contract"
+            )
 
 
 @dataclass(frozen=True)
 class AutonomyDecision:
     allowed: bool
     reason: str
+    provider_weights: Mapping[str, int] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if type(self.allowed) is not bool:
             raise TypeError("judge allowed must be a bool")
         _bounded(self.reason, "judge reason", max_bytes=128)
+        if not isinstance(self.provider_weights, Mapping):
+            raise TypeError("judge provider_weights must be a mapping")
+        if len(self.provider_weights) > 64:
+            raise ValueError("judge provider_weights is too large")
+        normalized: dict[str, int] = {}
+        for name, weight in self.provider_weights.items():
+            provider = _bounded(name, "provider name", max_bytes=128)
+            if type(weight) is not int or not 0 <= weight <= 100:
+                raise ValueError("judge provider weight must be between 0 and 100")
+            normalized[provider] = weight
+        object.__setattr__(self, "provider_weights", MappingProxyType(normalized))
 
 
 class AutonomyJudge(Protocol):
@@ -1089,11 +1138,81 @@ class AutonomyEngine:
                 selected_facts[fact.key] = fact
         return tuple(sorted(selected_facts.values(), key=lambda fact: fact.key))
 
+    @classmethod
+    def _public_epoch_from_record(cls, record: Any) -> Any:
+        """Hide the date-derived ledger epoch from the public identity."""
+
+        epoch_id = cls._record_value(record, "epoch_id")
+        if epoch_id is None:
+            return None
+        created_at = cls._record_value(record, "created_at")
+        if (
+            type(epoch_id) is str
+            and isinstance(created_at, datetime)
+            and epoch_id == f"autonomy:{created_at.date().isoformat()}"
+        ):
+            return None
+        return epoch_id
+
+    @classmethod
+    def _terminal_identity(cls, result: ActivityResult) -> tuple[str, str | None]:
+        """Resolve the public terminal identity without losing effect evidence."""
+
+        source_values: list[str] = []
+        for value in (
+            result.source_event_id,
+            result.canonical_event_id,
+            cls._record_value(result.effect_record, "source_event_id"),
+        ):
+            if value is None:
+                continue
+            if type(value) is not str or not value.strip():
+                raise ValueError("invalid_source_event_id")
+            source_values.append(value)
+        if len(set(source_values)) > 1:
+            raise ValueError("conflicting_source_event_id")
+        source_event_id = source_values[0] if source_values else None
+        if source_event_id is None and result.run_id is not None:
+            if type(result.run_id) is not str or not result.run_id.strip():
+                raise ValueError("invalid_source_event_id")
+            source_event_id = result.run_id
+        if source_event_id is None:
+            source_event_id = new_id("autonomy_terminal")
+
+        evidence = result.evidence
+        evidence_epoch = (
+            evidence.get("epoch_id") if isinstance(evidence, Mapping) else None
+        )
+        record_epoch_raw = cls._record_value(result.effect_record, "epoch_id")
+        record_epoch = cls._public_epoch_from_record(result.effect_record)
+        if record_epoch is None and evidence_epoch == record_epoch_raw:
+            # ``_record_evidence`` exposes the immutable ledger epoch.  A
+            # legacy effect's date-derived value is not a public epoch.
+            evidence_epoch = None
+        epoch_id: str | None = None
+        for value in (result.epoch_id, evidence_epoch, record_epoch):
+            if value is None:
+                continue
+            if type(value) is not str or not value.strip():
+                raise ValueError("invalid_epoch_id")
+            if epoch_id is not None and epoch_id != value:
+                raise ValueError("conflicting_epoch_id")
+            epoch_id = value
+        return source_event_id, epoch_id
+
     def _finish(
         self,
         result: ActivityResult,
         gate: GateResult,
     ) -> ActivityResult:
+        occurrence_id, epoch_id = self._terminal_identity(result)
+        result = replace(
+            result,
+            source_event_id=result.source_event_id or occurrence_id,
+            canonical_event_id=result.canonical_event_id or occurrence_id,
+            epoch_id=epoch_id,
+        )
+        terminal = self._canonical_terminal(result)
         evidence = None
         if result.evidence:
             evidence = {
@@ -1108,29 +1227,52 @@ class AutonomyEngine:
                 )
                 if key in result.evidence
             }
+        details = {
+            "provider": result.provider,
+            "reason": self._reason_code(result.reason),
+            "run_id": result.run_id,
+            "effect_id": result.effect_id,
+            "source_event_id": result.source_event_id,
+            "epoch_id": epoch_id,
+            "idempotency_key": result.idempotency_key,
+            "control_id": gate.control_id,
+            "evidence": evidence,
+            "gate": {
+                "allowed": gate.allowed,
+                "mode": gate.mode,
+                "reason": self._reason_code(gate.reason),
+                "control_id": gate.control_id,
+            },
+        }
+        if occurrence_id is not None:
+            details["occurrence_id"] = occurrence_id
         try:
-            self.bus.record_audit(
-                "autonomy",
-                status=result.status,
-                source="autonomy",
-                details={
-                    "provider": result.provider,
-                    "reason": self._reason_code(result.reason),
-                    "run_id": result.run_id,
-                    "effect_id": result.effect_id,
-                    "source_event_id": result.source_event_id,
-                    "idempotency_key": result.idempotency_key,
-                    "control_id": gate.control_id,
-                    "evidence": evidence,
-                    "gate": {
-                        "allowed": gate.allowed,
-                        "mode": gate.mode,
-                        "reason": self._reason_code(gate.reason),
-                        "control_id": gate.control_id,
-                    },
-                },
-            )
+            if terminal is not None and occurrence_id is not None:
+                self.bus.record_audit_terminal(
+                    "autonomy",
+                    occurrence_id=occurrence_id,
+                    epoch_id=epoch_id,
+                    terminal=terminal,
+                    status=result.status,
+                    source="autonomy",
+                    details=details,
+                )
+            else:
+                self.bus.record_audit(
+                    "autonomy",
+                    status=result.status,
+                    source="autonomy",
+                    details=details,
+                )
         except Exception as exc:
+            if isinstance(exc, RuntimeError) and "conflict" in str(exc).lower():
+                return replace(
+                    result,
+                    status="failed",
+                    reason="terminal_conflict",
+                    audit_status="degraded",
+                    audit_error=f"audit_terminal_conflict:{type(exc).__name__}",
+                )
             # The EffectLedger is the state owner.  A failed audit projection
             # must not erase a verified effect or invite a second execution.
             return replace(
@@ -1139,6 +1281,102 @@ class AutonomyEngine:
                 audit_error=f"audit_error:{type(exc).__name__}",
             )
         return result
+
+    @staticmethod
+    def _canonical_terminal(result: ActivityResult) -> str | None:
+        if result.status == "skipped":
+            if result.reason == "execution_in_progress":
+                # A lock race is only telemetry.  It must not claim the
+                # occurrence before the owner can settle its real outcome.
+                return None
+            return AutonomyEngine._reason_code(result.reason)
+        if result.status == "completed":
+            return "verified"
+        if result.status == "failed":
+            if result.effect_record is not None and getattr(
+                result.effect_record, "state", None
+            ) not in {"failed", "verified"}:
+                return None
+            if result.reason == "effect_expired_unverified":
+                return "expired"
+            return "failed"
+        return None
+
+    def _existing_terminal_result(
+        self,
+        occurrence_id: str,
+        *,
+        epoch_id: str | None = None,
+    ) -> ActivityResult | None:
+        finder = getattr(self.bus, "find_audit_terminal", None)
+        if not callable(finder):
+            return None
+        event = finder("autonomy", occurrence_id, epoch_id=epoch_id)
+        if event is None:
+            return None
+        payload = event.payload
+        terminal = payload.get("terminal")
+        if type(terminal) is not str or not terminal.strip():
+            raise RuntimeError("autonomy terminal audit is invalid")
+        # EffectLedger remains truth if an effect exists for this exact
+        # occurrence.  An audit projection cannot mask a conflicting effect.
+        if epoch_id is not None:
+            matching = [
+                record
+                for record in self.effect_ledger.records()
+                if self._record_value(record, "kind") == AUTONOMY_EFFECT_KIND
+                and self._record_value(record, "source_event_id") == occurrence_id
+                and self._record_value(record, "epoch_id") == epoch_id
+            ]
+            if len(matching) > 1:
+                raise RuntimeError("autonomy occurrence conflict")
+            if matching:
+                state = self._record_state(matching[0])
+                effect_terminal = (
+                    "verified"
+                    if state == "verified"
+                    else "failed"
+                    if state == "failed"
+                    else None
+                )
+                if (
+                    effect_terminal == "failed"
+                    and self._record_value(matching[0], "reason")
+                    == "effect_expired_unverified"
+                ):
+                    effect_terminal = "expired"
+                if effect_terminal is not None and effect_terminal != terminal:
+                    raise RuntimeError("audit effect conflict")
+                if effect_terminal is not None:
+                    return None
+                raise RuntimeError("audit effect conflict")
+        status = payload.get("status")
+        result_status = (
+            "completed"
+            if status == "completed"
+            else "failed"
+            if status == "failed"
+            else "skipped"
+        )
+        provider = payload.get("provider")
+        if not isinstance(provider, str) or not provider.strip():
+            provider = None
+        effect_id = payload.get("effect_id")
+        if not isinstance(effect_id, str) or not effect_id.strip():
+            effect_id = None
+        idempotency_key = payload.get("idempotency_key")
+        if not isinstance(idempotency_key, str) or not idempotency_key.strip():
+            idempotency_key = None
+        return ActivityResult(
+            result_status,
+            provider,
+            self._reason_code(payload.get("reason") or terminal),
+            effect_id=effect_id,
+            source_event_id=occurrence_id,
+            idempotency_key=idempotency_key,
+            canonical_event_id=occurrence_id,
+            epoch_id=payload.get("epoch_id"),
+        )
 
     @staticmethod
     def _reason_code(reason: Any) -> str:
@@ -1171,10 +1409,12 @@ class AutonomyEngine:
                     values.append(_bounded(facts[key], key))
                 except (TypeError, ValueError) as exc:
                     raise ValueError(f"invalid_{key}") from exc
+            if len(set(values)) > 1:
+                raise ValueError("conflicting_identity")
             return values[0] if values else None
 
         return (
-            read("source_event_id", "event_id"),
+            read("source_event_id", "occurrence_id", "event_id"),
             read("epoch_id", "epoch"),
             read("idempotency_key"),
         )
@@ -1187,7 +1427,14 @@ class AutonomyEngine:
             return None
         try:
             _bounded(value.reason, "judge reason", max_bytes=128)
-        except (TypeError, ValueError):
+            provider_weights = value.provider_weights
+            if not isinstance(provider_weights, Mapping) or len(provider_weights) > 64:
+                return None
+            for name, weight in provider_weights.items():
+                _bounded(name, "provider name", max_bytes=128)
+                if type(weight) is not int or not 0 <= weight <= 100:
+                    return None
+        except (AttributeError, TypeError, ValueError):
             return None
         return value
 
@@ -1269,6 +1516,11 @@ class AutonomyEngine:
             value = payload.get("provider")
             if isinstance(value, str) and value:
                 return value
+        value = _provider_from_effect_id(
+            AutonomyEngine._record_value(record, "effect_id")
+        )
+        if value is not None:
+            return value
         key = AutonomyEngine._record_value(record, "idempotency_key", "")
         if isinstance(key, str) and key.startswith("autonomy:"):
             parts = key.split(":", 2)
@@ -1600,6 +1852,18 @@ class AutonomyEngine:
         except (KeyError, ValueError):
             return None
 
+    def _find_by_occurrence(self, source_event_id: str, epoch_id: str) -> Any | None:
+        matches = [
+            record
+            for record in self.effect_ledger.records()
+            if self._record_value(record, "kind") == AUTONOMY_EFFECT_KIND
+            and self._record_value(record, "source_event_id") == source_event_id
+            and self._record_value(record, "epoch_id") == epoch_id
+        ]
+        if len(matches) > 1:
+            raise ValueError("occurrence_conflict")
+        return matches[0] if matches else None
+
     def _consume_verified(
         self,
         gate: GateResult,
@@ -1631,12 +1895,18 @@ class AutonomyEngine:
         provider: str,
         gate: GateResult,
         run_id: str,
+        public_epoch_id: str | None = None,
     ) -> ActivityResult | None:
         state = self._record_state(record)
         effect_id = self._record_value(record, "effect_id")
         source_event_id = self._record_value(record, "source_event_id")
         idempotency_key = self._record_value(record, "idempotency_key")
         evidence = self._record_evidence(record)
+        result_epoch_id = (
+            public_epoch_id
+            if public_epoch_id is not None
+            else self._public_epoch_from_record(record)
+        )
         if state == "verified":
             try:
                 self._consume_verified(gate, effect_id=effect_id)
@@ -1655,6 +1925,7 @@ class AutonomyEngine:
                         if isinstance(record, EffectRecord)
                         else None,
                         canonical_event_id=source_event_id,
+                        epoch_id=result_epoch_id,
                     ),
                     gate,
                 )
@@ -1670,6 +1941,7 @@ class AutonomyEngine:
                     idempotency_key=idempotency_key,
                     effect_record=record if isinstance(record, EffectRecord) else None,
                     canonical_event_id=source_event_id,
+                    epoch_id=result_epoch_id,
                 ),
                 gate,
             )
@@ -1686,6 +1958,7 @@ class AutonomyEngine:
                     idempotency_key=idempotency_key,
                     effect_record=record if isinstance(record, EffectRecord) else None,
                     canonical_event_id=source_event_id,
+                    epoch_id=result_epoch_id,
                 ),
                 gate,
             )
@@ -1702,6 +1975,7 @@ class AutonomyEngine:
                     idempotency_key=idempotency_key,
                     effect_record=record if isinstance(record, EffectRecord) else None,
                     canonical_event_id=source_event_id,
+                    epoch_id=result_epoch_id,
                 ),
                 gate,
             )
@@ -1710,7 +1984,7 @@ class AutonomyEngine:
                 ActivityResult(
                     "failed",
                     provider,
-                    "already_failed",
+                    self._record_value(record, "reason") or "already_failed",
                     run_id=run_id,
                     effect_id=effect_id,
                     evidence=evidence,
@@ -1718,6 +1992,7 @@ class AutonomyEngine:
                     idempotency_key=idempotency_key,
                     effect_record=record if isinstance(record, EffectRecord) else None,
                     canonical_event_id=source_event_id,
+                    epoch_id=result_epoch_id,
                 ),
                 gate,
             )
@@ -1744,6 +2019,32 @@ class AutonomyEngine:
             f"autonomy:{provider}:{source_event_id}:{epoch_id}",
             len(identity),
         )
+
+    @staticmethod
+    def _weighted_selection(
+        candidates: list[tuple[str, int]], occurrence_identity: str
+    ) -> str:
+        """Choose reproducibly from bounded weights for one occurrence."""
+
+        ordered = sorted(candidates)
+        identity = json.dumps(
+            {
+                "candidates": ordered,
+                "occurrence": occurrence_identity,
+                "selection_contract": "moon.autonomy.weighted.v1",
+            },
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        slot = int.from_bytes(hashlib.sha256(identity).digest()[:8], "big") % sum(
+            weight for _name, weight in ordered
+        )
+        for name, weight in ordered:
+            if slot < weight:
+                return name
+            slot -= weight
+        raise AssertionError("bounded weighted selection exhausted")
 
     @staticmethod
     def _receipt_from_output(output: Any) -> tuple[EffectReceipt | None, str | None]:
@@ -1857,6 +2158,91 @@ class AutonomyEngine:
             gate,
         )
 
+    def fail(self, effect_id: str, reason: str) -> ActivityResult:
+        """Settle an asynchronous provider with an explicit host failure."""
+
+        failure_reason = _bounded(reason, "failure reason", max_bytes=128)
+        record = self.effect_ledger.get(effect_id)
+        if record is None:
+            raise ValueError("autonomy effect does not exist")
+        if self._record_value(record, "kind") != AUTONOMY_EFFECT_KIND:
+            raise ValueError("effect is not an autonomy completion")
+        provider = self._record_provider(record) or "unknown"
+        gate = evaluate_gate(self.controls.resolve("autonomy"))
+        if self._record_state(record) in {"verified", "failed"}:
+            existing = self._existing_result(
+                record,
+                provider=provider,
+                gate=gate,
+                run_id=self._record_value(record, "effect_id"),
+            )
+            if existing is not None:
+                return existing
+        failed = self.effect_ledger.fail(effect_id, failure_reason, False)
+        return self._finish(
+            ActivityResult(
+                "failed",
+                provider,
+                failure_reason,
+                effect_id=effect_id,
+                evidence=self._record_evidence(failed),
+                source_event_id=self._record_value(failed, "source_event_id"),
+                idempotency_key=self._record_value(failed, "idempotency_key"),
+                effect_record=failed if isinstance(failed, EffectRecord) else None,
+                canonical_event_id=self._record_value(failed, "source_event_id"),
+            ),
+            gate,
+        )
+
+    def _settle_expired_unverified(
+        self,
+        *,
+        now: datetime,
+        gate: GateResult,
+    ) -> None:
+        """Fail old unverified autonomy effects without replaying providers."""
+
+        for record in self.effect_ledger.records():
+            if self._record_value(
+                record, "kind"
+            ) != AUTONOMY_EFFECT_KIND or self._record_state(record) not in {
+                "pending",
+                "executed_unverified",
+            }:
+                continue
+            expires_at = self._record_value(record, "expires_at")
+            if not isinstance(expires_at, datetime) or not expires_at < now:
+                continue
+            effect_id = self._record_value(record, "effect_id")
+            provider = self._record_provider(record) or "unknown"
+            try:
+                failed = self.effect_ledger.fail(
+                    effect_id,
+                    "effect_expired_unverified",
+                    False,
+                )
+            except Exception:
+                current = self.effect_ledger.get(effect_id)
+                if self._record_state(current) in {"verified", "failed"}:
+                    continue
+                raise
+            self._finish(
+                ActivityResult(
+                    "failed",
+                    provider,
+                    "effect_expired_unverified",
+                    effect_id=effect_id,
+                    evidence=self._record_evidence(failed),
+                    source_event_id=self._record_value(failed, "source_event_id"),
+                    idempotency_key=self._record_value(failed, "idempotency_key"),
+                    effect_record=(
+                        failed if isinstance(failed, EffectRecord) else None
+                    ),
+                    canonical_event_id=self._record_value(failed, "source_event_id"),
+                ),
+                gate,
+            )
+
     def run_once(
         self,
         settings: Mapping[str, Mapping[str, Any]],
@@ -1868,8 +2254,40 @@ class AutonomyEngine:
                 gate = GateResult(
                     False, "execution_lock", "execution_in_progress", None
                 )
+                run_id = new_id("autonomy_run")
+                source_event_id: str | None = None
+                epoch_id: str | None = None
+                if isinstance(facts, Mapping):
+                    try:
+                        source_event_id, epoch_id, _ = self._identity_overrides(facts)
+                    except ValueError as exc:
+                        # A lock race must not silently discard malformed
+                        # occurrence identity.  Report the same fail-closed
+                        # validation error as the owner path and use this
+                        # invocation's id only as a safe audit fallback.
+                        return self._finish(
+                            ActivityResult(
+                                "failed",
+                                None,
+                                str(exc),
+                                run_id=run_id,
+                                source_event_id=run_id,
+                                canonical_event_id=run_id,
+                            ),
+                            gate,
+                        )
+                source_event_id = source_event_id or run_id
                 return self._finish(
-                    ActivityResult("skipped", None, "execution_in_progress"), gate
+                    ActivityResult(
+                        "skipped",
+                        None,
+                        "execution_in_progress",
+                        run_id=run_id,
+                        source_event_id=source_event_id,
+                        canonical_event_id=source_event_id,
+                        epoch_id=epoch_id,
+                    ),
+                    gate,
                 )
             return self._run_once_locked(settings, facts=facts)
 
@@ -1881,41 +2299,64 @@ class AutonomyEngine:
     ) -> ActivityResult:
         resolution = self.controls.resolve("autonomy")
         gate = evaluate_gate(resolution)
+        now = self.clock()
+        context = AutonomyContext(now, {} if facts is None else dict(facts))
+        run_id = new_id("autonomy_run")
+        try:
+            source_override, epoch_override, idempotency_override = (
+                self._identity_overrides(context.facts)
+            )
+        except ValueError as exc:
+            return self._finish(
+                ActivityResult("failed", None, str(exc), run_id=run_id), gate
+            )
+        source_event_id = source_override or run_id
+        # ``epoch_id`` is optional at the public terminal boundary.  The
+        # effect ledger still needs a durable epoch for its immutable schema;
+        # legacy callers use the date-derived internal value while retaining
+        # their original no-epoch audit/key identity.
+        epoch_id = epoch_override
+        effect_epoch_id = epoch_override or (
+            f"autonomy:{context.now.date().isoformat()}"
+        )
+        existing_terminal = self._existing_terminal_result(
+            source_event_id, epoch_id=epoch_id
+        )
+        if existing_terminal is not None:
+            return existing_terminal
+
+        def finish(
+            result: ActivityResult, _gate: GateResult | None = None
+        ) -> ActivityResult:
+            if (
+                result.source_event_id is None
+                or result.canonical_event_id is None
+                or result.epoch_id is None
+                and epoch_id is not None
+            ):
+                result = replace(
+                    result,
+                    run_id=result.run_id or run_id,
+                    source_event_id=result.source_event_id or source_event_id,
+                    canonical_event_id=result.canonical_event_id or source_event_id,
+                    epoch_id=result.epoch_id or epoch_id,
+                )
+            return self._finish(result, gate)
+
+        self._settle_expired_unverified(now=now, gate=gate)
         if not gate.allowed:
-            return self._finish(ActivityResult("skipped", None, gate.reason), gate)
-        context = AutonomyContext(self.clock(), {} if facts is None else dict(facts))
+            return finish(ActivityResult("skipped", None, gate.reason))
 
         # Active-chat is a hard gate.  It is checked before Judge and before
         # any autonomy event/effect intent is emitted.  A present non-bool is
         # malformed control input, not an invitation to guess.
         for chat_key in ("active_chat", "chat_active"):
             if chat_key in context.facts and type(context.facts[chat_key]) is not bool:
-                return self._finish(
+                return finish(
                     ActivityResult("failed", None, f"{chat_key}_invalid"), gate
                 )
             if context.facts.get(chat_key) is True:
-                return self._finish(
-                    ActivityResult("skipped", None, "active_chat"), gate
-                )
-
-        try:
-            source_override, epoch_override, idempotency_override = (
-                self._identity_overrides(context.facts)
-            )
-        except ValueError as exc:
-            return self._finish(ActivityResult("failed", None, str(exc)), gate)
-
-        try:
-            self._validate_provider_settings(settings)
-        except _ProviderSettingsError as exc:
-            return self._finish(
-                ActivityResult(
-                    "failed",
-                    exc.provider,
-                    f"invalid_provider_settings:{exc.field}",
-                ),
-                gate,
-            )
+                return finish(ActivityResult("skipped", None, "active_chat"))
 
         requested: str | None = None
         payload = resolution.intent.payload if resolution.intent is not None else {}
@@ -1923,115 +2364,214 @@ class AutonomyEngine:
             value = payload.get("provider")
             if isinstance(value, str) and value.strip():
                 requested = value
-        if requested is None and not any(
-            provider_settings.get("enabled") is True
-            and self.registry.get(name) is not None
-            for name, provider_settings in settings.items()
-        ):
-            return self._finish(
-                ActivityResult("skipped", None, "no_eligible_provider"), gate
-            )
-
-        # A caller that retries a known source/idempotency identity must be
-        # reconciled before Judge or provider eligibility is evaluated.  This
-        # keeps a pending/unverified effect from becoming a second invocation.
-        early_key = idempotency_override
-        if early_key is None and requested is not None:
-            if source_override is not None and epoch_override is not None:
-                _digest, early_key, _length = self._effect_identity(
-                    requested, source_override, epoch_override
-                )
-        if early_key is not None:
-            existing = self._find_by_idempotency(early_key)
-            if existing is not None and self._record_state(existing) != "intent":
-                existing_provider = (
-                    self._record_provider(existing) or requested or "unknown"
-                )
-                reconciled = self._existing_result(
-                    existing,
-                    provider=existing_provider,
-                    gate=gate,
-                    run_id=self._record_value(existing, "effect_id"),
-                )
-                if reconciled is not None:
-                    return reconciled
-
+        existing_selection: Any | None = None
         try:
-            decision = self._validate_judge_decision(self.judge.decide(context))
+            if idempotency_override is not None:
+                existing_selection = self._find_by_idempotency(idempotency_override)
+            if existing_selection is None and source_override is not None:
+                existing_selection = self._find_by_occurrence(
+                    source_event_id, effect_epoch_id
+                )
+            if existing_selection is not None:
+                if (
+                    self._record_value(existing_selection, "kind")
+                    != AUTONOMY_EFFECT_KIND
+                ):
+                    raise ValueError("occurrence_conflict")
+                recorded_source = self._record_value(
+                    existing_selection, "source_event_id"
+                )
+                recorded_epoch = self._record_value(existing_selection, "epoch_id")
+                if source_override is not None and source_override != recorded_source:
+                    raise ValueError("occurrence_conflict")
+                if epoch_override is not None and epoch_override != recorded_epoch:
+                    raise ValueError("occurrence_conflict")
+                source_event_id = recorded_source
+                effect_epoch_id = recorded_epoch
+        except ValueError:
+            return finish(ActivityResult("failed", None, "occurrence_conflict"), gate)
         except Exception as exc:
-            return self._finish(
-                ActivityResult("failed", None, f"judge_error:{type(exc).__name__}"),
-                gate,
-            )
-        if decision is None:
-            return self._finish(
-                ActivityResult("failed", None, "judge_invalid_result"), gate
-            )
-        if not decision.allowed:
-            return self._finish(ActivityResult("skipped", None, decision.reason), gate)
-
-        try:
-            candidates, reasons = self._eligible_with_reasons(settings, context)
-        except ProviderEligibilityError as exc:
-            return self._finish(
+            return finish(
                 ActivityResult(
-                    "failed",
-                    exc.provider,
-                    f"eligibility_error:{type(exc.cause).__name__}",
+                    "failed", None, f"effect_lookup_error:{type(exc).__name__}"
                 ),
                 gate,
-            )
-        except (TypeError, ValueError):
-            return self._finish(
-                ActivityResult("failed", None, "invalid_provider_settings"), gate
             )
 
         selected: str | None = None
         selection_reason = "selected"
-        if requested is not None:
-            if any(name == requested for name, _weight in candidates):
-                selected = requested
-            else:
-                fallback = (
-                    payload.get("fallback_provider")
-                    if isinstance(payload, Mapping)
-                    else None
-                )
-                allow_fallback = isinstance(payload, Mapping) and (
-                    payload.get("allow_fallback") is True
-                    or payload.get("fallback") in {"first", "deterministic"}
-                )
-                if isinstance(fallback, str) and any(
-                    name == fallback for name, _ in candidates
-                ):
-                    selected = fallback
-                    selection_reason = "play_next_fallback"
-                elif allow_fallback and candidates:
-                    selected = candidates[0][0]
-                    selection_reason = "play_next_fallback"
-                else:
-                    return self._finish(
-                        ActivityResult(
-                            "skipped",
-                            requested,
-                            f"play_next_unavailable:{reasons.get(requested, 'ineligible')}",
-                        ),
-                        gate,
-                    )
-        elif candidates:
-            # Selection is deterministic for replay: highest bounded weight,
-            # then provider name.  The runner is never re-rolled after this
-            # point, including on an adapter failure.
-            selected = min(candidates, key=lambda item: (-item[1], item[0]))[0]
-        if selected is None:
-            return self._finish(
-                ActivityResult("skipped", None, "no_eligible_provider"), gate
+        if existing_selection is not None:
+            selected = self._record_provider(existing_selection)
+            reconciled = self._existing_result(
+                existing_selection,
+                provider=selected or "unknown",
+                gate=gate,
+                run_id=self._record_value(existing_selection, "effect_id"),
+                public_epoch_id=epoch_id,
             )
+            if reconciled is not None:
+                return reconciled
+            if selected is None:
+                return finish(
+                    ActivityResult(
+                        "awaiting_reconciliation",
+                        None,
+                        "selection_provider_unavailable",
+                        run_id=run_id,
+                        effect_id=self._record_value(existing_selection, "effect_id"),
+                        evidence=self._record_evidence(existing_selection),
+                        source_event_id=source_event_id,
+                        idempotency_key=self._record_value(
+                            existing_selection, "idempotency_key"
+                        ),
+                        effect_record=(
+                            existing_selection
+                            if isinstance(existing_selection, EffectRecord)
+                            else None
+                        ),
+                        canonical_event_id=source_event_id,
+                    ),
+                    gate,
+                )
+            selection_reason = "resumed_intent"
+        else:
+            try:
+                self._validate_provider_settings(settings)
+            except _ProviderSettingsError as exc:
+                return finish(
+                    ActivityResult(
+                        "failed",
+                        exc.provider,
+                        f"invalid_provider_settings:{exc.field}",
+                    ),
+                    gate,
+                )
+            if requested is None and not any(
+                provider_settings.get("enabled") is True
+                and self.registry.get(name) is not None
+                for name, provider_settings in settings.items()
+            ):
+                return finish(
+                    ActivityResult("skipped", None, "no_eligible_provider"), gate
+                )
+            try:
+                decision = self._validate_judge_decision(self.judge.decide(context))
+            except Exception as exc:
+                return finish(
+                    ActivityResult("failed", None, f"judge_error:{type(exc).__name__}"),
+                    gate,
+                )
+            if decision is None:
+                return finish(
+                    ActivityResult("failed", None, "judge_invalid_result"), gate
+                )
+            if not decision.allowed:
+                return finish(ActivityResult("skipped", None, decision.reason), gate)
+            decision_weights = dict(decision.provider_weights)
+            if any(
+                name not in settings or self.registry.get(name) is None
+                for name in decision_weights
+            ):
+                return finish(
+                    ActivityResult("failed", None, "judge_unknown_provider"), gate
+                )
+            try:
+                candidates, reasons = self._eligible_with_reasons(settings, context)
+            except ProviderEligibilityError as exc:
+                return finish(
+                    ActivityResult(
+                        "failed",
+                        exc.provider,
+                        f"eligibility_error:{type(exc.cause).__name__}",
+                    ),
+                    gate,
+                )
+            except (TypeError, ValueError):
+                return finish(
+                    ActivityResult("failed", None, "invalid_provider_settings"), gate
+                )
+            candidates = [
+                (name, decision_weights.get(name, weight))
+                for name, weight in candidates
+                if decision_weights.get(name, weight) > 0
+            ]
 
-        run_id = new_id("autonomy_run")
+            if idempotency_override is not None:
+                occurrence_identity = idempotency_override
+            else:
+                occurrence_identity = json.dumps(
+                    {
+                        "epoch_id": effect_epoch_id,
+                        "source_event_id": source_event_id,
+                    },
+                    ensure_ascii=True,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            if requested is not None:
+                if any(name == requested for name, _weight in candidates):
+                    selected = requested
+                else:
+                    fallback = (
+                        payload.get("fallback_provider")
+                        if isinstance(payload, Mapping)
+                        else None
+                    )
+                    allow_fallback = isinstance(payload, Mapping) and (
+                        payload.get("allow_fallback") is True
+                        or payload.get("fallback") in {"first", "deterministic"}
+                    )
+                    if isinstance(fallback, str) and any(
+                        name == fallback for name, _ in candidates
+                    ):
+                        selected = fallback
+                        selection_reason = "play_next_fallback"
+                    elif allow_fallback and candidates:
+                        selected = candidates[0][0]
+                        selection_reason = "play_next_fallback"
+                    else:
+                        return finish(
+                            ActivityResult(
+                                "skipped",
+                                requested,
+                                "play_next_unavailable:"
+                                f"{reasons.get(requested, 'ineligible')}",
+                            ),
+                            gate,
+                        )
+            elif candidates:
+                # The stable occurrence identity preserves weighted diversity
+                # without process randomness. The runner is never re-rolled.
+                selected = self._weighted_selection(candidates, occurrence_identity)
+                selection_reason = "weighted_replayable"
+        if selected is None:
+            return finish(ActivityResult("skipped", None, "no_eligible_provider"), gate)
+
         provider = self.registry.get(selected)
         if provider is None:
-            return self._finish(
+            if existing_selection is not None:
+                return finish(
+                    ActivityResult(
+                        "awaiting_reconciliation",
+                        selected,
+                        "selected_provider_unavailable",
+                        run_id=run_id,
+                        effect_id=self._record_value(existing_selection, "effect_id"),
+                        evidence=self._record_evidence(existing_selection),
+                        source_event_id=source_event_id,
+                        idempotency_key=self._record_value(
+                            existing_selection, "idempotency_key"
+                        ),
+                        effect_record=(
+                            existing_selection
+                            if isinstance(existing_selection, EffectRecord)
+                            else None
+                        ),
+                        canonical_event_id=source_event_id,
+                    ),
+                    gate,
+                )
+            return finish(
                 ActivityResult(
                     "failed",
                     selected,
@@ -2041,58 +2581,58 @@ class AutonomyEngine:
                 gate,
             )
 
-        source_event_id = source_override or run_id
-        epoch_id = epoch_override or f"autonomy:{context.now.date().isoformat()}"
-        digest, generated_key, content_length = self._effect_identity(
-            selected, source_event_id, epoch_id
-        )
-        idempotency_key = idempotency_override or generated_key
-
-        existing = self._find_by_idempotency(idempotency_key)
-        if existing is not None:
+        if existing_selection is not None:
+            record = existing_selection
+            digest = self._record_value(record, "content_sha256")
+            content_length = self._record_value(record, "content_length")
+            idempotency_key = self._record_value(record, "idempotency_key")
+        else:
+            digest, generated_key, content_length = self._effect_identity(
+                selected, source_event_id, effect_epoch_id
+            )
+            idempotency_key = idempotency_override or generated_key
+            provider_settings = settings.get(selected, {})
+            ttl_value = provider_settings.get("effect_ttl", _DEFAULT_EFFECT_TTL)
+            if isinstance(ttl_value, timedelta):
+                ttl = ttl_value
+            else:
+                try:
+                    ttl = timedelta(seconds=float(ttl_value))
+                except (TypeError, ValueError):
+                    ttl = _DEFAULT_EFFECT_TTL
+            if ttl <= timedelta(0) or ttl > timedelta(days=31):
+                ttl = _DEFAULT_EFFECT_TTL
+            try:
+                record = self.effect_ledger.begin_intent(
+                    effect_id=_new_autonomy_effect_id(selected),
+                    kind=AUTONOMY_EFFECT_KIND,
+                    source_event_id=source_event_id,
+                    idempotency_key=idempotency_key,
+                    epoch_id=effect_epoch_id,
+                    content_sha256=digest,
+                    content_length=content_length,
+                    expires_at=context.now + ttl,
+                    created_at=context.now,
+                )
+            except Exception as exc:
+                return finish(
+                    ActivityResult(
+                        "failed",
+                        selected,
+                        f"effect_intent_error:{type(exc).__name__}",
+                        run_id=run_id,
+                    ),
+                    gate,
+                )
             reconciled = self._existing_result(
-                existing, provider=selected, gate=gate, run_id=run_id
+                record,
+                provider=selected,
+                gate=gate,
+                run_id=run_id,
+                public_epoch_id=epoch_id,
             )
             if reconciled is not None:
                 return reconciled
-
-        provider_settings = settings.get(selected, {})
-        ttl_value = provider_settings.get("effect_ttl", _DEFAULT_EFFECT_TTL)
-        if isinstance(ttl_value, timedelta):
-            ttl = ttl_value
-        else:
-            try:
-                ttl = timedelta(seconds=float(ttl_value))
-            except (TypeError, ValueError):
-                ttl = _DEFAULT_EFFECT_TTL
-        if ttl <= timedelta(0) or ttl > timedelta(days=31):
-            ttl = _DEFAULT_EFFECT_TTL
-        try:
-            record = self.effect_ledger.begin_intent(
-                kind=AUTONOMY_EFFECT_KIND,
-                source_event_id=source_event_id,
-                idempotency_key=idempotency_key,
-                epoch_id=epoch_id,
-                content_sha256=digest,
-                content_length=content_length,
-                expires_at=context.now + ttl,
-                created_at=context.now,
-            )
-        except Exception as exc:
-            return self._finish(
-                ActivityResult(
-                    "failed",
-                    selected,
-                    f"effect_intent_error:{type(exc).__name__}",
-                    run_id=run_id,
-                ),
-                gate,
-            )
-        reconciled = self._existing_result(
-            record, provider=selected, gate=gate, run_id=run_id
-        )
-        if reconciled is not None:
-            return reconciled
         effect_id = self._record_value(record, "effect_id")
         try:
             self.bus.emit(
@@ -2102,10 +2642,13 @@ class AutonomyEngine:
                     "provider": selected,
                     "selection": selection_reason,
                     "effect_id": effect_id,
+                    "occurrence_id": source_event_id,
+                    "epoch_id": effect_epoch_id,
+                    "idempotency_key": idempotency_key,
                 },
             )
         except Exception as exc:
-            return self._finish(
+            return finish(
                 ActivityResult(
                     "failed",
                     selected,
@@ -2127,7 +2670,7 @@ class AutonomyEngine:
                 self.effect_ledger.fail(effect_id, "effect_pending_error", False)
             except Exception:
                 pass
-            return self._finish(
+            return finish(
                 ActivityResult(
                     "failed",
                     selected,
@@ -2143,7 +2686,7 @@ class AutonomyEngine:
             effect_id=effect_id,
             idempotency_key=idempotency_key,
             source_event_id=source_event_id,
-            epoch_id=epoch_id,
+            epoch_id=effect_epoch_id,
             content_sha256=digest,
             content_length=content_length,
             attempt=int(self._record_value(pending, "attempt", 1)),
@@ -2158,7 +2701,7 @@ class AutonomyEngine:
                 )
             except Exception:
                 failed = pending
-            return self._finish(
+            return finish(
                 ActivityResult(
                     "failed",
                     selected,
@@ -2180,7 +2723,7 @@ class AutonomyEngine:
                 failed = self.effect_ledger.fail(effect_id, evidence_error, False)
             except Exception:
                 failed = pending
-            return self._finish(
+            return finish(
                 ActivityResult(
                     "failed",
                     selected,
@@ -2200,7 +2743,7 @@ class AutonomyEngine:
             try:
                 unverified = self.effect_ledger.mark_queue_accepted(effect_id)
             except Exception as exc:
-                return self._finish(
+                return finish(
                     ActivityResult(
                         "failed",
                         selected,
@@ -2213,7 +2756,7 @@ class AutonomyEngine:
                     ),
                     gate,
                 )
-            return self._finish(
+            return finish(
                 ActivityResult(
                     "executed_unverified",
                     selected,
@@ -2238,7 +2781,7 @@ class AutonomyEngine:
                 failed = self.effect_ledger.fail(effect_id, "receipt_mismatch", False)
             except Exception:
                 failed = pending
-            return self._finish(
+            return finish(
                 ActivityResult(
                     "failed",
                     selected,
@@ -2257,7 +2800,7 @@ class AutonomyEngine:
         try:
             self._consume_verified(gate, effect_id=effect_id, allow_current=True)
         except Exception:
-            return self._finish(
+            return finish(
                 ActivityResult(
                     "failed",
                     selected,
@@ -2275,7 +2818,7 @@ class AutonomyEngine:
                 ),
                 gate,
             )
-        return self._finish(
+        return finish(
             ActivityResult(
                 "completed",
                 selected,
