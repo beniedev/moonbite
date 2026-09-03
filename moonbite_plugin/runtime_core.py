@@ -379,9 +379,7 @@ class EventBus:
             raise ValueError("audit action must be non-empty")
         if type(occurrence_id) is not str or not occurrence_id.strip():
             raise ValueError("audit occurrence_id must be non-empty")
-        if epoch_id is not None and (
-            type(epoch_id) is not str or not epoch_id.strip()
-        ):
+        if epoch_id is not None and (type(epoch_id) is not str or not epoch_id.strip()):
             raise ValueError("audit epoch_id must be non-empty when provided")
         found: EventEnvelope | None = None
         for row in self.audit.rows():
@@ -434,9 +432,7 @@ class EventBus:
             raise ValueError("audit action must be non-empty")
         if type(occurrence_id) is not str or not occurrence_id.strip():
             raise ValueError("audit occurrence_id must be non-empty")
-        if epoch_id is not None and (
-            type(epoch_id) is not str or not epoch_id.strip()
-        ):
+        if epoch_id is not None and (type(epoch_id) is not str or not epoch_id.strip()):
             raise ValueError("audit epoch_id must be non-empty when provided")
         if type(terminal) is not str or not terminal.strip():
             raise ValueError("audit terminal must be non-empty")

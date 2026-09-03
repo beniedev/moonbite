@@ -1766,9 +1766,7 @@ class HeartbeatCadence:
             or not kind.strip()
         ):
             raise ValueError("effect reference identity is invalid")
-        if epoch_id is not None and (
-            type(epoch_id) is not str or not epoch_id.strip()
-        ):
+        if epoch_id is not None and (type(epoch_id) is not str or not epoch_id.strip()):
             raise ValueError("effect reference epoch is invalid")
         key = f"{kind}:{source_event_id}"
         return key if epoch_id is None else f"{key}:{epoch_id}"
@@ -2906,13 +2904,11 @@ class HeartbeatEngine:
                 ):
                     raise StateError("heartbeat audit effect conflict")
                 real_failure = any(
-                    record.state == "failed"
-                    and record.reason != "intentional_silence"
+                    record.state == "failed" and record.reason != "intentional_silence"
                     for record in matching
                 )
                 intentional_silence = any(
-                    record.state == "failed"
-                    and record.reason == "intentional_silence"
+                    record.state == "failed" and record.reason == "intentional_silence"
                     for record in matching
                 )
                 expected = (
@@ -3430,13 +3426,11 @@ class HeartbeatEngine:
         # intentionally silenced delivery.  Silence is only the aggregate
         # terminal when no sibling failed.
         real_failure = any(
-            candidate.state == "failed"
-            and candidate.reason != "intentional_silence"
+            candidate.state == "failed" and candidate.reason != "intentional_silence"
             for candidate in siblings
         )
         intentional_silence = any(
-            candidate.state == "failed"
-            and candidate.reason == "intentional_silence"
+            candidate.state == "failed" and candidate.reason == "intentional_silence"
             for candidate in siblings
         )
         terminal = (
@@ -4100,8 +4094,7 @@ class HeartbeatEngine:
                 except Exception as exc:
                     raise StateError("effect ledger replay failed") from exc
                 if record is not None and (
-                    record.source_event_id != source
-                    or record.epoch_id != effect_epoch
+                    record.source_event_id != source or record.epoch_id != effect_epoch
                 ):
                     continue
                 if record is not None:
@@ -4114,10 +4107,7 @@ class HeartbeatEngine:
             except Exception as exc:
                 raise StateError("effect ledger replay failed") from exc
             for record in pending:
-                if (
-                    record.source_event_id != source
-                    or record.epoch_id != effect_epoch
-                ):
+                if record.source_event_id != source or record.epoch_id != effect_epoch:
                     continue
                 if record.kind == "heartbeat_delivery":
                     selected.setdefault("delivery", record)

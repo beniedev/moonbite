@@ -1155,9 +1155,7 @@ class AutonomyEngine:
         return epoch_id
 
     @classmethod
-    def _terminal_identity(
-        cls, result: ActivityResult
-    ) -> tuple[str, str | None]:
+    def _terminal_identity(cls, result: ActivityResult) -> tuple[str, str | None]:
         """Resolve the public terminal identity without losing effect evidence."""
 
         source_values: list[str] = []
@@ -1183,9 +1181,7 @@ class AutonomyEngine:
 
         evidence = result.evidence
         evidence_epoch = (
-            evidence.get("epoch_id")
-            if isinstance(evidence, Mapping)
-            else None
+            evidence.get("epoch_id") if isinstance(evidence, Mapping) else None
         )
         record_epoch_raw = cls._record_value(result.effect_record, "epoch_id")
         record_epoch = cls._public_epoch_from_record(result.effect_record)
@@ -2335,7 +2331,8 @@ class AutonomyEngine:
             if (
                 result.source_event_id is None
                 or result.canonical_event_id is None
-                or result.epoch_id is None and epoch_id is not None
+                or result.epoch_id is None
+                and epoch_id is not None
             ):
                 result = replace(
                     result,

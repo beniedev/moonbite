@@ -26,7 +26,7 @@ The 7 manifest hooks are registered in strict `HOOK_ORDER`:
 2. `on_session_start`: Fires when a session initializes; records normalized session-start lifecycle telemetry when resolvable context is available.
 3. `pre_llm_call`: Fires immediately before model invocation; records lifecycle step and optionally attaches fresh Panel Afterglow or enabled Memory recall as bounded, untrusted context (never as instructions).
 4. `post_llm_call`: Fires only for a non-empty, non-interrupted final response; records a completed post-model turn.
-5. `on_session_end`: Fires for every completed `run_conversation` path and maps success, failure, interruption, or incomplete exit into canonical terminal evidence without storing free-text exit details. `settled_turn_ids` independently records turns with a successful post callback.
+5. `on_session_end`: With a real `turn_id`, maps success, failure, interruption, or incomplete exit into canonical turn-terminal evidence without storing free-text exit details. Hermes CLI/TUI may instead emit an identifier-poor interrupted shutdown fallback; Moonbite correlates it to the exact durable lifecycle and closes that lifecycle's real open turn as `host_shutdown`, without inventing an ID. `settled_turn_ids` independently records turns with a successful post callback.
 6. `on_session_finalize`: Fires when a session finishes; records normalized session rotation, expiry, or shutdown evidence.
 7. `subagent_stop`: Uses only `child_session_id` and `child_status`; a non-success stop closes that child's unique open turn without reading its summary, goal, or tool history. A completed child is a no-op because its own post/end callbacks carry success.
 
@@ -35,20 +35,25 @@ The outer manifest (`plugin.yaml`) retains `manifest_version: 1` and `kind: stan
 ### Turn liveness contract
 
 Moonbite does not require `post_llm_call` to fire for every `pre_llm_call`.
-HermesHostAdapter consumes the unconditional `on_session_end` callback and the
-non-success `subagent_stop` fallback. Both converge on the same canonical
-terminal row under the same mutation lock; neither manufactures a successful
-post. A later pre-model hook remains a crash-recovery fallback. Operators can inspect open turns with
+HermesHostAdapter consumes turn-scoped `on_session_end`, identifier-poor
+interrupted shutdown fallback, and non-success `subagent_stop` evidence. All
+converge on the same canonical terminal row under the same mutation lock;
+none manufactures a successful post or a fake turn ID. The shutdown fallback
+does not finalize the lifecycle: the later `on_session_finalize` callback owns
+that session boundary. A later pre-model hook remains a crash-recovery
+fallback. Operators can inspect open turns with
 `hermes moonbite session status` and use exact-ID `session repair` only when no
 host terminal was delivered. Every path preserves the append-only ledger and
 never manufactures a completed response.
 
 Legacy Hermes compression can rotate `session_id` after `pre_llm_call` while
-keeping `turn_id` and `task_id` stable. For `post_llm_call` and
+keeping `turn_id` and `task_id` stable. For `post_llm_call` and turn-scoped
 `on_session_end`, HermesHostAdapter therefore correlates that stable `turn_id`
 against Moonbite's durable lifecycle ledger and writes the callback to the
-original lifecycle. Missing evidence remains neutral; ambiguous matches fail
-closed. This uses no recency timer or process-local correlation cache.
+original lifecycle. An identifier-poor shutdown fallback is instead correlated
+by its exact `session_id`; an unmatched session cannot close another lifecycle.
+Missing evidence remains neutral; ambiguous matches fail closed. This uses no
+recency timer or process-local correlation cache.
 
 The next pre-model callback may use the rotated session ID without a matching
 `on_session_start`. HermesHostAdapter then starts a new canonical lifecycle at

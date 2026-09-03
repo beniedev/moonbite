@@ -215,12 +215,13 @@ def test_audit_terminal_epoch_is_independent_and_legacy_rows_stay_readable(tmp_p
     )
 
     assert bus.find_audit_terminal("heartbeat", "same-source") == legacy
-    assert bus.find_audit_terminal(
-        "heartbeat", "same-source", epoch_id="epoch-1"
-    ) == first
-    assert bus.find_audit_terminal(
-        "heartbeat", "same-source", epoch_id="epoch-2"
-    ) == second
+    assert (
+        bus.find_audit_terminal("heartbeat", "same-source", epoch_id="epoch-1") == first
+    )
+    assert (
+        bus.find_audit_terminal("heartbeat", "same-source", epoch_id="epoch-2")
+        == second
+    )
     assert bus.audit.path.read_bytes().startswith(before)
     assert "epoch_id" not in legacy.payload
     assert first.payload["epoch_id"] == "epoch-1"

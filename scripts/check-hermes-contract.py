@@ -185,6 +185,53 @@ def _turn_exit_contract() -> None:
             assert receipt.snapshot.settled_turn_ids == ()
             assert terminal.reason == expected_reason
 
+        shutdown_fallbacks = (
+            {
+                "session_id": "test-session",
+                "task_id": "",
+                "turn_id": "",
+                "api_request_id": "",
+                "completed": False,
+                "interrupted": True,
+                "reason": "keyboard_interrupt",
+                "platform": "cli",
+            },
+            {
+                "session_id": "test-session",
+                "completed": False,
+                "interrupted": True,
+                "reason": "shutdown",
+                "platform": "cli",
+            },
+            {
+                "session_id": "test-session",
+                "completed": False,
+                "interrupted": True,
+                "platform": "tui",
+            },
+        )
+        for index, payload in enumerate(shutdown_fallbacks):
+            store = SessionLifecycleStore(Path(root) / f"shutdown-fallback-{index}")
+            start_turn(store)
+            context = adapter.session_end_shutdown_fallback(
+                payload,
+                supported_hooks=supported,
+            )
+            assert context is not None
+            assert context.turn_id is None
+            context = adapter.correlate_lifecycle(context, store.replay())
+            receipt = store.record_host_shutdown(context)
+            store.record_host_shutdown(context)
+            assert receipt.snapshot.open_turn_id is None
+            assert receipt.snapshot.finalized is False
+            assert receipt.snapshot.abandoned_turn_ids == ("test-turn",)
+            terminal_rows = [
+                row for row in store.ledger.rows() if row["kind"] == "turn_terminal"
+            ]
+            assert len(terminal_rows) == 1
+            assert terminal_rows[0]["turn_id"] == "test-turn"
+            assert terminal_rows[0]["reason"] == "host_shutdown"
+
         child = SessionLifecycleStore(Path(root) / "child-interrupted")
         start_turn(child)
         child_terminal = adapter.subagent_stop_terminal(

@@ -245,9 +245,7 @@ def test_autonomy_epoch_scopes_terminal_and_preserves_legacy_identity(tmp_path):
         calls.append(request)
         return receipt_for(request, receipt_id=f"receipt-{len(calls)}")
 
-    engine, _controls = make_engine(
-        tmp_path, [ActivityProvider("chosen", run)]
-    )
+    engine, _controls = make_engine(tmp_path, [ActivityProvider("chosen", run)])
     source = "same-source"
     legacy = engine.run_once(settings(), facts={"source_event_id": source})
     first = engine.run_once(
@@ -333,7 +331,11 @@ def test_autonomy_no_effect_terminals_keep_epoch_identity(
         source,
         source,
     ]
-    assert [legacy.canonical_event_id, first.canonical_event_id, second.canonical_event_id] == [
+    assert [
+        legacy.canonical_event_id,
+        first.canonical_event_id,
+        second.canonical_event_id,
+    ] == [
         source,
         source,
         source,
