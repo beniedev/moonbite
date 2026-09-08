@@ -17,6 +17,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **CLI failure exits:** Heartbeat and Autonomy business failures now return a nonzero CLI exit code while normal skips, silence and pending work retain their structured outcome without forcing a retry.
+- **Autonomy Judge reasons:** the host adapter bounds valid explanations to 128 UTF-8 bytes without changing the permission decision; empty reasons and invalid booleans remain errors.
+
 - **Orphaned turns:** `on_session_end` now closes a turn whose success-only `post_llm_call` was omitted; a new `pre_llm_call` remains the crash-recovery fallback, preventing the Conversation Gate from remaining permanently active without a TTL.
 - **Compression lifecycle correlation:** if Hermes rotates `session_id` during compression, Moonbite uses the stable `turn_id` and durable lifecycle ledger to attach post/end callbacks to the original turn; ambiguous evidence fails closed.
 - **Canonical proactive terminals:** Heartbeat and Autonomy now persist one occurrence-keyed terminal audit for pre-Judge skips and settled effects. Exact duplicates reuse that terminal before Judge/provider execution, while conflicting source or effect identity fails closed.

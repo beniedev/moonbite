@@ -417,8 +417,11 @@ def _cli_handler(
         )
         return 2
     print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True, default=str))
-    if isinstance(result, Mapping) and result.get("ok") is False:
-        return 1
+    if isinstance(result, Mapping):
+        if command in {"heartbeat", "autonomy"} and result.get("status") == "failed":
+            return 1
+        if result.get("ok") is False:
+            return 1
     return 0
 
 

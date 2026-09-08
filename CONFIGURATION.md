@@ -129,6 +129,21 @@ tool. The host separately decides cadence, realtime versus discounted routing,
 timeouts, and delivery. Disabling a Moonbite module makes its command/tool fail
 visibly even if a stale cron still calls it.
 
+For `heartbeat` and `autonomy`, the CLI returns exit code `1` when the
+structured runtime result has `status: "failed"`. Ordinary skips, intentional
+silence, and accepted or pending work keep exit code `0`. An unknown or
+unverified outcome is not proof of delivery and must not trigger an automatic
+resend. A degraded secondary projection alone does not make the primary effect
+fail. Hosts should inspect the JSON status, reason codes and effect receipts
+when they need completion or delivery evidence; exit code `0` does not supply
+that evidence. Other commands retain their explicit `ok: false` failure check.
+
+The autonomy Judge's explanatory `reason` has a 128 UTF-8-byte budget. The host
+adapter trims surrounding whitespace and bounds a valid reason at a UTF-8
+character boundary before constructing the decision. It preserves `allowed`
+exactly. Empty reasons and non-boolean `allowed` values still fail closed;
+JSON Schema character counts do not express this byte budget.
+
 ## Change procedure
 
 1. Back up the private host config by its normal process.

@@ -48,6 +48,14 @@ CHILD_STOP_TERMINAL_REASONS = frozenset(
         "host_turn_interrupted",
     }
 )
+# Hermes can classify the same max-iteration child as incomplete at session end
+# and failed when the parent aggregates its result.
+_COMPATIBLE_NON_SUCCESS_TERMINAL_REASONS = frozenset(
+    {
+        "host_turn_failed",
+        "host_turn_incomplete",
+    }
+)
 
 HOOK_ORDER = (
     "pre_gateway_dispatch",
@@ -123,6 +131,12 @@ def _reference(value: str, label: str) -> str:
 
 def _ordered_hooks(hooks: frozenset[str]) -> tuple[str, ...]:
     return tuple(hook for hook in HOOK_ORDER if hook in hooks)
+
+
+def _terminal_reasons_compatible(left: str, right: str) -> bool:
+    return left == right or frozenset((left, right)) == (
+        _COMPATIBLE_NON_SUCCESS_TERMINAL_REASONS
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -618,7 +632,9 @@ class SessionLifecycleStore:
                 raise SessionLifecycleError(
                     "subagent_stop requires canonical non-success terminal evidence"
                 )
-            if terminal.reason != callback.terminal_reason:
+            if not _terminal_reasons_compatible(
+                terminal.reason, callback.terminal_reason
+            ):
                 raise SessionLifecycleError(
                     "subagent_stop conflicts with existing terminal evidence"
                 )
@@ -1088,7 +1104,9 @@ class SessionLifecycleStore:
 
             existing_terminal = state.terminals.get(turn_id)
             if existing_terminal is not None:
-                if existing_terminal.reason != terminal_reason:
+                if not _terminal_reasons_compatible(
+                    existing_terminal.reason, terminal_reason
+                ):
                     raise SessionLifecycleError(
                         "on_session_end conflicts with existing terminal evidence"
                     )
@@ -1100,6 +1118,8 @@ class SessionLifecycleStore:
             if turn.outcome == "completed" and terminal_reason not in {
                 "host_turn_completed",
                 "host_turn_completed_without_post",
+                "host_turn_failed",
+                "host_turn_incomplete",
             }:
                 raise SessionLifecycleError(
                     "on_session_end conflicts with settled turn evidence"
@@ -1198,7 +1218,9 @@ class SessionLifecycleStore:
                     terminal is None
                     or turn is None
                     or turn.outcome != "abandoned"
-                    or terminal.reason != terminal_reason
+                    or not _terminal_reasons_compatible(
+                        terminal.reason, terminal_reason
+                    )
                 ):
                     raise SessionLifecycleError(
                         "subagent_stop callback conflicts with terminal evidence"
@@ -1239,7 +1261,9 @@ class SessionLifecycleStore:
                 )
                 self._apply_terminal(state, terminal)
                 terminal_created = True
-            elif terminal is None or terminal.reason != terminal_reason:
+            elif terminal is None or not _terminal_reasons_compatible(
+                terminal.reason, terminal_reason
+            ):
                 raise SessionLifecycleError(
                     "subagent_stop conflicts with existing terminal evidence"
                 )

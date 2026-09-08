@@ -253,6 +253,46 @@ def test_host_turn_end_rejects_conflicting_terminal_classification(tmp_path) -> 
     assert store.ledger.rows()[-1]["terminal_reason"] == "host_turn_failed"
 
 
+@pytest.mark.parametrize(
+    "reason",
+    ("host_turn_incomplete", "host_turn_failed"),
+)
+def test_settled_post_accepts_canonical_non_success_classification(
+    tmp_path, reason
+) -> None:
+    store = open_turn_store(tmp_path)
+    store.record_hook(
+        context(
+            "post",
+            source_kind="assistant_response",
+            turn_id="turn-1",
+            supported_hooks=FINALIZE_HOOKS,
+        ),
+        "post_llm_call",
+        settled=True,
+    )
+
+    receipt = store.record_host_turn_end(
+        context(
+            "end",
+            source_kind="system",
+            turn_id="turn-1",
+            supported_hooks=FINALIZE_HOOKS,
+        ),
+        reason,
+    )
+
+    assert receipt.hook == "on_session_end"
+    assert receipt.snapshot.settled_turn_ids == ("turn-1",)
+    assert receipt.snapshot.abandoned_turn_ids == ()
+    assert [row for row in store.ledger.rows() if row["kind"] == "turn_terminal"] == []
+    assert store.ledger.rows()[-1]["hook"] == "on_session_end"
+    assert store.ledger.rows()[-1]["terminal_reason"] == reason
+    assert SessionLifecycleStore(tmp_path).snapshot("lifecycle-1").settled_turn_ids == (
+        "turn-1",
+    )
+
+
 def test_child_stop_first_and_session_end_later_share_one_terminal(tmp_path) -> None:
     store = open_child_store(tmp_path)
 
@@ -313,6 +353,62 @@ def test_session_end_first_and_child_stop_later_add_one_callback(tmp_path) -> No
         for row in store.ledger.rows()
         if row["kind"] == "hook" and row["hook"] == "subagent_stop"
     ] == ["subagent_stop"]
+
+
+def test_session_end_incomplete_then_child_stop_failed_keeps_first_terminal(
+    tmp_path,
+) -> None:
+    store = open_child_store(tmp_path)
+    store.record_host_turn_end(
+        context(
+            "end",
+            source_kind="system",
+            turn_id="turn-1",
+            supported_hooks=ALL_HOOKS,
+        ),
+        "host_turn_incomplete",
+    )
+
+    child = store.record_host_child_stop("session-1", "host_turn_failed")
+    replay = store.record_host_child_stop("session-1", "host_turn_failed")
+
+    terminal_rows = [
+        row for row in store.ledger.rows() if row["kind"] == "turn_terminal"
+    ]
+    assert child.hook == "subagent_stop"
+    assert replay.deduplicated is True
+    assert [row["reason"] for row in terminal_rows] == ["host_turn_incomplete"]
+    assert store.ledger.rows()[-1]["terminal_reason"] == "host_turn_failed"
+    assert SessionLifecycleStore(tmp_path).snapshot(
+        "lifecycle-1"
+    ).abandoned_turn_ids == ("turn-1",)
+
+
+def test_child_stop_failed_then_session_end_incomplete_keeps_first_terminal(
+    tmp_path,
+) -> None:
+    store = open_child_store(tmp_path)
+    store.record_host_child_stop("session-1", "host_turn_failed")
+
+    end = store.record_host_turn_end(
+        context(
+            "end",
+            source_kind="system",
+            turn_id="turn-1",
+            supported_hooks=ALL_HOOKS,
+        ),
+        "host_turn_incomplete",
+    )
+
+    terminal_rows = [
+        row for row in store.ledger.rows() if row["kind"] == "turn_terminal"
+    ]
+    assert end.hook == "on_session_end"
+    assert [row["reason"] for row in terminal_rows] == ["host_turn_failed"]
+    assert store.ledger.rows()[-1]["terminal_reason"] == "host_turn_incomplete"
+    assert SessionLifecycleStore(tmp_path).snapshot(
+        "lifecycle-1"
+    ).abandoned_turn_ids == ("turn-1",)
 
 
 def test_child_stop_after_finalized_terminal_is_idempotent(tmp_path) -> None:
