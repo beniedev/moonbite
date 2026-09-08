@@ -1204,6 +1204,8 @@ class AutonomyEngine:
         self,
         result: ActivityResult,
         gate: GateResult,
+        *,
+        record_terminal: bool = True,
     ) -> ActivityResult:
         occurrence_id, epoch_id = self._terminal_identity(result)
         result = replace(
@@ -1212,7 +1214,7 @@ class AutonomyEngine:
             canonical_event_id=result.canonical_event_id or occurrence_id,
             epoch_id=epoch_id,
         )
-        terminal = self._canonical_terminal(result)
+        terminal = self._canonical_terminal(result) if record_terminal else None
         evidence = None
         if result.evidence:
             evidence = {
@@ -1307,6 +1309,7 @@ class AutonomyEngine:
         occurrence_id: str,
         *,
         epoch_id: str | None = None,
+        ledger_epoch_id: str,
     ) -> ActivityResult | None:
         finder = getattr(self.bus, "find_audit_terminal", None)
         if not callable(finder):
@@ -1318,46 +1321,59 @@ class AutonomyEngine:
         terminal = payload.get("terminal")
         if type(terminal) is not str or not terminal.strip():
             raise RuntimeError("autonomy terminal audit is invalid")
-        # EffectLedger remains truth if an effect exists for this exact
-        # occurrence.  An audit projection cannot mask a conflicting effect.
-        if epoch_id is not None:
-            matching = [
-                record
-                for record in self.effect_ledger.records()
-                if self._record_value(record, "kind") == AUTONOMY_EFFECT_KIND
-                and self._record_value(record, "source_event_id") == occurrence_id
-                and self._record_value(record, "epoch_id") == epoch_id
-            ]
-            if len(matching) > 1:
-                raise RuntimeError("autonomy occurrence conflict")
-            if matching:
-                state = self._record_state(matching[0])
-                effect_terminal = (
-                    "verified"
-                    if state == "verified"
-                    else "failed"
-                    if state == "failed"
-                    else None
-                )
-                if (
-                    effect_terminal == "failed"
-                    and self._record_value(matching[0], "reason")
-                    == "effect_expired_unverified"
-                ):
-                    effect_terminal = "expired"
-                if effect_terminal is not None and effect_terminal != terminal:
+        # EffectLedger remains truth for this exact public occurrence and its
+        # durable internal epoch.  The public epoch is optional for legacy
+        # callers, so checking only ``epoch_id`` would let a no-epoch audit
+        # mask a date-derived effect or mix two identities.
+        matching = [
+            record
+            for record in self.effect_ledger.records()
+            if self._record_value(record, "kind") == AUTONOMY_EFFECT_KIND
+            and self._record_value(record, "source_event_id") == occurrence_id
+            and self._record_value(record, "epoch_id") == ledger_epoch_id
+        ]
+        if len(matching) > 1:
+            raise RuntimeError("autonomy occurrence conflict")
+        if matching:
+            record = matching[0]
+            state = self._record_state(record)
+            effect_terminal = (
+                "verified"
+                if state == "verified"
+                else "failed"
+                if state == "failed"
+                else None
+            )
+            if (
+                effect_terminal == "failed"
+                and self._record_value(record, "reason") == "effect_expired_unverified"
+            ):
+                effect_terminal = "expired"
+            if effect_terminal is not None:
+                if effect_terminal != terminal:
                     raise RuntimeError("audit effect conflict")
-                if effect_terminal is not None:
-                    return None
-                raise RuntimeError("audit effect conflict")
+                # Let _existing_result serialize the durable effect, including
+                # its receipt and failure reason, instead of trusting audit.
+                return None
+            # A terminal skip cannot mask an intent that is still awaiting a
+            # durable provider outcome.  Replaying it would turn a temporary
+            # authority decision into a false terminal state.
+            raise RuntimeError("audit effect conflict")
+        elif payload.get("effect_id") is not None:
+            # An effect-bearing terminal without its exact ledger record is
+            # untrusted.  Replaying it would hide an incomplete or conflicting
+            # effect, especially on the legacy no-public-epoch path.
+            raise RuntimeError("autonomy terminal effect unavailable")
         status = payload.get("status")
-        result_status = (
-            "completed"
-            if status == "completed"
-            else "failed"
-            if status == "failed"
-            else "skipped"
-        )
+        if status == "completed":
+            # Autonomy completion is receipt-backed.  A canonical success with
+            # no matching effect cannot prove delivery and must not be replayed.
+            # Let the caller's existing-terminal conflict path fail closed
+            # without appending another terminal for the same identity.
+            raise RuntimeError("autonomy terminal effect unavailable")
+        if status not in {"skipped", "failed"}:
+            raise RuntimeError("autonomy terminal status invalid")
+        result_status = status
         provider = payload.get("provider")
         if not isinstance(provider, str) or not provider.strip():
             provider = None
@@ -1528,16 +1544,26 @@ class AutonomyEngine:
                 return parts[1]
         return None
 
-    def _provider_history(self, name: str) -> list[Any]:
+    def _provider_history(
+        self, name: str, *, exclude_effect_id: str | None = None
+    ) -> list[Any]:
+        def is_excluded(record: Any) -> bool:
+            return (
+                exclude_effect_id is not None
+                and self._record_value(record, "effect_id") == exclude_effect_id
+            )
+
         rows = [
             record
             for record in self._audit_history()
-            if self._record_provider(record) == name
+            if self._record_provider(record) == name and not is_excluded(record)
         ]
         latest_by_effect: dict[str, Any] = {}
         without_effect: list[Any] = []
         for record in rows:
             effect_id = self._record_value(record, "effect_id")
+            if is_excluded(record):
+                continue
             if isinstance(effect_id, str) and effect_id:
                 latest_by_effect[effect_id] = record
             else:
@@ -1670,6 +1696,8 @@ class AutonomyEngine:
         provider: ActivityProvider,
         provider_settings: Mapping[str, Any],
         context: AutonomyContext,
+        *,
+        exclude_effect_id: str | None = None,
     ) -> str | None:
         facts = context.facts
         source = facts.get("source", facts.get("source_kind"))
@@ -1695,7 +1723,9 @@ class AutonomyEngine:
             return "channel_not_allowed"
 
         try:
-            history = self._provider_history(provider.name)
+            history = self._provider_history(
+                provider.name, exclude_effect_id=exclude_effect_id
+            )
         except Exception as exc:
             raise ProviderEligibilityError(provider.name, exc) from exc
         now = context.now
@@ -1860,6 +1890,124 @@ class AutonomyEngine:
             and self._record_value(record, "source_event_id") == source_event_id
             and self._record_value(record, "epoch_id") == epoch_id
         ]
+        if len(matches) > 1:
+            raise ValueError("occurrence_conflict")
+        return matches[0] if matches else None
+
+    def _audit_identity_for_record(self, source_event_id: str, record: Any) -> str:
+        """Classify scoped audit proof for one durable autonomy effect."""
+
+        effect_id = self._record_value(record, "effect_id")
+        record_key = self._record_value(record, "idempotency_key")
+        record_epoch = self._record_value(record, "epoch_id")
+        if (
+            not isinstance(effect_id, str)
+            or not effect_id.strip()
+            or not isinstance(record_epoch, str)
+            or not record_epoch.strip()
+        ):
+            return "unknown"
+        record_public_epoch = self._public_epoch_from_record(record)
+        implicit = False
+        explicit = False
+        matched = False
+        invalid = False
+        try:
+            events = self.bus.read_audit()
+        except Exception:
+            return "unknown"
+        for event in events:
+            if (
+                getattr(event, "kind", None) != "audit.autonomy"
+                or getattr(event, "source", None) != "autonomy"
+            ):
+                continue
+            payload = getattr(event, "payload", None)
+            if not isinstance(payload, Mapping):
+                continue
+            if payload.get("effect_id") != effect_id:
+                continue
+            occurrence_id = payload.get("occurrence_id")
+            payload_source = payload.get("source_event_id")
+            if (
+                occurrence_id is not None
+                and payload_source is not None
+                and occurrence_id != payload_source
+            ):
+                if (
+                    occurrence_id == source_event_id
+                    or payload_source == source_event_id
+                ):
+                    invalid = True
+                continue
+            if occurrence_id != source_event_id and payload_source != source_event_id:
+                continue
+            matched = True
+            row_key = payload.get("idempotency_key")
+            if row_key is not None and row_key != record_key:
+                invalid = True
+                continue
+            row_epoch = payload.get("epoch_id")
+            if row_epoch is None:
+                if record_public_epoch is None:
+                    implicit = True
+                else:
+                    invalid = True
+                continue
+            if type(row_epoch) is not str or not row_epoch.strip():
+                invalid = True
+                continue
+            if row_epoch != record_epoch:
+                invalid = True
+                continue
+            explicit = True
+        if invalid or not matched or (implicit and explicit):
+            return "unknown"
+        if explicit:
+            return "explicit"
+        if implicit:
+            return "implicit"
+        return "unknown"
+
+    def _find_implicit_occurrence(
+        self, source_event_id: str, *, requested_epoch_id: str
+    ) -> Any | None:
+        """Find one legacy occurrence from a scoped audit identity proof.
+
+        A caller that omits the public epoch cannot infer identity from a
+        date-shaped internal epoch or from the generated idempotency key.  An
+        ``audit.autonomy`` row emitted by this module, with the same
+        occurrence/source and effect, is the proof.  Rows from another audit
+        kind/source, rows with contradictory identity fields, and effects with
+        no proof are ignored or fail closed.  A non-null public epoch marks an
+        exact effect as explicit, so it cannot be replayed by a legacy retry.
+        """
+
+        matches: list[Any] = []
+        unproven: list[Any] = []
+        for record in self.effect_ledger.records():
+            if self._record_value(record, "kind") != AUTONOMY_EFFECT_KIND:
+                continue
+            if self._record_value(record, "source_event_id") != source_event_id:
+                continue
+            effect_id = self._record_value(record, "effect_id")
+            if not isinstance(effect_id, str) or not effect_id.strip():
+                continue
+            identity = self._audit_identity_for_record(source_event_id, record)
+            if identity == "unknown":
+                unproven.append(record)
+            elif identity == "implicit":
+                matches.append(record)
+            else:
+                # An explicit epoch that equals the internal epoch requested
+                # by this legacy retry is indistinguishable from it in the
+                # ledger schema.  Keep the retry pending instead of allowing
+                # a fresh begin_intent to collide or replay it.
+                record_epoch = self._record_value(record, "epoch_id")
+                if record_epoch == requested_epoch_id:
+                    unproven.append(record)
+        if unproven:
+            raise ValueError("implicit_identity_unavailable")
         if len(matches) > 1:
             raise ValueError("occurrence_conflict")
         return matches[0] if matches else None
@@ -2319,14 +2467,12 @@ class AutonomyEngine:
         effect_epoch_id = epoch_override or (
             f"autonomy:{context.now.date().isoformat()}"
         )
-        existing_terminal = self._existing_terminal_result(
-            source_event_id, epoch_id=epoch_id
-        )
-        if existing_terminal is not None:
-            return existing_terminal
 
         def finish(
-            result: ActivityResult, _gate: GateResult | None = None
+            result: ActivityResult,
+            _gate: GateResult | None = None,
+            *,
+            record_terminal: bool = True,
         ) -> ActivityResult:
             if (
                 result.source_event_id is None
@@ -2341,22 +2487,7 @@ class AutonomyEngine:
                     canonical_event_id=result.canonical_event_id or source_event_id,
                     epoch_id=result.epoch_id or epoch_id,
                 )
-            return self._finish(result, gate)
-
-        self._settle_expired_unverified(now=now, gate=gate)
-        if not gate.allowed:
-            return finish(ActivityResult("skipped", None, gate.reason))
-
-        # Active-chat is a hard gate.  It is checked before Judge and before
-        # any autonomy event/effect intent is emitted.  A present non-bool is
-        # malformed control input, not an invitation to guess.
-        for chat_key in ("active_chat", "chat_active"):
-            if chat_key in context.facts and type(context.facts[chat_key]) is not bool:
-                return finish(
-                    ActivityResult("failed", None, f"{chat_key}_invalid"), gate
-                )
-            if context.facts.get(chat_key) is True:
-                return finish(ActivityResult("skipped", None, "active_chat"))
+            return self._finish(result, gate, record_terminal=record_terminal)
 
         requested: str | None = None
         payload = resolution.intent.payload if resolution.intent is not None else {}
@@ -2368,9 +2499,22 @@ class AutonomyEngine:
         try:
             if idempotency_override is not None:
                 existing_selection = self._find_by_idempotency(idempotency_override)
-            if existing_selection is None and source_override is not None:
+            if (
+                existing_selection is None
+                and source_override is not None
+                and epoch_override is not None
+            ):
                 existing_selection = self._find_by_occurrence(
                     source_event_id, effect_epoch_id
+                )
+            if (
+                existing_selection is None
+                and source_override is not None
+                and epoch_override is None
+            ):
+                existing_selection = self._find_implicit_occurrence(
+                    source_event_id,
+                    requested_epoch_id=effect_epoch_id,
                 )
             if existing_selection is not None:
                 if (
@@ -2388,8 +2532,53 @@ class AutonomyEngine:
                     raise ValueError("occurrence_conflict")
                 source_event_id = recorded_source
                 effect_epoch_id = recorded_epoch
-        except ValueError:
-            return finish(ActivityResult("failed", None, "occurrence_conflict"), gate)
+                if (
+                    idempotency_override is not None
+                    and epoch_override is None
+                    and self._audit_identity_for_record(
+                        source_event_id, existing_selection
+                    )
+                    != "implicit"
+                ):
+                    # An idempotency key identifies a durable effect, but it
+                    # does not supply the missing public epoch.  Refuse an
+                    # explicit effect under a legacy request instead of
+                    # replaying it across public identity boundaries.
+                    raise ValueError("implicit_identity_unavailable")
+                if (
+                    epoch_override is not None
+                    and epoch_override == recorded_epoch
+                    and self._public_epoch_from_record(existing_selection) is None
+                    and self._audit_identity_for_record(
+                        source_event_id, existing_selection
+                    )
+                    != "explicit"
+                ):
+                    # A date-shaped internal epoch can belong either to a
+                    # legacy occurrence or to an explicit caller value.  A
+                    # source-plus-epoch retry cannot resolve that collision
+                    # from the ledger alone, so leave the record untouched.
+                    raise ValueError("implicit_identity_unavailable")
+        except ValueError as exc:
+            if str(exc) == "implicit_identity_unavailable":
+                # The ledger candidate remains untouched, but its internal
+                # epoch is not enough to prove a legacy public identity.  Do
+                # not turn that uncertainty into a permanent terminal that
+                # would poison a later retry once valid evidence exists.
+                return finish(
+                    ActivityResult(
+                        "awaiting_reconciliation",
+                        None,
+                        "implicit_identity_unavailable",
+                        run_id=run_id,
+                        source_event_id=source_event_id,
+                        canonical_event_id=source_event_id,
+                    ),
+                    gate,
+                    record_terminal=False,
+                )
+            reason = "occurrence_conflict"
+            return finish(ActivityResult("failed", None, reason), gate)
         except Exception as exc:
             return finish(
                 ActivityResult(
@@ -2398,41 +2587,238 @@ class AutonomyEngine:
                 gate,
             )
 
+        # Resolve an existing canonical terminal before current admission
+        # gates.  A prior no-effect skip is still the durable fact for this
+        # occurrence, while an effect-bearing terminal is checked against the
+        # exact ledger epoch before its state is replayed.
+        try:
+            existing_terminal = self._existing_terminal_result(
+                source_event_id,
+                epoch_id=epoch_id,
+                ledger_epoch_id=effect_epoch_id,
+            )
+        except Exception as exc:
+            return finish(
+                ActivityResult(
+                    "failed",
+                    None,
+                    f"terminal_integrity_error:{type(exc).__name__}",
+                ),
+                gate,
+            )
+        if existing_terminal is not None:
+            return existing_terminal
+
+        unexecuted_intent = (
+            existing_selection is not None
+            and self._record_state(existing_selection) == "intent"
+        )
+        intent_provider = (
+            self._record_provider(existing_selection) if unexecuted_intent else None
+        )
+        intent_effect_id = (
+            self._record_value(existing_selection, "effect_id")
+            if unexecuted_intent
+            else None
+        )
+
+        def intent_skip(reason: str) -> ActivityResult:
+            return ActivityResult(
+                "skipped",
+                intent_provider,
+                reason,
+                run_id=run_id,
+                effect_id=intent_effect_id,
+                evidence=self._record_evidence(existing_selection),
+                source_event_id=source_event_id,
+                idempotency_key=self._record_value(
+                    existing_selection, "idempotency_key"
+                ),
+                effect_record=(
+                    existing_selection
+                    if isinstance(existing_selection, EffectRecord)
+                    else None
+                ),
+                canonical_event_id=source_event_id,
+                epoch_id=epoch_id,
+            )
+
+        self._settle_expired_unverified(now=now, gate=gate)
+
+        # Resolve the durable effect before evaluating current gates.  A
+        # pending or executed effect belongs to the host's reconciliation
+        # path; replaying it through a current chat/control gate would append
+        # a misleading terminal skip for work that already started.
+        if existing_selection is not None:
+            refreshed = self.effect_ledger.get(
+                self._record_value(existing_selection, "effect_id")
+            )
+            if refreshed is not None:
+                existing_selection = refreshed
+            if self._record_state(existing_selection) != "intent":
+                selected_existing = self._record_provider(existing_selection)
+                reconciled = self._existing_result(
+                    existing_selection,
+                    provider=selected_existing or "unknown",
+                    gate=gate,
+                    run_id=self._record_value(existing_selection, "effect_id"),
+                    public_epoch_id=epoch_id,
+                )
+                if reconciled is not None:
+                    return reconciled
+                if selected_existing is None:
+                    return finish(
+                        ActivityResult(
+                            "awaiting_reconciliation",
+                            None,
+                            "selection_provider_unavailable",
+                            run_id=run_id,
+                            effect_id=self._record_value(
+                                existing_selection, "effect_id"
+                            ),
+                            evidence=self._record_evidence(existing_selection),
+                            source_event_id=source_event_id,
+                            idempotency_key=self._record_value(
+                                existing_selection, "idempotency_key"
+                            ),
+                            effect_record=(
+                                existing_selection
+                                if isinstance(existing_selection, EffectRecord)
+                                else None
+                            ),
+                            canonical_event_id=source_event_id,
+                        ),
+                        gate,
+                    )
+
+        if not gate.allowed:
+            if unexecuted_intent:
+                return finish(
+                    intent_skip(gate.reason),
+                    gate,
+                    record_terminal=False,
+                )
+            return finish(ActivityResult("skipped", None, gate.reason))
+
+        # Active-chat is a hard gate for new effects and unexecuted intents.
+        # Existing pending/executed effects were replayed above so that the
+        # host can reconcile an already-started operation.
+        for chat_key in ("active_chat", "chat_active"):
+            if chat_key in context.facts and type(context.facts[chat_key]) is not bool:
+                return finish(
+                    ActivityResult("failed", None, f"{chat_key}_invalid"), gate
+                )
+            if context.facts.get(chat_key) is True:
+                if unexecuted_intent:
+                    return finish(
+                        intent_skip("active_chat"),
+                        gate,
+                        record_terminal=False,
+                    )
+                return finish(ActivityResult("skipped", None, "active_chat"))
+
         selected: str | None = None
         selection_reason = "selected"
         if existing_selection is not None:
             selected = self._record_provider(existing_selection)
-            reconciled = self._existing_result(
-                existing_selection,
-                provider=selected or "unknown",
-                gate=gate,
-                run_id=self._record_value(existing_selection, "effect_id"),
-                public_epoch_id=epoch_id,
-            )
-            if reconciled is not None:
-                return reconciled
-            if selected is None:
-                return finish(
-                    ActivityResult(
-                        "awaiting_reconciliation",
-                        None,
-                        "selection_provider_unavailable",
-                        run_id=run_id,
-                        effect_id=self._record_value(existing_selection, "effect_id"),
-                        evidence=self._record_evidence(existing_selection),
-                        source_event_id=source_event_id,
-                        idempotency_key=self._record_value(
-                            existing_selection, "idempotency_key"
+            selection_state = self._record_state(existing_selection)
+            if selection_state == "intent":
+                effect_id = self._record_value(existing_selection, "effect_id")
+                try:
+                    self._validate_provider_settings(settings)
+                except _ProviderSettingsError as exc:
+                    return finish(
+                        ActivityResult(
+                            "failed",
+                            selected,
+                            f"invalid_provider_settings:{exc.field}",
+                            run_id=run_id,
+                            effect_id=effect_id,
+                            evidence=self._record_evidence(existing_selection),
+                            source_event_id=source_event_id,
+                            idempotency_key=self._record_value(
+                                existing_selection, "idempotency_key"
+                            ),
+                            effect_record=(
+                                existing_selection
+                                if isinstance(existing_selection, EffectRecord)
+                                else None
+                            ),
+                            canonical_event_id=source_event_id,
                         ),
-                        effect_record=(
-                            existing_selection
-                            if isinstance(existing_selection, EffectRecord)
-                            else None
-                        ),
-                        canonical_event_id=source_event_id,
-                    ),
-                    gate,
+                        gate,
+                    )
+                provider_settings = (
+                    settings.get(selected) if selected is not None else None
                 )
+                provider = self.registry.get(selected) if selected is not None else None
+                if (
+                    provider is None
+                    or not isinstance(provider_settings, Mapping)
+                    or provider_settings.get("enabled") is not True
+                ):
+                    return finish(
+                        intent_skip("no_eligible_provider"),
+                        gate,
+                        record_terminal=False,
+                    )
+                try:
+                    eligibility_reason = self._eligible_reason(
+                        provider,
+                        provider_settings,
+                        context,
+                        exclude_effect_id=effect_id,
+                    )
+                except ProviderEligibilityError as exc:
+                    return finish(
+                        ActivityResult(
+                            "failed",
+                            selected,
+                            f"eligibility_error:{type(exc.cause).__name__}",
+                            run_id=run_id,
+                            effect_id=effect_id,
+                            evidence=self._record_evidence(existing_selection),
+                            source_event_id=source_event_id,
+                            idempotency_key=self._record_value(
+                                existing_selection, "idempotency_key"
+                            ),
+                            effect_record=(
+                                existing_selection
+                                if isinstance(existing_selection, EffectRecord)
+                                else None
+                            ),
+                            canonical_event_id=source_event_id,
+                        ),
+                        gate,
+                    )
+                except (TypeError, ValueError):
+                    return finish(
+                        ActivityResult(
+                            "failed",
+                            selected,
+                            "invalid_provider_settings",
+                            run_id=run_id,
+                            effect_id=effect_id,
+                            evidence=self._record_evidence(existing_selection),
+                            source_event_id=source_event_id,
+                            idempotency_key=self._record_value(
+                                existing_selection, "idempotency_key"
+                            ),
+                            effect_record=(
+                                existing_selection
+                                if isinstance(existing_selection, EffectRecord)
+                                else None
+                            ),
+                            canonical_event_id=source_event_id,
+                        ),
+                        gate,
+                    )
+                if eligibility_reason is not None:
+                    return finish(
+                        intent_skip("no_eligible_provider"),
+                        gate,
+                        record_terminal=False,
+                    )
             selection_reason = "resumed_intent"
         else:
             try:

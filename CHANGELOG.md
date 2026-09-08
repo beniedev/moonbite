@@ -22,11 +22,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Orphaned turns:** `on_session_end` now closes a turn whose success-only `post_llm_call` was omitted; a new `pre_llm_call` remains the crash-recovery fallback, preventing the Conversation Gate from remaining permanently active without a TTL.
 - **Compression lifecycle correlation:** if Hermes rotates `session_id` during compression, Moonbite uses the stable `turn_id` and durable lifecycle ledger to attach post/end callbacks to the original turn; ambiguous evidence fails closed.
-- **Canonical proactive terminals:** Heartbeat and Autonomy now persist one occurrence-keyed terminal audit for pre-Judge skips and settled effects. Exact duplicates reuse that terminal before Judge/provider execution, while conflicting source or effect identity fails closed.
-- **Multi-effect Heartbeat settlement:** an occurrence with both delivery and wake effects is terminal only after every sibling effect settles; one early receipt can no longer make the whole occurrence appear complete.
+- **Canonical proactive terminals:** Heartbeat and Autonomy now persist one occurrence-keyed terminal audit for pre-Judge skips and settled effects. Exact duplicates reuse that terminal before Judge/provider execution, while conflicting source, public epoch or effect identity fails closed.
+- **Effect recovery gates:** already-started work is reconciled before current admission gates. An unexecuted Autonomy intent retains its selected provider and rechecks current permissions without counting its own reservation twice.
+- **Multi-effect Heartbeat settlement:** the complete expected effect set is persisted and its intents are created before the first adapter action. An early receipt cannot settle the whole occurrence while another required effect is missing or pending.
+- **Receipt replay identity:** synchronous completion and later reconciliation use the same public occurrence identity, including explicit epochs that match internal defaults. Audit replay checks the complete stored effect set and rejects contradictory nested receipts or terminal statuses. A verified effect claim requires durable effect evidence. Legitimate outcomes without effects, including Heartbeat completion and Autonomy skips or early failures, remain supported.
 
 ### Compatibility
 
+- Recovery does not rewrite historical audit or effect rows. Legacy Heartbeat occurrences without evidence of a complete effect set remain pending; legacy Autonomy identities that cannot be distinguished from an explicit epoch fail closed. These outcomes must not be interpreted as completed work or retried under a new occurrence identity.
 - Session ledgers may now contain additive `moon.session.turn_terminal.v1` rows. Moonbite `0.1.0a1` cannot read upgraded state; take a state snapshot before upgrading and retain the new reader or restore that snapshot when rolling back.
 
 ## [0.1.0a1] - 2026-08-28
