@@ -96,12 +96,15 @@ Hermes 则继续管模型、工具、调度和投递。
 - **Heartbeat** 判断一件事现在是否值得关注、行动或升级。它是判断流程，
   不是定时器。
 - **Autonomy** 在宿主提供机会时，每次 Tick 最多执行一项符合条件的有限
-  自主活动。如果选中的活动失败，Moonbite 会记录失败，不会在同一次 Tick
-  改选另一项。
+  自主活动。宿主适配器会逐活动显式注入 Provider；Moonbite 只做一次可重放
+  的加权选择并拥有对应的 Effect 生命周期。如果选中的活动失败，Moonbite
+  会记录失败，不会在同一次 Tick 改选另一项。
 - **Runtime Core** 用追加式记录维护事件、状态变化、控制规则与决策，使它们
   保持一致并可供审计。
 - **控制规则与执行回执** 负责暂停、配额、频率、执行条件和安全限制。只有
   收到匹配的宿主执行回执（receipt），外部操作才会被认定为已接受或完成。
+  `proactive` 是 Heartbeat 与 Autonomy 共用的一道维护门；旧名称
+  `background_costly` 只会映射到同一份状态，不会形成第二套控制。
 
 ## Moonbite 与宿主各自负责什么
 
@@ -153,6 +156,8 @@ hermes plugins enable moonbite --no-allow-tool-override
 ```bash
 hermes moonbite doctor
 hermes moonbite status
+hermes moonbite control pause proactive
+hermes moonbite control resume proactive
 ```
 
 Doctor 不会产生外部影响：不调用模型、不探测网络，也不写入状态。安全的默认

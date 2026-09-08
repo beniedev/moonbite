@@ -100,13 +100,18 @@ execution, and delivery. The main agent keeps final interpretive authority.
 - **Heartbeat** decides whether something deserves attention, action, or
   escalation now. It is a decision pipeline, not a timer.
 - **Autonomy** performs at most one eligible, host-triggered activity per tick.
-  If the selected activity fails, Moonbite records the failure instead of
-  choosing another one in the same tick.
+  Host adapters explicitly inject per-activity providers; Moonbite makes one
+  replayable weighted selection and owns its effect lifecycle. If the selected
+  activity fails, Moonbite records the failure instead of choosing another one
+  in the same tick.
 - **Runtime Core** keeps events, state changes, controls, and decisions
   consistent in append-only records.
 - **Controls and execution receipts** apply pause, quota, frequency, eligibility,
   and safety rules, then require a matching host receipt before an external
-  action is considered accepted or completed.
+  action is considered accepted or completed. The `proactive` group is one
+  maintenance gate for both Heartbeat and Autonomy; the legacy
+  `background_costly` name resolves to that same state rather than creating a
+  second control.
 
 ## What Moonbite leaves to the host
 
@@ -161,6 +166,8 @@ After starting a fresh Hermes process:
 ```bash
 hermes moonbite doctor
 hermes moonbite status
+hermes moonbite control pause proactive
+hermes moonbite control resume proactive
 ```
 
 The doctor is side-effect-free: it performs no model call, network probe, or

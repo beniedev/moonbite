@@ -9,6 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from moonbite_plugin.autonomy import ActivityProvider, AllowAutonomyJudge
 from moonbite_plugin.config import ConfigError
 from moonbite_plugin.effects import EffectLedger, EffectReceipt
 from moonbite_plugin.plugin import (
@@ -823,6 +824,81 @@ def test_cli_parser_and_handler_round_trip(capsys, monkeypatch, tmp_path):
     args = parser.parse_args(["doctor"])
     assert ctx.cli["handler_fn"](args) == 0
     assert json.loads(capsys.readouterr().out)["ok"] is True
+
+
+def test_register_passes_host_activity_providers_to_runtime(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
+    provider = ActivityProvider("host_activity", lambda _request: "accepted")
+
+    runtime = register(FakeContext(), activity_providers=(provider,))
+
+    assert runtime.providers.get("host_activity") is provider
+
+
+def test_autonomy_cli_accepts_stable_host_occurrence_identity(
+    capsys, monkeypatch, tmp_path
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
+    ctx = FakeContext(
+        {
+            "modules": {"autonomy": True},
+            "autonomy": {
+                "providers": {"host_activity": {"enabled": True, "weight": 1}}
+            },
+        }
+    )
+    register(
+        ctx,
+        autonomy_judge=AllowAutonomyJudge(),
+        activity_providers=(
+            ActivityProvider("host_activity", lambda _request: "accepted"),
+        ),
+    )
+    parser = argparse.ArgumentParser()
+    ctx.cli["setup_fn"](parser)
+
+    result = ctx.cli["handler_fn"](
+        parser.parse_args(
+            [
+                "autonomy",
+                "--occurrence-id",
+                "occurrence-1",
+                "--epoch-id",
+                "epoch-1",
+            ]
+        )
+    )
+    output = json.loads(capsys.readouterr().out)
+
+    assert result == 0
+    assert output["source_event_id"] == "occurrence-1"
+
+
+def test_proactive_control_cli_slash_and_legacy_alias_share_state(
+    capsys, monkeypatch, tmp_path
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
+    ctx = FakeContext()
+    register(ctx)
+    parser = argparse.ArgumentParser()
+    ctx.cli["setup_fn"](parser)
+
+    assert (
+        ctx.cli["handler_fn"](
+            parser.parse_args(["control", "pause", "background_costly"])
+        )
+        == 0
+    )
+    paused = json.loads(capsys.readouterr().out)
+    assert paused["control"]["feature"] == "proactive"
+
+    status = json.loads(ctx.slash["handler"]("status proactive"))
+    assert status["feature"] == "proactive"
+    assert [item["feature"] for item in status["controls"]] == ["proactive"]
+
+    resumed = json.loads(ctx.slash["handler"]("resume background_costly"))
+    assert resumed["feature"] == "proactive"
+    assert json.loads(ctx.slash["handler"]("status proactive"))["controls"] == []
 
 
 def test_session_status_and_exact_repair_cli(capsys, monkeypatch, tmp_path):

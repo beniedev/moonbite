@@ -80,6 +80,25 @@ contract.
 
 Moonbite v0.1 does not expose a third-party provider discovery contract.
 Deployments register activity descriptors explicitly through a host adapter.
+Composition code passes those descriptors through the `activity_providers`
+argument of `register`, `build_runtime`, or `MoonbiteRuntime`; duplicate names
+fail closed. Moonbite then owns the one control/Judge/eligibility/selection and
+effect lifecycle for each occurrence. A provider owns only its activity probe,
+execution, and evidence translation.
+
+Ordinary selection uses bounded provider weights and a SHA-256-derived slot
+from the stable occurrence identity. The same candidate set plus the same
+`idempotency_key`, or the same `source_event_id` and `epoch_id`, selects the
+same provider across process restarts without consuming process randomness.
+Different occurrences retain weighted diversity. Host-scheduled calls should
+therefore provide stable, non-secret occurrence identifiers; retrying an
+existing effect never invokes a second provider, even if provider settings
+changed. The autonomy effect intent is the durable canonical selection record.
+For the CLI, use `--occurrence-id` and optionally `--epoch-id`; runtime adapters
+may pass the same values as typed facts. A provider return or queue
+acceptance remains `executed_unverified`; only a matching `EffectReceipt`
+produces `completed` and Panel afterglow.
+
 The bundled registry contains `local_reflection`, opt-in `model_reflection`,
 and disabled host-fed `paper_browse` / `x_browse` examples. The two browse
 examples perform no network or credential access; the host supplies verified
@@ -109,6 +128,21 @@ as `hermes moonbite heartbeat <kind>` or ask the agent to invoke one Moonbite
 tool. The host separately decides cadence, realtime versus discounted routing,
 timeouts, and delivery. Disabling a Moonbite module makes its command/tool fail
 visibly even if a stale cron still calls it.
+
+For `heartbeat` and `autonomy`, the CLI returns exit code `1` when the
+structured runtime result has `status: "failed"`. Ordinary skips, intentional
+silence, and accepted or pending work keep exit code `0`. An unknown or
+unverified outcome is not proof of delivery and must not trigger an automatic
+resend. A degraded secondary projection alone does not make the primary effect
+fail. Hosts should inspect the JSON status, reason codes and effect receipts
+when they need completion or delivery evidence; exit code `0` does not supply
+that evidence. Other commands retain their explicit `ok: false` failure check.
+
+The autonomy Judge's explanatory `reason` has a 128 UTF-8-byte budget. The host
+adapter trims surrounding whitespace and bounds a valid reason at a UTF-8
+character boundary before constructing the decision. It preserves `allowed`
+exactly. Empty reasons and non-boolean `allowed` values still fail closed;
+JSON Schema character counts do not express this byte budget.
 
 ## Change procedure
 

@@ -357,9 +357,23 @@ AUTONOMY_DECISION_SCHEMA = {
     "required": ["allowed", "reason"],
     "properties": {
         "allowed": {"type": "boolean"},
-        "reason": {"type": "string", "minLength": 1},
+        "reason": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Non-empty reason, bounded to 128 UTF-8 bytes.",
+        },
     },
 }
+
+_AUTONOMY_REASON_MAX_BYTES = 128
+
+
+def _truncate_utf8(value: str, max_bytes: int) -> str:
+    encoded = value.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return value
+    return encoded[:max_bytes].decode("utf-8", errors="ignore")
+
 
 DIARY_DRAFT_SCHEMA = {
     "type": "object",
@@ -442,7 +456,8 @@ class HermesAutonomyJudge:
             instructions=(
                 "Decide whether one optional autonomous activity may run now. "
                 "Respect active conversation, explicit controls, quiet/sleep evidence, "
-                "and insufficient context. Return only the requested schema."
+                "and insufficient context. Return a non-empty reason within 128 "
+                "UTF-8 bytes. Return only the requested schema."
             ),
             input=[
                 {
@@ -467,7 +482,10 @@ class HermesAutonomyJudge:
         reason = parsed.get("reason")
         if not isinstance(reason, str) or not reason.strip():
             raise RuntimeError("autonomy Judge returned invalid reason")
-        return AutonomyDecision(parsed["allowed"], reason.strip())
+        reason = _truncate_utf8(reason.strip(), _AUTONOMY_REASON_MAX_BYTES)
+        if not reason:
+            raise RuntimeError("autonomy Judge returned invalid reason")
+        return AutonomyDecision(parsed["allowed"], reason)
 
 
 class HermesModelReflection:

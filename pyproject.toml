@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "moonbite-plugin"
-version = "0.1.0a1"
+version = "0.1.0a2"
 description = "Memory, working state, heartbeat, and bounded autonomy for long-running AI agents"
 readme = "README.md"
 license = "MIT"
