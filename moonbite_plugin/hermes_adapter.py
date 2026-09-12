@@ -612,9 +612,9 @@ class HermesSessionWakeSink:
             for parameter in parameters
         )
         if not supports_target:
-            # Official pinned Hermes can inject only into an active CLI
-            # conversation and exposes no targeted gateway/session wake API.
-            # A deployment adapter may provide the explicit extension.
+            # Legacy hosts without a target parameter cannot accept this
+            # request. A compatible signature alone does not prove routing
+            # or completion; supported Hermes also has a current-CLI path.
             return EffectResult(False, "targeted_wake_adapter_unavailable")
         accepted = inject_message(marker, role="system", session_key=self.session_key)
         return EffectResult(

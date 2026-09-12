@@ -47,12 +47,59 @@ fail-closed and auditable.
   Natural overlap requires two shared four-codepoint features after Unicode
   NFKC normalization; single-character CJK queries return no results.
 - `delivery.adapter: noop` is safe and cannot claim delivery.
-- `delivery.adapter: hermes_session` can request a targeted main-session wake
-  only when the host's `inject_message` surface explicitly supports a
-  `session_key`. It needs a non-empty `target` and host-level
-  `allow_gateway_injection: true`. A host without that extension returns
-  `targeted_wake_adapter_unavailable`; it does not fall back to the current
-  conversation. This is not a direct-message adapter.
+- `delivery.adapter: hermes_session` passes a wake request to the host's
+  `inject_message(..., session_key=target)` surface. A legacy host without that
+  parameter returns `targeted_wake_adapter_unavailable`. Routing and permission
+  checks belong to the host; this adapter does not send direct messages.
+
+### Host wake integration
+
+In the supported Hermes 0.20.5 and 0.21.0 API, Gateway injection needs a
+non-empty target, `plugins.entries.moonbite.allow_gateway_injection: true`,
+and a live injector attached to the **same PluginManager process**. A separate
+`hermes moonbite heartbeat` CLI process does not acquire another Gateway
+process's injector merely by sharing configuration. Moonbite supplies no IPC
+bridge or background relay service.
+
+Hermes also has an interactive CLI path: when a CLI is attached, it queues into
+that current CLI conversation before checking the Gateway target and grant.
+In that context, `session_key` does not prove targeted Gateway routing.
+Moonbite does not inspect private host fields to guess which path is active.
+Use the adapter only where the host controls and verifies that execution
+context. A `False` host response maps to `rejected`; Moonbite cannot distinguish
+missing prerequisites from a host rejection when the API supplies only a bool.
+A `True` response maps to `queued_unverified`, never to verified contact.
+
+For an existing dispatcher, compose a host-owned `WakeSink` through
+`register(ctx, wake_sink=...)` or `build_runtime(ctx, wake_sink=...)`. Its
+`wake` method requests a main-session action; its `deliver` method, if
+implemented, handles direct delivery. A host relay owns routing, consent,
+idempotent submission, and completion evidence. A queue acknowledgement is
+not a direct-message receipt or proof that a main-session turn completed.
+
+[examples/heartbeat_host.py](examples/heartbeat_host.py) shows a runnable,
+offline registration and settlement example. Its
+`register_with_host_wake(ctx, loaded_plugin, submit_wake, ...)` helper belongs
+at the host's registration entrypoint; do not also register the stock entrypoint
+on the same context. This is Python composition, not a YAML callback setting.
+The example transport and receipts are synthetic and send nothing externally.
+
+From a source checkout with Moonbite installed in its environment, run
+`.venv/bin/python -m examples.heartbeat_host`. It creates a fresh temporary
+state directory and prints `pending -> completed` with one Judge call and one
+host submission. The file is source documentation, not part of the wheel;
+wheel integrators can reuse the helper with their loaded entry-point module.
+
+Keep runtime types in the same loaded module tree. Wheel entry points use
+`moonbite_plugin`, while Hermes directory loading uses
+`hermes_plugins.moonbite.moonbite_plugin`. The example derives its types from
+the supplied module's `register.__module__`; do not import one copy's
+`EffectResult` or `EffectReceipt` into the other, or monkey patch both copies.
+Use the real effect's identity, digest, length, and epoch when translating host
+completion evidence into that tree's `EffectReceipt`. Reconcile a wake with
+`runtime.heartbeat.reconcile_heartbeat_wake(effect_id, receipt)`; delegated
+delivery uses `reconcile_heartbeat_delivery`. The [recovery rules](#heartbeat-recovery-and-receipts)
+describe pending work, invalid receipts, and missing intents.
 
 ## Heartbeat contact guards
 
@@ -77,6 +124,54 @@ values are rejected. A bypass only lets the candidate continue to later Judge
 and policy evaluation. The bypass itself neither requests delivery or wake nor
 counts as an effect receipt; any later effect follows the normal receipt
 contract.
+
+## Heartbeat recovery and receipts
+
+Give each scheduled occurrence a stable, non-secret `source_event_id` and,
+when applicable, `epoch_id`. Different occurrences, including different
+heartbeat kinds, need distinct source identifiers. The `delivery` / `wake`
+part of an effect's idempotency key names the effect role, not the candidate
+kind. Keep the same identity when retrying an occurrence.
+
+Moonbite persists the complete approved effect plan before consuming cadence,
+then creates all required intents before calling an adapter. The plan contains
+identities and content digests, not a copy of the message. A crash between
+these writes remains visible as `pending/awaiting_effect_intent` after restart;
+it does not rerun Judge, send a partial effect set, or silently become
+`cadence_not_due` for the same occurrence.
+
+| Result or evidence | Host action |
+|---|---|
+| `pending/awaiting_effect_intent` | Pause scheduling this work and inspect the saved plan and intents. Automatic reconstruction or cancellation of missing intents is not implemented. Resolve it through a reviewed host maintenance procedure; do not delete evidence or invent a new occurrence to force a resend. |
+| `pending/awaiting_receipt` or `queued_unverified` | Check the existing host operation. Supply its actual completion receipt through the matching reconciliation method; do not submit the operation again solely because it is pending. |
+| Delegated delivery settles without visible contact | Use `reconcile_heartbeat_delivery(..., status="intentional_silence")` for intentional silence, or `status="failed"` for a confirmed failure. `status="unknown"` keeps work pending. None counts as a delivery receipt. |
+| `requeued` / expired work | Preserve the occurrence and effect identities. Requeue records recovery state; it does not itself prove another adapter call or successful delivery. |
+| Verified effect with degraded projections | Inspect `projection_errors` and repair the affected cadence/audit projection. Preserve the durable receipt; a projection failure is not a reason to resend the effect. |
+
+After same-occurrence recovery and the control gate, pending heartbeat effects
+are reconciled across **all kinds** before new candidates reach cadence and
+contact guards. An incomplete same-occurrence plan remains pending before
+this global reconciliation step. An urgent kind's contact-guard bypass does
+not bypass another occurrence's pending effects. Hosts that need independent
+concurrent delivery must design that policy separately.
+
+Synchronous receipts, delegated delivery reconciliation, and wake
+reconciliation require matching source, epoch, content digest, and length.
+Their `observed_at` must satisfy `created_at <= observed_at < expires_at`.
+This is the time the host observed completion, not when it submits the receipt:
+a later submission is valid while the record is still awaiting settlement.
+An invalid synchronous receipt fails that effect; an invalid reconciliation
+receipt is rejected without consuming the pending record, allowing correction
+from real host evidence.
+
+For a decision containing delivery and wake, inspect both nested effect
+results and their ledger records. The top-level reason summarizes the first
+failure; the first result and terminal audit retain each effect's status.
+Terminal replay may return only a summary. Audit and cadence projections are
+not a transaction with the effect ledger; conflicting durable identities fail
+closed rather than being relabeled as successful.
+
+## Autonomy composition
 
 Moonbite v0.1 does not expose a third-party provider discovery contract.
 Deployments register activity descriptors explicitly through a host adapter.

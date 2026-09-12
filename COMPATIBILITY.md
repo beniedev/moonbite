@@ -94,6 +94,32 @@ match; session ledgers remain append-only and are not rewritten.
 
 ---
 
+### Wake registration and settlement
+
+Both required Hermes lanes expose `PluginContext.inject_message` with a
+`session_key` parameter. The contract check exercises their actual Gateway
+context and directory loader; CLI precedence is documented from the supported
+host implementations, which expose no public CLI attachment method. A signature check alone proves
+neither target routing nor delivery: a CLI attachment takes precedence over
+Gateway injection, and a separate process has no live Gateway injector.
+See [Host wake integration](CONFIGURATION.md#host-wake-integration) for the
+public `WakeSink` registration seam and its limitations.
+
+Heartbeat receipts now share the `[created_at, expires_at)` observation-time
+rule across synchronous effects and both reconciliation methods. This adds
+validation at the Heartbeat boundary without changing the effect-ledger
+schema or rewriting historical rows. The approved effect plan is also saved
+before cadence consumption; missing intents remain explicitly pending and
+are not reconstructed automatically.
+
+Low-level `HeartbeatEngine` injection now requires the cadence owner's stable
+`Path`-valued `path` for any delivery or wake decision, so the approved plan can
+be persisted alongside cadence. A pathless cadence still supports no-effect
+decisions; effect requests fail with `effect_replay_error` before consuming
+cadence or calling an adapter. Supplying only locks and an effect ledger does
+not supply a durable plan owner. The normal registered runtime already uses
+`HeartbeatCadence` with that path.
+
 ## 2. Platform & Isolation Invariants
 
 - **Isolated HERMES_HOME:** All testing and verification must execute within an isolated test directory to prevent contamination of live profiles.

@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import inspect
 import json
 import os
 from datetime import UTC, datetime
+from importlib import import_module
 from pathlib import Path
 import subprocess
 import sys
@@ -15,13 +17,21 @@ import tomllib
 
 import yaml
 from hermes_cli.hooks import _DEFAULT_PAYLOADS
-from hermes_cli.plugins import PluginContext, VALID_HOOKS
+from hermes_cli.plugins import (
+    PluginContext,
+    PluginManager,
+    PluginManifest,
+    VALID_HOOKS,
+)
 
 from moonbite_plugin.config import normalize_config
-from moonbite_plugin.hermes_adapter import HermesHostAdapter
+from moonbite_plugin.config import ConfigError
+from moonbite_plugin.hermes_adapter import HermesHostAdapter, HermesSessionWakeSink
+from moonbite_plugin.heartbeat import HeartbeatCandidate, JudgeDecision
 from moonbite_plugin.plugin import TOOL_NAMES
 from moonbite_plugin.session import HOOK_ORDER
 from moonbite_plugin.session import SessionLifecycleStore
+from moonbite_plugin.scenarios import resolve_config
 
 
 ROOT = Path(__file__).parents[1]
@@ -369,12 +379,259 @@ def _metadata_contract() -> None:
             assert hook in text, (relative, hook)
 
 
+@contextmanager
+def _wake_home(*, allow_gateway_injection: bool):
+    """Give the real Hermes manager a synthetic, isolated grant profile."""
+
+    previous = os.environ.get("HERMES_HOME")
+    with tempfile.TemporaryDirectory(prefix="moonbite-wake-") as temporary:
+        home = Path(temporary)
+        (home / "config.yaml").write_text(
+            yaml.safe_dump(
+                {
+                    "plugins": {
+                        "entries": {
+                            "moonbite": {
+                                "allow_gateway_injection": allow_gateway_injection
+                            }
+                        }
+                    }
+                },
+                sort_keys=False,
+            ),
+            encoding="utf-8",
+        )
+        os.environ["HERMES_HOME"] = str(home)
+        try:
+            yield
+        finally:
+            if previous is None:
+                os.environ.pop("HERMES_HOME", None)
+            else:
+                os.environ["HERMES_HOME"] = previous
+
+
+def _wake_context() -> tuple[PluginContext, PluginManager]:
+    """Construct the official context and manager used by the wake adapter."""
+
+    manager = PluginManager()
+    manifest = PluginManifest(name="moonbite", key="moonbite", source=ROOT)
+    return PluginContext(manifest, manager), manager
+
+
+def _wake_candidate() -> tuple[HeartbeatCandidate, JudgeDecision]:
+    return (
+        HeartbeatCandidate("care_poke", candidate_id="contract-wake"),
+        JudgeDecision(True, False, "contract wake"),
+    )
+
+
+def _wake_result(sink: HermesSessionWakeSink):
+    candidate, decision = _wake_candidate()
+    return sink.wake(candidate, decision)
+
+
+def _wake_contract() -> None:
+    """Exercise targeted wake admission through real Hermes public APIs."""
+
+    inject_signature = inspect.signature(PluginContext.inject_message)
+    inject_parameters = inject_signature.parameters
+    assert {"self", "content", "role"} <= set(inject_parameters)
+    session_parameter = inject_parameters.get("session_key")
+    supports_target = session_parameter is not None or any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in inject_parameters.values()
+    )
+    assert supports_target, inject_signature
+
+    missing_target = {"delivery": {"adapter": "hermes_session"}}
+    try:
+        resolve_config(missing_target)
+    except ConfigError as exc:
+        assert str(exc) == "delivery.target is required for hermes_session"
+    else:
+        raise AssertionError("hermes_session without a target was accepted")
+
+    target = "synthetic-session"
+    calls: list[dict[str, object]] = []
+
+    with _wake_home(allow_gateway_injection=False):
+        context, manager = _wake_context()
+
+        def grant_injector(**kwargs: object) -> bool:
+            calls.append(kwargs)
+            return True
+
+        manager.set_gateway_message_injector(object(), grant_injector)
+        assert manager.has_gateway_message_injector is True
+        assert context.inject_message("no target", role="system") is False
+        assert calls == []
+        result = _wake_result(HermesSessionWakeSink(context, session_key=target))
+        assert result.ok is False
+        assert result.status == "rejected"
+        assert calls == []
+
+    calls.clear()
+    with _wake_home(allow_gateway_injection=True):
+        context, manager = _wake_context()
+        result = _wake_result(HermesSessionWakeSink(context, session_key=target))
+        assert manager.has_gateway_message_injector is False
+        assert result.ok is False
+        assert result.status == "rejected"
+        assert calls == []
+
+    calls.clear()
+    with _wake_home(allow_gateway_injection=True):
+        context, manager = _wake_context()
+
+        def rejected_injector(**kwargs: object) -> bool:
+            calls.append(kwargs)
+            return False
+
+        manager.set_gateway_message_injector(object(), rejected_injector)
+        result = _wake_result(HermesSessionWakeSink(context, session_key=target))
+        assert result.ok is False
+        assert result.status == "rejected"
+        assert len(calls) == 1
+
+    calls.clear()
+    with _wake_home(allow_gateway_injection=True):
+        context, manager = _wake_context()
+
+        def accepting_injector(**kwargs: object) -> bool:
+            calls.append(kwargs)
+            return True
+
+        manager.set_gateway_message_injector(object(), accepting_injector)
+        result = _wake_result(HermesSessionWakeSink(context, session_key=target))
+        assert result.ok is True
+        assert result.status == "queued_unverified"
+        assert result.verified is False
+        assert len(calls) == 1
+        call = calls[0]
+        assert call["session_key"] == target
+        assert call["plugin_id"] == "moonbite"
+        content = str(call["content"])
+        assert content.startswith("[system] ")
+        assert json.loads(content.removeprefix("[system] ")) == {
+            "candidate_id": "contract-wake",
+            "event_type": "moonbite_heartbeat_wake",
+            "kind": "care_poke",
+            "schema_version": "moon.wake_packet.v1",
+        }
+        assert call.get("role") is None
+
+    manager = PluginManager()
+    public_cli_attach_methods = sorted(
+        name
+        for name in dir(manager)
+        if not name.startswith("_")
+        and ("cli" in name.lower() or "attach" in name.lower())
+    )
+    print(
+        json.dumps(
+            {
+                "inject_message_signature": str(inject_signature),
+                "gateway_cases": [
+                    "missing_target",
+                    "missing_grant",
+                    "no_gateway_injector",
+                    "gateway_reject",
+                    "gateway_accept_queued_unverified",
+                ],
+                "public_cli_attach_methods": public_cli_attach_methods,
+                "cli_targeting": (
+                    "unavailable_via_public_manager_api"
+                    if not public_cli_attach_methods
+                    else "requires_host_public_attach_contract"
+                ),
+            },
+            sort_keys=True,
+        )
+    )
+
+
+def _loaded_example_contract(loaded_plugin: object) -> None:
+    """Prove the runnable example consumes the loader's own module tree."""
+
+    host_example = import_module("examples.heartbeat_host")
+    package_name, heartbeat_module, effects_module, plugin_module = (
+        host_example._implementation_modules(loaded_plugin)
+    )
+    assert package_name in {
+        loaded_plugin.__name__,
+        f"{loaded_plugin.__name__}.moonbite_plugin",
+    }
+    register = getattr(loaded_plugin, "register")
+    assert plugin_module.register is register
+    assert heartbeat_module.EffectResult.__module__ == f"{package_name}.heartbeat"
+    assert effects_module.EffectReceipt.__module__ == f"{package_name}.effects"
+
+    submitted: list[object] = []
+
+    class ContractJudge:
+        calls = 0
+
+        def decide(self, _candidate: object) -> object:
+            self.calls += 1
+            return heartbeat_module.JudgeDecision(True, False, "loader example")
+
+    def submit_wake(_candidate: object, _decision: object, intent: object) -> bool:
+        submitted.append(intent)
+        return True
+
+    with tempfile.TemporaryDirectory(prefix="moonbite-example-") as temporary:
+        state_root = Path(temporary)
+        ctx = host_example.SyntheticHostContext(
+            host_example._example_config(state_root)
+        )
+        judge = ContractJudge()
+        runtime = host_example.register_with_host_wake(
+            ctx,
+            loaded_plugin,
+            submit_wake,
+            heartbeat_judge=judge,
+        )
+        result = runtime.run_heartbeat(
+            "care_poke",
+            context={
+                "events": ["loader-example-event"],
+                "due": True,
+                "source_event_id": "loader-example-source",
+            },
+        )
+        assert result.wake is not None
+        assert type(result.wake) is heartbeat_module.EffectResult
+        assert result.wake.status == "queued_unverified"
+        assert result.wake.verified is False
+        assert judge.calls == 1
+        assert len(submitted) == 1
+        intent = submitted[0]
+        receipt = effects_module.EffectReceipt(
+            receipt_id=f"loader-example-receipt:{intent.effect_id}",
+            event_id=intent.source_event_id,
+            observed_at=intent.created_at,
+            content_sha256=intent.content_sha256,
+            content_length=intent.content_length,
+            epoch_id=intent.epoch_id,
+        )
+        settled = runtime.heartbeat.reconcile_heartbeat_wake(intent.effect_id, receipt)
+        assert settled.status == "verified"
+        assert type(settled.receipt) is effects_module.EffectReceipt
+
+
 def _write_loader_home(home: Path, config: dict) -> None:
     plugins = home / "plugins"
     bundled = home / "bundled"
     plugins.mkdir(parents=True)
     bundled.mkdir()
     (plugins / "moonbite").symlink_to(ROOT, target_is_directory=True)
+    # An editable install can leave entry-point metadata in ROOT. Keep only
+    # importable source on PYTHONPATH so it cannot shadow directory discovery.
+    imports = home / "imports"
+    imports.mkdir()
+    for name in ("moonbite_plugin", "examples"):
+        (imports / name).symlink_to(ROOT / name, target_is_directory=True)
     host_config = {
         "plugins": {
             "enabled": ["moonbite"],
@@ -392,8 +649,6 @@ def _write_loader_home(home: Path, config: dict) -> None:
 
 
 def _loader_probe() -> None:
-    from hermes_cli.plugins import PluginManager
-
     manager = PluginManager()
     manager.discover_and_load()
     row = next(item for item in manager.list_plugins() if item["name"] == "moonbite")
@@ -403,8 +658,30 @@ def _loader_probe() -> None:
     assert row["hooks"] == len(HOOK_ORDER)
     assert row["commands"] == 1
     assert row["error"] is None
+    loaded_namespace = sys.modules.get("hermes_plugins.moonbite")
+    assert loaded_namespace is not None, (
+        "directory plugin was shadowed by an entry point"
+    )
+    register = getattr(loaded_namespace, "register", None)
+    assert callable(register)
+    assert register.__module__ == "hermes_plugins.moonbite.moonbite_plugin.plugin"
+    register_source = inspect.getsourcefile(register)
+    assert register_source is not None
+    assert ROOT in Path(register_source).resolve().parents
+    _loaded_example_contract(loaded_namespace)
     assert not (Path(os.environ["HERMES_HOME"]) / "moonbite").exists()
-    print(json.dumps({"tools": len(TOOL_NAMES), "hooks": len(HOOK_ORDER)}))
+    print(
+        json.dumps(
+            {
+                "tools": len(TOOL_NAMES),
+                "hooks": len(HOOK_ORDER),
+                "register_module": register.__module__,
+                "register_source_matches_repo": True,
+                "loaded_namespace": "hermes_plugins.moonbite",
+                "loaded_example_flow": "queued_unverified_to_verified",
+            }
+        )
+    )
 
 
 def _loader_contract() -> None:
@@ -421,6 +698,12 @@ def _loader_contract() -> None:
                 "HERMES_HOME": str(home),
                 "HERMES_BUNDLED_PLUGINS": str(home / "bundled"),
                 "HERMES_ENABLE_PROJECT_PLUGINS": "0",
+                "PYTHONPATH": os.pathsep.join(
+                    (
+                        str(home / "imports"),
+                        str(Path(inspect.getfile(PluginContext)).resolve().parents[1]),
+                    )
+                ),
             }
             completed = subprocess.run(
                 [sys.executable, str(Path(__file__).resolve()), "--loader-probe"],
@@ -452,6 +735,7 @@ def main() -> int:
         return 0
     _turn_exit_contract()
     _metadata_contract()
+    _wake_contract()
     _loader_contract()
     print(
         f"Hermes public API contract: manifest {len(TOOL_NAMES)} tools/"

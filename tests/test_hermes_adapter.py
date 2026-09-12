@@ -334,8 +334,8 @@ def test_session_wake_is_typed_system_data_and_not_a_delivery_receipt():
     )
 
 
-def test_official_hermes_shape_rejects_unsupported_targeted_wake():
-    class OfficialContextShape:
+def test_legacy_host_without_target_parameter_rejects_targeted_wake():
+    class LegacyContextShape:
         def __init__(self):
             self.called = False
 
@@ -343,7 +343,7 @@ def test_official_hermes_shape_rejects_unsupported_targeted_wake():
             self.called = True
             return True
 
-    context = OfficialContextShape()
+    context = LegacyContextShape()
     sink = HermesSessionWakeSink(context, session_key="fixture-session")
 
     result = sink.wake(
