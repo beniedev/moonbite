@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import importlib
 import json
+import runpy
 import sys
 import types
 from contextlib import redirect_stdout
@@ -11,13 +12,16 @@ from pathlib import Path
 
 import pytest
 
-from examples.heartbeat_host import (
-    SyntheticHostContext,
-    _implementation_modules,
-    _example_config,
-    main,
-    register_with_host_wake,
+# Examples are source files, outside the installed package. Loading by path
+# supports the pytest console entry point without changing package resolution.
+_example = runpy.run_path(
+    str(Path(__file__).resolve().parents[1] / "examples" / "heartbeat_host.py")
 )
+SyntheticHostContext = _example["SyntheticHostContext"]
+_implementation_modules = _example["_implementation_modules"]
+_example_config = _example["_example_config"]
+main = _example["main"]
+register_with_host_wake = _example["register_with_host_wake"]
 
 
 def _cli_call(ctx: SyntheticHostContext, context: dict[str, object]):
