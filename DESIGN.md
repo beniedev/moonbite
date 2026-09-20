@@ -35,11 +35,14 @@ control or cadence skip prevents the model call. A Judge exception is
 `failed/judge_error`; a rejected delivery or wake is `failed/effect_failed`.
 Generated text is never treated as delivered.
 
-The bundled targeted-session adapter is capability-checked. If the host does
-not expose a `session_key` injection parameter, Moonbite reports
-`targeted_wake_adapter_unavailable` and does not inject into an arbitrary active
-conversation. Queue acceptance remains `pending` until a deployment supplies a
-real completion receipt.
+The bundled session adapter checks for a `session_key` injection parameter;
+a legacy host without it returns `targeted_wake_adapter_unavailable`. That
+signature does not guarantee Gateway routing: supported Hermes queues into
+the current interactive CLI when one is attached. Gateway use requires a
+target, host grant, and a live injector in the same process. Host composition
+can inject a `WakeSink` through `register` or `build_runtime`; Moonbite supplies
+no cross-process bridge. Queue acceptance remains unverified until the host
+supplies a real completion receipt. See [Host wake integration](CONFIGURATION.md#host-wake-integration).
 
 Autonomy runs at most one provider per tick. A selected failure is terminal for
 that tick. `play_next` is consumed only after a completed provider, so a failed

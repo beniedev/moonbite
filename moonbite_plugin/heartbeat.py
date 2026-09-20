@@ -2660,12 +2660,12 @@ class HeartbeatEngine:
         decision: JudgeDecision,
         now: datetime,
     ) -> dict[str, Any] | None:
-        if self._effect_plans is None:
-            if decision.dm_user and decision.wake_main:
-                raise StateError(
-                    "heartbeat closed effect plan requires a durable cadence root"
-                )
+        if not decision.dm_user and not decision.wake_main:
             return None
+        if self._effect_plans is None:
+            raise StateError(
+                "heartbeat closed effect plan requires a durable cadence root"
+            )
         source = (
             candidate.context.get("source_event_id")
             or candidate.context.get("event_id")
@@ -4222,6 +4222,11 @@ class HeartbeatEngine:
             projection_errors=tuple(projection_errors),
         )
 
+    @staticmethod
+    def _validate_receipt_time(record: EffectRecord, receipt: EffectReceipt) -> None:
+        if not record.created_at <= receipt.observed_at < record.expires_at:
+            raise ValueError("heartbeat receipt is outside the effect lifetime")
+
     def reconcile_heartbeat_delivery(
         self,
         effect_id: str,
@@ -4259,6 +4264,7 @@ class HeartbeatEngine:
         if selected_status == "verified":
             if not isinstance(receipt, EffectReceipt):
                 raise TypeError("verified delegated delivery requires EffectReceipt")
+            self._validate_receipt_time(record, receipt)
             if record.state == "verified":
                 if record.receipt != receipt:
                     raise ValueError("conflicting delegated delivery receipt")
@@ -4355,8 +4361,7 @@ class HeartbeatEngine:
             raise ValueError("effect is not a heartbeat wake")
         if not isinstance(receipt, EffectReceipt):
             raise TypeError("verified heartbeat wake requires EffectReceipt")
-        if not record.created_at <= receipt.observed_at < record.expires_at:
-            raise ValueError("heartbeat wake receipt is outside the effect lifetime")
+        self._validate_receipt_time(record, receipt)
         if record.state == "verified":
             if record.receipt != receipt:
                 raise ValueError("conflicting heartbeat wake receipt")
@@ -4575,6 +4580,7 @@ class HeartbeatEngine:
                     False,
                 )
             try:
+                self._validate_receipt_time(record, adapter.receipt)
                 verified = self.effect_ledger.verify(record.effect_id, adapter.receipt)
             except Exception:
                 return self._fail_effect(
@@ -5414,6 +5420,21 @@ class HeartbeatEngine:
                         code=HeartbeatReasonCode.CADENCE_ERROR,
                         decision=decision,
                     )
+        # Keep the approved effect set durable before consuming cadence. A
+        # crash after mark_judge must replay as pending rather than silently
+        # skipping a daily anchor whose effect intents were never created.
+        try:
+            effect_plan = self._ensure_effect_plan(candidate, decision, now)
+        except (StateError, TypeError, ValueError) as exc:
+            return make_result(
+                "failed",
+                "effect_replay_error",
+                candidate_id,
+                gate,
+                code=HeartbeatReasonCode.EFFECT_REPLAY_ERROR,
+                decision=decision,
+                projection_errors=(f"effect_plan:{type(exc).__name__}",),
+            )
         mark_judge = getattr(self.cadence, "mark_judge", None)
         if callable(mark_judge):
             mark_kwargs = {
@@ -5461,19 +5482,6 @@ class HeartbeatEngine:
                 code=HeartbeatReasonCode.DENIED,
                 decision=decision,
                 next_judge_at=next_judge,
-            )
-        try:
-            effect_plan = self._ensure_effect_plan(candidate, decision, now)
-        except (StateError, TypeError, ValueError) as exc:
-            return make_result(
-                "failed",
-                "effect_replay_error",
-                candidate_id,
-                gate,
-                code=HeartbeatReasonCode.EFFECT_REPLAY_ERROR,
-                decision=decision,
-                next_judge_at=next_judge,
-                projection_errors=(f"effect_plan:{type(exc).__name__}",),
             )
         prepared: dict[str, EffectRecord] = {}
         try:

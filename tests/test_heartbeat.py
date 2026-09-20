@@ -1355,7 +1355,9 @@ def test_injected_cadence_internal_error_fails_closed(
         epoch_error=error if failure_port == "epoch" else None,
         mark_error=error if failure_port == "mark" else None,
     )
-    judge = Judge(JudgeDecision(True, True, "contact", "hello"))
+    # A pathless legacy cadence supports no-effect decisions; isolate its
+    # own failure from the durable closed-plan requirement for effects.
+    judge = Judge(JudgeDecision(False, False, "silent"))
     sink = Sink()
     runtime = HeartbeatEngine(
         bus=EventBus(tmp_path, clock=lambda: NOW),

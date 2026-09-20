@@ -224,7 +224,7 @@ Moonbite ships inert defaults; the host deployment retains complete authority ov
    - Moonbite contains no internal timer or scheduler. The owner chooses the cadence; host cron calls `hermes moonbite ...` CLI commands or triggers tools at those approved times.
 7. **Delivery adapter, consent, and target:**
    - `delivery.adapter: noop` is safe and performs no external messaging.
-   - `delivery.adapter: hermes_session` allows targeted main-session wake only when the host supports session key injection and `allow_gateway_injection: true` is configured.
+   - `delivery.adapter: hermes_session` requires a host execution context that routes to the intended session. Gateway use needs a target, `allow_gateway_injection: true`, and an injector in the same process; an attached interactive CLI instead queues into its current conversation. Follow [Host wake integration](CONFIGURATION.md#host-wake-integration) for the registration example and receipt boundary. A separate CLI invocation does not create a cross-process Gateway bridge.
 8. **Retention, backup, and rollback policy:**
    - Local state files are POSIX owner-only (`0700`/`0600`). The operator is responsible for backup, compaction, and data retention schedules.
 

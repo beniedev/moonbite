@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Host wake composition:** an offline registration example uses the loaded plugin's own types, submits through an injected `WakeSink`, and reconciles synthetic completion evidence. Setup and contract checks distinguish same-process Gateway injection, current-CLI queues, and host-owned cross-process relays.
 - **Session recovery:** `hermes moonbite session status` lists exact open turns, and `session repair` appends an idempotent `abandoned` terminal for the specified current turn without fabricating a successful model response.
 - **HermesHostAdapter:** the public integration boundary now consumes Hermes `on_session_end` and normalizes successful, failed, interrupted, incomplete, session-rotation, and shutdown exits into canonical lifecycle evidence. The pinned Hermes 0.20.5 commit and official v0.21.0 release share the same tested contract.
 - **Subagent terminal fallback:** the seventh manifest hook, `subagent_stop`, uses only child session identity and bounded status to close a non-success one-shot child turn in the existing canonical terminal ledger; completed children remain owned by their own post/end evidence.
@@ -17,6 +18,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Heartbeat admission recovery:** persist the approved effect plan before consuming cadence. A restart after a daily-anchor write but before intent creation now reports pending work instead of silently skipping the occurrence; automatic intent reconstruction remains unsupported.
+- **Heartbeat receipt time:** synchronous effects and delegated delivery reconciliation now apply the same `[created_at, expires_at)` observation-time check as wake reconciliation. Submission time alone does not invalidate an otherwise valid receipt that is still awaiting settlement.
 - **CLI failure exits:** Heartbeat and Autonomy business failures now return a nonzero CLI exit code while normal skips, silence and pending work retain their structured outcome without forcing a retry.
 - **Autonomy Judge reasons:** the host adapter bounds valid explanations to 128 UTF-8 bytes without changing the permission decision; empty reasons and invalid booleans remain errors.
 
@@ -29,6 +32,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Compatibility
 
+- Injected pathless cadence owners no longer admit delivery or wake effects without a durable plan root. They fail before cadence consumption; no-effect decisions remain supported.
 - Recovery does not rewrite historical audit or effect rows. Legacy Heartbeat occurrences without evidence of a complete effect set remain pending; legacy Autonomy identities that cannot be distinguished from an explicit epoch fail closed. These outcomes must not be interpreted as completed work or retried under a new occurrence identity.
 - Session ledgers may now contain additive `moon.session.turn_terminal.v1` rows. Moonbite `0.1.0a1` cannot read upgraded state; take a state snapshot before upgrading and retain the new reader or restore that snapshot when rolling back.
 
