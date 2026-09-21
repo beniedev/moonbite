@@ -35,6 +35,11 @@ control or cadence skip prevents the model call. A Judge exception is
 `failed/judge_error`; a rejected delivery or wake is `failed/effect_failed`.
 Generated text is never treated as delivered.
 
+An effect left `pending` or `executed_unverified` must still have a reachable
+terminal after expiry. Global pending serialization intentionally protects
+visible-contact at-most-once behavior, but its gate must clean itself up. A
+stale plan write overtaken by newer durable state is a no-op, not a failure.
+
 The bundled session adapter checks for a `session_key` injection parameter;
 a legacy host without it returns `targeted_wake_adapter_unavailable`. That
 signature does not guarantee Gateway routing: supported Hermes queues into
