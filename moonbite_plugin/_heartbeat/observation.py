@@ -585,7 +585,8 @@ def engine_observer_status(
         )
 
     ledger_path: Path | None = None
-    ledger_file = getattr(getattr(effect_ledger, "ledger", None), "path", None)
+    ledger = effect_ledger
+    ledger_file = getattr(getattr(ledger, "ledger", None), "path", None)
     if isinstance(ledger_file, Path):
         ledger_path = ledger_file
     if ledger_path is None:
@@ -622,7 +623,7 @@ def engine_observer_status(
         facts.append(
             _heartbeat_effect_fact(
                 current,
-                history=tuple(same_key),
+                history=same_key,
                 target_date=target_date,
                 now=now,
             )
