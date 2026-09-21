@@ -2465,9 +2465,19 @@ def test_engine_observer_separates_visible_delivery_from_internal_wake(tmp_path)
     runtime._reconcile_pending = lambda *args, **kwargs: (_ for _ in ()).throw(
         AssertionError("observer must not reconcile heartbeat")
     )
+    before = {
+        path.name: (path.read_bytes(), path.stat().st_mtime_ns)
+        for path in tmp_path.iterdir()
+        if path.is_file()
+    }
 
     facts = runtime.observer_status(target_date=NOW.date(), now=NOW)
     by_key = {fact.key: fact for fact in facts}
+    after = {
+        path.name: (path.read_bytes(), path.stat().st_mtime_ns)
+        for path in tmp_path.iterdir()
+        if path.is_file()
+    }
 
     assert by_key["heartbeat:contact:verified_visible"].state == "neutral"
     assert "heartbeat:contact:wake" not in by_key
@@ -2475,6 +2485,7 @@ def test_engine_observer_separates_visible_delivery_from_internal_wake(tmp_path)
     assert all(
         "expected" not in fact.code and "missed" not in fact.code for fact in facts
     )
+    assert after == before
 
 
 @pytest.mark.parametrize("port_kind", ("mapping", "string", "non_iterable", "mixed"))
