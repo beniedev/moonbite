@@ -14,7 +14,10 @@ from typing import Any, Protocol
 
 from ..runtime_core import StateError, file_lock, isoformat
 from .cadence_codec import (
+    CADENCE_SCHEMA_V4,
     DAILY_ANCHOR_MAX,
+    EFFECT_REF_MAX,
+    EFFECT_TERMINAL_MAX,
     PRIVATE_CONTACT_MAX,
     SILENCE_BACKOFF_RECEIPT_MAX,
     VISIBLE_CONTACT_MAX,
@@ -22,6 +25,7 @@ from .cadence_codec import (
     compact_contacts,
     compact_tail,
     daily_anchor_kind,
+    empty_state,
     optional_time,
     strict_iso_date,
 )
@@ -34,6 +38,7 @@ class _CadenceOwner(Protocol):
     anchor_hour: int
     judge_interval: timedelta
     recent_contact_window: timedelta
+    timezone_name: str
 
     def _load(self) -> dict[str, Any]: ...
 
@@ -56,6 +61,19 @@ class _CadenceOwner(Protocol):
     ) -> tuple[str | None, datetime | None]: ...
 
     def daily_anchor_epoch(self, now: datetime | None = None) -> str: ...
+
+    def _effect_ref_key(
+        self,
+        source_event_id: str,
+        kind: str,
+        epoch_id: str | None = None,
+    ) -> str: ...
+
+
+def clear_automatic_backoff(state: dict[str, Any]) -> None:
+    state["automatic_cooldown_until"] = state["auto_until"] = None
+    state["silence_backoff_streak"] = 0
+    state["silence_backoff_last_completed_at"] = None
 
 
 def prune_contact_state(
@@ -687,3 +705,140 @@ def recent_private_inbound(
             effective_now,
             include_verified_visible=False,
         )
+
+
+def record_effect_terminal(
+    owner: _CadenceOwner,
+    effect_id: str,
+    terminal: str,
+    *,
+    observed_at: datetime | None = None,
+) -> None:
+    if type(effect_id) is not str or not effect_id.strip():
+        raise ValueError("effect_id must be non-empty")
+    if type(terminal) is not str or not terminal.strip():
+        raise ValueError("effect terminal must be non-empty")
+    observed = owner._now(observed_at)
+    with file_lock(owner.lock_path):
+        state = owner._load()
+        terminals = dict(state["effect_terminals"])
+        terminals.pop(effect_id, None)
+        terminals[effect_id] = terminal
+        state["effect_terminals"] = compact_tail(terminals, EFFECT_TERMINAL_MAX)
+        state["last_effect_at"] = isoformat(observed)
+        owner._save(state)
+
+
+def effect_ref_key(
+    source_event_id: str,
+    kind: str,
+    epoch_id: str | None = None,
+) -> str:
+    if (
+        type(source_event_id) is not str
+        or not source_event_id.strip()
+        or type(kind) is not str
+        or not kind.strip()
+    ):
+        raise ValueError("effect reference identity is invalid")
+    if epoch_id is not None and (type(epoch_id) is not str or not epoch_id.strip()):
+        raise ValueError("effect reference epoch is invalid")
+    key = f"{kind}:{source_event_id}"
+    return key if epoch_id is None else f"{key}:{epoch_id}"
+
+
+def remember_effect_ref(
+    owner: _CadenceOwner,
+    source_event_id: str,
+    kind: str,
+    effect_id: str,
+    *,
+    epoch_id: str | None = None,
+) -> None:
+    key = owner._effect_ref_key(source_event_id, kind, epoch_id)
+    if type(effect_id) is not str or not effect_id.strip():
+        raise ValueError("effect reference id is invalid")
+    with file_lock(owner.lock_path):
+        state = owner._load()
+        refs = dict(state["effect_refs"])
+        refs.pop(key, None)
+        refs[key] = effect_id
+        state["effect_refs"] = compact_tail(refs, EFFECT_REF_MAX)
+        owner._save(state)
+
+
+def effect_ref(
+    owner: _CadenceOwner,
+    source_event_id: str,
+    kind: str,
+    *,
+    epoch_id: str | None = None,
+) -> str | None:
+    key = owner._effect_ref_key(source_event_id, kind, epoch_id)
+    if not owner.path.exists():
+        return None
+    with file_lock(owner.lock_path):
+        return owner._load()["effect_refs"].get(key)
+
+
+def snapshot(
+    owner: _CadenceOwner,
+    *,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    effective_now = owner._now(now)
+    if owner.path.exists():
+        with file_lock(owner.lock_path):
+            state = owner._load()
+            owner._prune_contact_state(state, effective_now)
+    else:
+        state = empty_state()
+    private, visible = state["private_contacts"], state["verified_visible_contacts"]
+    next_at = optional_time(state["next_judge_at"], "next_judge_at")
+    if next_at is None:
+        last = optional_time(state["last_judge_at"], "last_judge_at")
+        next_at = effective_now if last is None else last + owner.judge_interval
+    recent_kind, recent_at = owner._recent_from_state(state, effective_now)
+    anchor_epochs = dict(state["daily_anchor_epochs"])
+    default_anchor_epoch = (
+        anchor_epochs.get("daily_anchor") or state["daily_anchor_legacy_epoch"]
+    )
+    return {
+        "schema_version": CADENCE_SCHEMA_V4,
+        "last_judge_at": state["last_judge_at"],
+        "next_judge_at": isoformat(next_at),
+        "manual_cooldown_until": state["manual_cooldown_until"],
+        "automatic_cooldown_until": state["automatic_cooldown_until"],
+        "last_effect_at": state["last_effect_at"],
+        # The old fields remain as a compatibility view for the default
+        # kind; per-kind callers must use daily_anchor_epochs.
+        "daily_anchor_epoch": default_anchor_epoch,
+        "daily_anchor_completed": bool(default_anchor_epoch),
+        "daily_anchor_epochs": anchor_epochs,
+        "daily_anchor_legacy_epoch": state["daily_anchor_legacy_epoch"],
+        "daily_anchor_hour": owner.anchor_hour,
+        "timezone": owner.timezone_name,
+        "last_private_contact_at": state["last_private_contact_at"],
+        "private_contact_sources": sorted(private),
+        "private_contact_overflow_until": state["private_contact_overflow_until"],
+        "last_verified_visible_contact_at": state["last_verified_visible_contact_at"],
+        "verified_visible_effects": sorted(visible),
+        "verified_visible_overflow_until": state["verified_visible_overflow_until"],
+        "recent_contact_kind": recent_kind,
+        "recent_contact_at": None if recent_at is None else isoformat(recent_at),
+        "effect_terminals": dict(state["effect_terminals"]),
+        "effect_reference_count": len(state["effect_refs"]),
+        "silence_backoff": {
+            "streak": state["silence_backoff_streak"],
+            "processed_receipts": len(state["silence_backoff_processed_receipts"]),
+            "last_completed_at": state["silence_backoff_last_completed_at"],
+            "active": (
+                optional_time(
+                    state["automatic_cooldown_until"],
+                    "automatic_cooldown_until",
+                )
+                or effective_now
+            )
+            > effective_now,
+        },
+    }

@@ -17,8 +17,11 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from ._heartbeat.cadence import (
     anchor_epoch as _cadence_anchor_epoch,
     apply_silence_backoff as _cadence_apply_silence_backoff,
+    clear_automatic_backoff as _cadence_clear_automatic_backoff,
     cooldown as _cadence_cooldown,
     daily_anchor_due as _cadence_daily_anchor_due,
+    effect_ref as _cadence_effect_ref,
+    effect_ref_key as _cadence_effect_ref_key,
     mark_daily_anchor as _cadence_mark_daily_anchor,
     mark_judge as _cadence_mark_judge,
     next_judge_at as _cadence_next_judge_at,
@@ -27,9 +30,12 @@ from ._heartbeat.cadence import (
     recent_contact as _cadence_recent_contact,
     recent_from_state as _cadence_recent_from_state,
     recent_private_inbound as _cadence_recent_private_inbound,
+    record_effect_terminal as _cadence_record_effect_terminal,
     record_private_contact as _cadence_record_private_contact,
     record_verified_visible_contact as _cadence_record_verified_visible_contact,
+    remember_effect_ref as _cadence_remember_effect_ref,
     resume as _cadence_resume,
+    snapshot as _cadence_snapshot,
     snooze as _cadence_snooze,
 )
 from ._heartbeat.cadence_codec import (
@@ -38,14 +44,11 @@ from ._heartbeat.cadence_codec import (
     CADENCE_SCHEMA_V2 as CADENCE_SCHEMA_V2,
     CADENCE_SCHEMA_V3 as CADENCE_SCHEMA_V3,
     CADENCE_SCHEMA_V4 as CADENCE_SCHEMA_V4,
-    EFFECT_REF_MAX as _EFFECT_REF_MAX,
-    EFFECT_TERMINAL_MAX as _EFFECT_TERMINAL_MAX,
     HEARTBEAT_CADENCE_SCHEMA as HEARTBEAT_CADENCE_SCHEMA,
     HEARTBEAT_KIND_PATTERN as _HEARTBEAT_KIND_PATTERN,
     SILENCE_BACKOFF_RECEIPT_ID as _SILENCE_BACKOFF_RECEIPT_ID,
     SILENCE_BACKOFF_RECEIPT_MAX as _SILENCE_BACKOFF_RECEIPT_MAX,
     aware as _aware,
-    compact_tail as _compact_tail,
     empty_state as _empty_state,
     json_time as _json_time,
     normalise_cadence_state as _normalise_cadence_state,
@@ -71,7 +74,6 @@ from .runtime_core import (
     RuntimeLocks,
     StateError,
     atomic_json_write,
-    file_lock,
     isoformat,
     new_id,
     utc_now,
@@ -744,9 +746,7 @@ class HeartbeatCadence:
 
     @staticmethod
     def _clear_automatic_backoff(state: dict[str, Any]) -> None:
-        state["automatic_cooldown_until"] = state["auto_until"] = None
-        state["silence_backoff_streak"] = 0
-        state["silence_backoff_last_completed_at"] = None
+        return _cadence_clear_automatic_backoff(state)
 
     def observe_private_reply(self, observed_at: datetime | None = None) -> None:
         return _cadence_observe_private_reply(self, observed_at)
@@ -873,35 +873,18 @@ class HeartbeatCadence:
     def record_effect_terminal(
         self, effect_id: str, terminal: str, *, observed_at: datetime | None = None
     ) -> None:
-        if type(effect_id) is not str or not effect_id.strip():
-            raise ValueError("effect_id must be non-empty")
-        if type(terminal) is not str or not terminal.strip():
-            raise ValueError("effect terminal must be non-empty")
-        observed = self._now(observed_at)
-        with file_lock(self.lock_path):
-            state = self._load()
-            terminals = dict(state["effect_terminals"])
-            terminals.pop(effect_id, None)
-            terminals[effect_id] = terminal
-            state["effect_terminals"] = _compact_tail(terminals, _EFFECT_TERMINAL_MAX)
-            state["last_effect_at"] = isoformat(observed)
-            self._save(state)
+        return _cadence_record_effect_terminal(
+            self,
+            effect_id,
+            terminal,
+            observed_at=observed_at,
+        )
 
     @staticmethod
     def _effect_ref_key(
         source_event_id: str, kind: str, epoch_id: str | None = None
     ) -> str:
-        if (
-            type(source_event_id) is not str
-            or not source_event_id.strip()
-            or type(kind) is not str
-            or not kind.strip()
-        ):
-            raise ValueError("effect reference identity is invalid")
-        if epoch_id is not None and (type(epoch_id) is not str or not epoch_id.strip()):
-            raise ValueError("effect reference epoch is invalid")
-        key = f"{kind}:{source_event_id}"
-        return key if epoch_id is None else f"{key}:{epoch_id}"
+        return _cadence_effect_ref_key(source_event_id, kind, epoch_id)
 
     def remember_effect_ref(
         self,
@@ -911,16 +894,13 @@ class HeartbeatCadence:
         *,
         epoch_id: str | None = None,
     ) -> None:
-        key = self._effect_ref_key(source_event_id, kind, epoch_id)
-        if type(effect_id) is not str or not effect_id.strip():
-            raise ValueError("effect reference id is invalid")
-        with file_lock(self.lock_path):
-            state = self._load()
-            refs = dict(state["effect_refs"])
-            refs.pop(key, None)
-            refs[key] = effect_id
-            state["effect_refs"] = _compact_tail(refs, _EFFECT_REF_MAX)
-            self._save(state)
+        return _cadence_remember_effect_ref(
+            self,
+            source_event_id,
+            kind,
+            effect_id,
+            epoch_id=epoch_id,
+        )
 
     def effect_ref(
         self,
@@ -929,11 +909,12 @@ class HeartbeatCadence:
         *,
         epoch_id: str | None = None,
     ) -> str | None:
-        key = self._effect_ref_key(source_event_id, kind, epoch_id)
-        if not self.path.exists():
-            return None
-        with file_lock(self.lock_path):
-            return self._load()["effect_refs"].get(key)
+        return _cadence_effect_ref(
+            self,
+            source_event_id,
+            kind,
+            epoch_id=epoch_id,
+        )
 
     def recent_contact(
         self, *, now: datetime | None = None
@@ -952,64 +933,7 @@ class HeartbeatCadence:
         return _cadence_recent_private_inbound(self, now=now)
 
     def snapshot(self, *, now: datetime | None = None) -> dict[str, Any]:
-        effective_now = self._now(now)
-        if self.path.exists():
-            with file_lock(self.lock_path):
-                state = self._load()
-                self._prune_contact_state(state, effective_now)
-        else:
-            state = _empty_state()
-        private, visible = state["private_contacts"], state["verified_visible_contacts"]
-        next_at = _optional_time(state["next_judge_at"], "next_judge_at")
-        if next_at is None:
-            last = _optional_time(state["last_judge_at"], "last_judge_at")
-            next_at = effective_now if last is None else last + self.judge_interval
-        recent_kind, recent_at = self._recent_from_state(state, effective_now)
-        anchor_epochs = dict(state["daily_anchor_epochs"])
-        default_anchor_epoch = (
-            anchor_epochs.get("daily_anchor") or state["daily_anchor_legacy_epoch"]
-        )
-        return {
-            "schema_version": CADENCE_SCHEMA_V4,
-            "last_judge_at": state["last_judge_at"],
-            "next_judge_at": isoformat(next_at),
-            "manual_cooldown_until": state["manual_cooldown_until"],
-            "automatic_cooldown_until": state["automatic_cooldown_until"],
-            "last_effect_at": state["last_effect_at"],
-            # The old fields remain as a compatibility view for the default
-            # kind; per-kind callers must use daily_anchor_epochs.
-            "daily_anchor_epoch": default_anchor_epoch,
-            "daily_anchor_completed": bool(default_anchor_epoch),
-            "daily_anchor_epochs": anchor_epochs,
-            "daily_anchor_legacy_epoch": state["daily_anchor_legacy_epoch"],
-            "daily_anchor_hour": self.anchor_hour,
-            "timezone": self.timezone_name,
-            "last_private_contact_at": state["last_private_contact_at"],
-            "private_contact_sources": sorted(private),
-            "private_contact_overflow_until": state["private_contact_overflow_until"],
-            "last_verified_visible_contact_at": state[
-                "last_verified_visible_contact_at"
-            ],
-            "verified_visible_effects": sorted(visible),
-            "verified_visible_overflow_until": state["verified_visible_overflow_until"],
-            "recent_contact_kind": recent_kind,
-            "recent_contact_at": None if recent_at is None else isoformat(recent_at),
-            "effect_terminals": dict(state["effect_terminals"]),
-            "effect_reference_count": len(state["effect_refs"]),
-            "silence_backoff": {
-                "streak": state["silence_backoff_streak"],
-                "processed_receipts": len(state["silence_backoff_processed_receipts"]),
-                "last_completed_at": state["silence_backoff_last_completed_at"],
-                "active": (
-                    _optional_time(
-                        state["automatic_cooldown_until"],
-                        "automatic_cooldown_until",
-                    )
-                    or effective_now
-                )
-                > effective_now,
-            },
-        }
+        return _cadence_snapshot(self, now=now)
 
     def observer_status(
         self, *, target_date: date, now: datetime

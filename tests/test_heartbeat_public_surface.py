@@ -150,6 +150,21 @@ PUBLIC_SIGNATURES = {
         "'tuple[str | None, datetime | None]'",
         ("now", "return"),
     ),
+    "HeartbeatCadence.record_effect_terminal": (
+        "(self, effect_id: 'str', terminal: 'str', *, observed_at: "
+        "'datetime | None' = None) -> 'None'",
+        ("effect_id", "terminal", "observed_at", "return"),
+    ),
+    "HeartbeatCadence.remember_effect_ref": (
+        "(self, source_event_id: 'str', kind: 'str', effect_id: 'str', *, "
+        "epoch_id: 'str | None' = None) -> 'None'",
+        ("source_event_id", "kind", "effect_id", "epoch_id", "return"),
+    ),
+    "HeartbeatCadence.effect_ref": (
+        "(self, source_event_id: 'str', kind: 'str', *, epoch_id: "
+        "'str | None' = None) -> 'str | None'",
+        ("source_event_id", "kind", "epoch_id", "return"),
+    ),
     "HeartbeatCadence.snapshot": (
         "(self, *, now: 'datetime | None' = None) -> 'dict[str, Any]'",
         ("now", "return"),
