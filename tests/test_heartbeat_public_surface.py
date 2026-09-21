@@ -129,6 +129,27 @@ PUBLIC_SIGNATURES = {
             "return",
         ),
     ),
+    "HeartbeatCadence.record_private_contact": (
+        "(self, receipt: 'SessionHookReceipt | None' = None, *, source_id: "
+        "'str | None' = None, observed_at: 'datetime | None' = None, fresh: "
+        "'bool' = True, source_kind: 'str' = 'private_inbound') -> 'bool'",
+        ("receipt", "source_id", "observed_at", "fresh", "source_kind", "return"),
+    ),
+    "HeartbeatCadence.record_verified_visible_contact": (
+        "(self, record: 'EffectRecord', receipt: 'EffectReceipt | None' = None) "
+        "-> 'bool'",
+        ("record", "receipt", "return"),
+    ),
+    "HeartbeatCadence.recent_contact": (
+        "(self, *, now: 'datetime | None' = None) -> "
+        "'tuple[str | None, datetime | None]'",
+        ("now", "return"),
+    ),
+    "HeartbeatCadence.recent_private_inbound": (
+        "(self, *, now: 'datetime | None' = None) -> "
+        "'tuple[str | None, datetime | None]'",
+        ("now", "return"),
+    ),
     "HeartbeatCadence.snapshot": (
         "(self, *, now: 'datetime | None' = None) -> 'dict[str, Any]'",
         ("now", "return"),
@@ -303,4 +324,16 @@ def test_cadence_observer_status_keeps_read_only_contract_docstring() -> None:
 def test_cadence_silence_backoff_keeps_atomic_contract_docstring() -> None:
     assert inspect.getdoc(heartbeat.HeartbeatCadence.apply_silence_backoff) == (
         "Atomically dedupe a settled silence and update cadence cooldown."
+    )
+
+
+def test_cadence_contact_projection_docstrings_remain_public() -> None:
+    assert inspect.getdoc(
+        heartbeat.HeartbeatCadence.record_verified_visible_contact
+    ) == ("Project only a verified heartbeat delivery into contact state.")
+    assert inspect.getdoc(heartbeat.HeartbeatCadence.recent_private_inbound) == (
+        "Return only recent user-originated private contact.\n\n"
+        "Verified outbound delivery remains part of ``recent_contact`` so a\n"
+        "heartbeat can avoid repeated messages, but it is not user-presence\n"
+        "evidence for autonomy admission."
     )

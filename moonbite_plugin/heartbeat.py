@@ -23,6 +23,12 @@ from ._heartbeat.cadence import (
     mark_judge as _cadence_mark_judge,
     next_judge_at as _cadence_next_judge_at,
     observe_private_reply as _cadence_observe_private_reply,
+    prune_contact_state as _cadence_prune_contact_state,
+    recent_contact as _cadence_recent_contact,
+    recent_from_state as _cadence_recent_from_state,
+    recent_private_inbound as _cadence_recent_private_inbound,
+    record_private_contact as _cadence_record_private_contact,
+    record_verified_visible_contact as _cadence_record_verified_visible_contact,
     resume as _cadence_resume,
     snooze as _cadence_snooze,
 )
@@ -36,12 +42,9 @@ from ._heartbeat.cadence_codec import (
     EFFECT_TERMINAL_MAX as _EFFECT_TERMINAL_MAX,
     HEARTBEAT_CADENCE_SCHEMA as HEARTBEAT_CADENCE_SCHEMA,
     HEARTBEAT_KIND_PATTERN as _HEARTBEAT_KIND_PATTERN,
-    PRIVATE_CONTACT_MAX as _PRIVATE_CONTACT_MAX,
     SILENCE_BACKOFF_RECEIPT_ID as _SILENCE_BACKOFF_RECEIPT_ID,
     SILENCE_BACKOFF_RECEIPT_MAX as _SILENCE_BACKOFF_RECEIPT_MAX,
-    VISIBLE_CONTACT_MAX as _VISIBLE_CONTACT_MAX,
     aware as _aware,
-    compact_contacts as _compact_contacts,
     compact_tail as _compact_tail,
     empty_state as _empty_state,
     json_time as _json_time,
@@ -717,36 +720,7 @@ class HeartbeatCadence:
         single expiry marker represents the conservative overflow case until
         the window clears; this avoids lifetime probabilistic dedupe.
         """
-        changed = False
-        cutoff = now - self.recent_contact_window
-        for contacts_key, overflow_key, limit in (
-            (
-                "private_contacts",
-                "private_contact_overflow_until",
-                _PRIVATE_CONTACT_MAX,
-            ),
-            (
-                "verified_visible_contacts",
-                "verified_visible_overflow_until",
-                _VISIBLE_CONTACT_MAX,
-            ),
-        ):
-            contacts = state[contacts_key]
-            kept: dict[str, str] = {}
-            for key, raw in contacts.items():
-                observed = _optional_time(raw, f"{contacts_key}.{key}")
-                if observed is not None and observed > cutoff:
-                    kept[key] = raw
-            if len(kept) > limit:
-                kept = _compact_contacts(kept, limit)
-            if kept != contacts:
-                state[contacts_key] = kept
-                changed = True
-            overflow = _optional_time(state.get(overflow_key), overflow_key)
-            if overflow is not None and overflow <= now:
-                state[overflow_key] = None
-                changed = True
-        return changed
+        return _cadence_prune_contact_state(self, state, now)
 
     def _recent_from_state(
         self,
@@ -755,33 +729,12 @@ class HeartbeatCadence:
         *,
         include_verified_visible: bool = True,
     ) -> tuple[str | None, datetime | None]:
-        items: list[tuple[str, datetime]] = []
-        contact_sources = [("private_contacts", "recent_private_inbound")]
-        overflow_sources = [
-            ("private_contact_overflow_until", "recent_private_inbound")
-        ]
-        if include_verified_visible:
-            contact_sources.append(
-                ("verified_visible_contacts", "recent_verified_visible_contact")
-            )
-            overflow_sources.append(
-                (
-                    "verified_visible_overflow_until",
-                    "recent_verified_visible_contact",
-                )
-            )
-        for contacts_key, label in contact_sources:
-            for raw in state[contacts_key].values():
-                parsed = _optional_time(raw, contacts_key)
-                if parsed is not None and parsed + self.recent_contact_window > now:
-                    items.append((label, parsed))
-        for overflow_key, label in overflow_sources:
-            expiry = _optional_time(state.get(overflow_key), overflow_key)
-            if expiry is not None and expiry > now:
-                items.append((label, expiry - self.recent_contact_window))
-        if not items:
-            return None, None
-        return max(items, key=lambda item: item[1])
+        return _cadence_recent_from_state(
+            self,
+            state,
+            now,
+            include_verified_visible=include_verified_visible,
+        )
 
     def snooze(self, minutes: int, *, manual: bool) -> datetime:
         return _cadence_snooze(self, minutes, manual=manual)
@@ -893,66 +846,15 @@ class HeartbeatCadence:
         fresh: bool = True,
         source_kind: str = "private_inbound",
     ) -> bool:
-        if receipt is not None:
-            if not isinstance(receipt, SessionHookReceipt):
-                raise TypeError("receipt must be a SessionHookReceipt")
-            context = receipt.context
-            if not context.counts_as_private_contact:
-                return False
-            source_id, observed_at, fresh, source_kind = (
-                context.source_id,
-                context.observed_at,
-                context.fresh,
-                context.source_kind,
-            )
-        if (
-            type(source_id) is not str
-            or not source_id.strip()
-            or type(fresh) is not bool
-            or not fresh
-            or source_kind != "private_inbound"
-        ):
-            return False
-        effective_now = self._now()
-        observed = _aware(effective_now if observed_at is None else observed_at)
-        if observed > effective_now:
-            return False
-        with file_lock(self.lock_path):
-            state = self._load()
-            changed = self._prune_contact_state(state, effective_now)
-            contacts = dict(state["private_contacts"])
-            if source_id in contacts:
-                if changed:
-                    self._save(state)
-                return False
-            watermark = _optional_time(
-                state.get("last_private_contact_at"), "last_private_contact_at"
-            )
-            if watermark is None or observed > watermark:
-                state["last_private_contact_at"] = isoformat(observed)
-            if observed + self.recent_contact_window <= effective_now:
-                self._clear_automatic_backoff(state)
-                self._save(state)
-                return False
-            if len(contacts) >= _PRIVATE_CONTACT_MAX:
-                expiry = observed + self.recent_contact_window
-                current_expiry = _optional_time(
-                    state.get("private_contact_overflow_until"),
-                    "private_contact_overflow_until",
-                )
-                if current_expiry is not None and current_expiry > expiry:
-                    expiry = current_expiry
-                state["private_contact_overflow_until"] = isoformat(expiry)
-                self._clear_automatic_backoff(state)
-                self._save(state)
-                return True
-            contacts[source_id] = isoformat(observed)
-            state["private_contacts"] = _compact_contacts(
-                contacts, _PRIVATE_CONTACT_MAX
-            )
-            self._clear_automatic_backoff(state)
-            self._save(state)
-        return True
+        return _cadence_record_private_contact(
+            self,
+            receipt,
+            receipt_type=SessionHookReceipt,
+            source_id=source_id,
+            observed_at=observed_at,
+            fresh=fresh,
+            source_kind=source_kind,
+        )
 
     def record_verified_visible_contact(
         self,
@@ -960,69 +862,13 @@ class HeartbeatCadence:
         receipt: EffectReceipt | None = None,
     ) -> bool:
         """Project only a verified heartbeat delivery into contact state."""
-
-        if not isinstance(record, EffectRecord):
-            raise TypeError("verified visible contact requires EffectRecord")
-        if (
-            record.kind != "heartbeat_delivery"
-            or record.state != "verified"
-            or not record.verified
-            or not isinstance(record.receipt, EffectReceipt)
-        ):
-            return False
-        selected = record.receipt if receipt is None else receipt
-        if not isinstance(selected, EffectReceipt):
-            raise TypeError("verified visible contact requires EffectReceipt")
-        if selected != record.receipt or (
-            selected.event_id != record.source_event_id
-            or selected.content_sha256 != record.content_sha256
-            or selected.content_length != record.content_length
-            or selected.epoch_id != record.epoch_id
-        ):
-            return False
-        key = record.effect_id
-        observed = _aware(selected.observed_at, "receipt observed_at")
-        effective_now = self._now()
-        if observed > effective_now:
-            return False
-        with file_lock(self.lock_path):
-            state = self._load()
-            changed = self._prune_contact_state(state, effective_now)
-            contacts = dict(state["verified_visible_contacts"])
-            if key in contacts:
-                if changed:
-                    self._save(state)
-                return False
-            watermark = _optional_time(
-                state.get("last_verified_visible_contact_at"),
-                "last_verified_visible_contact_at",
-            )
-            watermark_changed = watermark is None or observed > watermark
-            if watermark_changed:
-                state["last_verified_visible_contact_at"] = isoformat(observed)
-            if observed + self.recent_contact_window <= effective_now:
-                self._clear_automatic_backoff(state)
-                self._save(state)
-                return False
-            if len(contacts) >= _VISIBLE_CONTACT_MAX:
-                expiry = observed + self.recent_contact_window
-                current_expiry = _optional_time(
-                    state.get("verified_visible_overflow_until"),
-                    "verified_visible_overflow_until",
-                )
-                if current_expiry is not None and current_expiry > expiry:
-                    expiry = current_expiry
-                state["verified_visible_overflow_until"] = isoformat(expiry)
-                self._clear_automatic_backoff(state)
-                self._save(state)
-                return True
-            contacts[key] = isoformat(observed)
-            state["verified_visible_contacts"] = _compact_contacts(
-                contacts, _VISIBLE_CONTACT_MAX
-            )
-            self._clear_automatic_backoff(state)
-            self._save(state)
-        return True
+        return _cadence_record_verified_visible_contact(
+            self,
+            record,
+            receipt,
+            record_type=EffectRecord,
+            receipt_type=EffectReceipt,
+        )
 
     def record_effect_terminal(
         self, effect_id: str, terminal: str, *, observed_at: datetime | None = None
@@ -1092,13 +938,7 @@ class HeartbeatCadence:
     def recent_contact(
         self, *, now: datetime | None = None
     ) -> tuple[str | None, datetime | None]:
-        effective_now = self._now(now)
-        if not self.path.exists():
-            return None, None
-        with file_lock(self.lock_path):
-            state = self._load()
-            self._prune_contact_state(state, effective_now)
-            return self._recent_from_state(state, effective_now)
+        return _cadence_recent_contact(self, now=now)
 
     def recent_private_inbound(
         self, *, now: datetime | None = None
@@ -1109,18 +949,7 @@ class HeartbeatCadence:
         heartbeat can avoid repeated messages, but it is not user-presence
         evidence for autonomy admission.
         """
-
-        effective_now = self._now(now)
-        if not self.path.exists():
-            return None, None
-        with file_lock(self.lock_path):
-            state = self._load()
-            self._prune_contact_state(state, effective_now)
-            return self._recent_from_state(
-                state,
-                effective_now,
-                include_verified_visible=False,
-            )
+        return _cadence_recent_private_inbound(self, now=now)
 
     def snapshot(self, *, now: datetime | None = None) -> dict[str, Any]:
         effective_now = self._now(now)
