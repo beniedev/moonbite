@@ -1808,6 +1808,8 @@ class HeartbeatCadence:
     def observer_status(
         self, *, target_date: date, now: datetime
     ) -> tuple[ObservationFact, ...]:
+        """Project cadence state without normalising, pruning, or locking."""
+
         return _cadence_observer_status(
             path=self.path,
             anchor_epoch=self._anchor_epoch,

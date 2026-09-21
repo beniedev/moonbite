@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import json
 import threading
 from contextlib import contextmanager
@@ -2398,6 +2399,12 @@ def test_projection_failures_are_degraded_without_erasing_verified_truth(tmp_pat
     assert audit_failure.status == "partial"
     assert audit_failure.degraded is True
     assert any("audit_write" in item for item in audit_failure.projection_errors)
+
+
+def test_cadence_observer_status_retains_public_read_only_contract():
+    assert inspect.getdoc(HeartbeatCadence.observer_status) == (
+        "Project cadence state without normalising, pruning, or locking."
+    )
 
 
 def test_observer_status_pristine_and_corrupt_cadence_are_read_only(tmp_path):
