@@ -3051,6 +3051,17 @@ class HeartbeatEngine:
             if result.effects and not all(effect.verified for effect in result.effects):
                 return None
             return "verified" if result.effects else "completed"
+        if result.status == "intentional_silence":
+            if not result.effects or any(
+                effect.terminal not in {"intentional_silence", "verified"}
+                for effect in result.effects
+            ):
+                return None
+            if not any(
+                effect.terminal == "intentional_silence" for effect in result.effects
+            ):
+                return None
+            return "intentional_silence"
         if result.status == "failed":
             if result.effects and any(
                 effect.terminal not in {"failed", "intentional_silence", "verified"}
@@ -4026,11 +4037,16 @@ class HeartbeatEngine:
                 tuple(projection_errors),
             )
         elif record.state == "failed":
+            terminal = (
+                "intentional_silence"
+                if record.reason == "intentional_silence"
+                else "failed"
+            )
             result = EffectResult(
                 False,
                 status or "failed",
                 effect_id=record.effect_id,
-                terminal="failed",
+                terminal=terminal,
                 reason_code=code or HeartbeatReasonCode.EFFECT_ERROR,
             )
         elif record.state == "requeued":
@@ -5118,13 +5134,14 @@ class HeartbeatEngine:
         ) -> HeartbeatResult:
             delivery, wake = existing
             effects = [x for x in existing if x is not None]
-            if any(not x.ok for x in effects):
+            real_failures = [
+                effect
+                for effect in effects
+                if not effect.ok and effect.terminal != "intentional_silence"
+            ]
+            if real_failures:
                 failure_code = next(
-                    (
-                        x.reason_code
-                        for x in effects
-                        if not x.ok and x.reason_code is not None
-                    ),
+                    (x.reason_code for x in real_failures if x.reason_code is not None),
                     HeartbeatReasonCode.EFFECT_ERROR,
                 )
                 return make_result(
@@ -5133,6 +5150,22 @@ class HeartbeatEngine:
                     candidate_id,
                     gate,
                     code=failure_code,
+                    delivery=delivery,
+                    wake=wake,
+                    next_judge_at=now,
+                )
+            if any(
+                effect.terminal == "intentional_silence" for effect in effects
+            ) and all(
+                effect.verified or effect.terminal == "intentional_silence"
+                for effect in effects
+            ):
+                return make_result(
+                    "intentional_silence",
+                    "effects_settled_silent",
+                    candidate_id,
+                    gate,
+                    code=HeartbeatReasonCode.DENIED,
                     delivery=delivery,
                     wake=wake,
                     next_judge_at=now,

@@ -543,6 +543,115 @@ def test_multi_effect_failure_wins_over_intentional_silence(tmp_path):
     assert terminals[0].payload["terminal"] == "failed"
 
 
+def _clear_effect_terminal_projection(cadence):
+    state = json.loads(cadence.path.read_text(encoding="utf-8"))
+    state["effect_terminals"] = {}
+    atomic_json_write(cadence.path, state)
+
+
+def _delegated_replay_fixture(tmp_path, source):
+    class DelegatedSink:
+        def deliver(self, _candidate, _decision, _intent=None):
+            return EffectResult(True, "queued")
+
+        def wake(self, _candidate, _decision, _intent=None):
+            return EffectResult(True, "queued")
+
+    judge = Judge(
+        JudgeDecision(
+            True,
+            True,
+            "contact",
+            "hello",
+            delivery_mode="delegated",
+        )
+    )
+    sink = DelegatedSink()
+    runtime, _controls, bus, cadence = engine(tmp_path, judge, sink)
+    candidate = HeartbeatCandidate(
+        "care_poke",
+        {"events": ["event"], "due": True, "source_event_id": source},
+        candidate_id=source,
+    )
+    initial = runtime.run(candidate)
+    runtime.reconcile_heartbeat_delivery(
+        initial.delivery.effect_id, "intentional_silence"
+    )
+    return runtime, judge, sink, bus, cadence, candidate, initial
+
+
+def test_settled_silent_delivery_replays_with_consistent_terminal(tmp_path):
+    runtime, judge, _sink, bus, cadence, candidate, initial = _delegated_replay_fixture(
+        tmp_path, "settled-silent"
+    )
+    wake_record = runtime.effect_ledger.get(initial.wake.effect_id)
+    wake_receipt = EffectReceipt(
+        receipt_id="settled-silent-wake",
+        event_id=wake_record.source_event_id,
+        observed_at=NOW,
+        content_sha256=wake_record.content_sha256,
+        content_length=wake_record.content_length,
+        epoch_id=wake_record.epoch_id,
+    )
+    runtime.effect_ledger.verify(wake_record.effect_id, wake_receipt)
+    _clear_effect_terminal_projection(cadence)
+
+    replay = runtime.run(candidate)
+    duplicate = runtime.run(candidate)
+
+    assert (replay.status, replay.reason, replay.reason_code) == (
+        "intentional_silence",
+        "effects_settled_silent",
+        HeartbeatReasonCode.DENIED,
+    )
+    assert replay.delivery.terminal == "intentional_silence"
+    assert replay.wake.terminal == "verified"
+    assert (duplicate.status, duplicate.reason) == (
+        "completed",
+        "intentional_silence",
+    )
+    assert judge.calls == 1
+    terminals = [
+        event
+        for event in bus.read_audit()
+        if event.payload.get("occurrence_id") == "settled-silent"
+        and event.payload.get("terminal") is not None
+    ]
+    assert len(terminals) == 1
+    assert (
+        terminals[0].payload["status"],
+        terminals[0].payload["terminal"],
+    ) == ("intentional_silence", "intentional_silence")
+
+
+def test_settled_silent_delivery_does_not_hide_real_sibling_failure(tmp_path):
+    runtime, _judge, _sink, bus, cadence, candidate, initial = (
+        _delegated_replay_fixture(tmp_path, "settled-mixed")
+    )
+    runtime.effect_ledger.fail(
+        initial.wake.effect_id, "adapter_error:RuntimeError", retryable=False
+    )
+    _clear_effect_terminal_projection(cadence)
+
+    replay = runtime.run(candidate)
+
+    assert (replay.status, replay.reason, replay.reason_code) == (
+        "failed",
+        "effect_failed",
+        HeartbeatReasonCode.EFFECT_ERROR,
+    )
+    assert replay.delivery.terminal == "intentional_silence"
+    assert replay.wake.terminal == "failed"
+    terminals = [
+        event
+        for event in bus.read_audit()
+        if event.payload.get("occurrence_id") == "settled-mixed"
+        and event.payload.get("terminal") is not None
+    ]
+    assert len(terminals) == 1
+    assert terminals[0].payload["terminal"] == "failed"
+
+
 def test_accepted_but_unverified_wake_is_pending(tmp_path):
     judge = Judge(JudgeDecision(True, False, "contact", "untrusted text"))
     sink = Sink(wake_verified=False)
