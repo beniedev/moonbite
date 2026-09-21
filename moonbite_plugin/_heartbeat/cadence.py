@@ -12,17 +12,24 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Protocol
 
-from ..runtime_core import file_lock, isoformat
+from ..runtime_core import StateError, file_lock, isoformat
 from .cadence_codec import (
+    DAILY_ANCHOR_MAX,
     SILENCE_BACKOFF_RECEIPT_MAX,
+    aware,
     compact_tail,
+    daily_anchor_kind,
     optional_time,
+    strict_iso_date,
 )
 
 
 class _CadenceOwner(Protocol):
     path: Path
     lock_path: Path
+    timezone: Any
+    anchor_hour: int
+    judge_interval: timedelta
 
     def _load(self) -> dict[str, Any]: ...
 
@@ -33,6 +40,8 @@ class _CadenceOwner(Protocol):
     def _prune_contact_state(self, state: dict[str, Any], now: datetime) -> bool: ...
 
     def _clear_automatic_backoff(self, state: dict[str, Any]) -> None: ...
+
+    def daily_anchor_epoch(self, now: datetime | None = None) -> str: ...
 
 
 def snooze(owner: _CadenceOwner, minutes: int, *, manual: bool) -> datetime:
@@ -280,3 +289,125 @@ def cooldown(
         if until is not None and until > effective_now:
             return True, label, until
     return False, "open", None
+
+
+def anchor_epoch(owner: _CadenceOwner, now: datetime) -> str:
+    local = aware(now).astimezone(owner.timezone)
+    date = local.date()
+    if local.hour < owner.anchor_hour:
+        date -= timedelta(days=1)
+    return date.isoformat()
+
+
+def daily_anchor_due(
+    owner: _CadenceOwner,
+    now: datetime | None = None,
+    *,
+    kind: str = "daily_anchor",
+) -> bool:
+    selected_kind = daily_anchor_kind(kind)
+    epoch = owner.daily_anchor_epoch(now)
+    if not owner.path.exists():
+        return True
+    with file_lock(owner.lock_path):
+        state = owner._load()
+    if state["daily_anchor_legacy_epoch"] == epoch:
+        return False
+    return state["daily_anchor_epochs"].get(selected_kind) != epoch
+
+
+def mark_daily_anchor(
+    owner: _CadenceOwner,
+    epoch: str | None = None,
+    *,
+    kind: str = "daily_anchor",
+    now: datetime | None = None,
+) -> str:
+    selected_kind = daily_anchor_kind(kind)
+    selected = epoch if epoch is not None else owner.daily_anchor_epoch(now)
+    strict_iso_date(selected, "daily anchor epoch")
+    with file_lock(owner.lock_path):
+        state = owner._load()
+        epochs = dict(state["daily_anchor_epochs"])
+        if selected_kind not in epochs and len(epochs) >= DAILY_ANCHOR_MAX:
+            raise StateError("heartbeat daily_anchor_epochs exceeds its bound")
+        epochs[selected_kind] = selected
+        state["daily_anchor_epochs"] = epochs
+        state["daily_anchor_epoch"] = (
+            epochs.get("daily_anchor") or state["daily_anchor_legacy_epoch"]
+        )
+        state["daily_anchor_completed"] = bool(state["daily_anchor_epoch"])
+        owner._save(state)
+    return selected
+
+
+def next_judge_at(
+    owner: _CadenceOwner,
+    now: datetime | None = None,
+) -> datetime:
+    effective_now = owner._now(now)
+    if not owner.path.exists():
+        return effective_now
+    with file_lock(owner.lock_path):
+        state = owner._load()
+    value = optional_time(state["next_judge_at"], "next_judge_at")
+    if value is not None:
+        return value
+    last = optional_time(state["last_judge_at"], "last_judge_at")
+    return effective_now if last is None else last + owner.judge_interval
+
+
+def mark_judge(
+    owner: _CadenceOwner,
+    *,
+    now: datetime | None = None,
+    next_judge_at: datetime | str | None = None,
+    cadence_minutes: int | None = None,
+    anchor_epoch: str | None = None,
+    anchor_kind: str | None = None,
+) -> datetime:
+    effective_now = owner._now(now)
+    if anchor_kind is not None and anchor_epoch is None:
+        raise ValueError("anchor_kind requires anchor_epoch")
+    if anchor_epoch is not None:
+        strict_iso_date(anchor_epoch, "anchor_epoch")
+    selected_anchor_kind = (
+        daily_anchor_kind(anchor_kind) if anchor_kind is not None else "daily_anchor"
+    )
+    if next_judge_at is not None:
+        selected = optional_time(next_judge_at, "next_judge_at")
+        assert selected is not None
+        if selected <= effective_now:
+            raise ValueError("next_judge_at must be later than now")
+    elif cadence_minutes is not None:
+        if type(cadence_minutes) is not int or not 1 <= cadence_minutes <= 10080:
+            raise ValueError("cadence_minutes is out of bounds")
+        selected = effective_now + timedelta(minutes=cadence_minutes)
+    elif anchor_epoch is not None:
+        local = effective_now.astimezone(owner.timezone)
+        next_date = local.date() + timedelta(days=1)
+        selected = datetime(
+            next_date.year,
+            next_date.month,
+            next_date.day,
+            owner.anchor_hour,
+            tzinfo=owner.timezone,
+        ).astimezone(effective_now.tzinfo)
+    else:
+        selected = effective_now + owner.judge_interval
+    with file_lock(owner.lock_path):
+        state = owner._load()
+        state["last_judge_at"] = isoformat(effective_now)
+        state["next_judge_at"] = isoformat(selected)
+        if anchor_epoch is not None:
+            epochs = dict(state["daily_anchor_epochs"])
+            if selected_anchor_kind not in epochs and len(epochs) >= DAILY_ANCHOR_MAX:
+                raise StateError("heartbeat daily_anchor_epochs exceeds its bound")
+            epochs[selected_anchor_kind] = anchor_epoch
+            state["daily_anchor_epochs"] = epochs
+            state["daily_anchor_epoch"] = (
+                epochs.get("daily_anchor") or state["daily_anchor_legacy_epoch"]
+            )
+            state["daily_anchor_completed"] = bool(state["daily_anchor_epoch"])
+        owner._save(state)
+    return selected

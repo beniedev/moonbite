@@ -79,6 +79,56 @@ PUBLIC_SIGNATURES = {
         "'tuple[ObservationFact, ...]'",
         ("target_date", "now", "return"),
     ),
+    "HeartbeatCadence.snooze": (
+        "(self, minutes: 'int', *, manual: 'bool') -> 'datetime'",
+        ("minutes", "manual", "return"),
+    ),
+    "HeartbeatCadence.resume": (
+        "(self) -> 'None'",
+        ("return",),
+    ),
+    "HeartbeatCadence.observe_private_reply": (
+        "(self, observed_at: 'datetime | None' = None) -> 'None'",
+        ("observed_at", "return"),
+    ),
+    "HeartbeatCadence.apply_silence_backoff": (
+        "(self, receipt: 'HeartbeatSilenceReceipt', *, policy: "
+        "'Mapping[str, Any]', now: 'datetime | None' = None) -> 'dict[str, Any]'",
+        ("receipt", "policy", "now", "return"),
+    ),
+    "HeartbeatCadence.cooldown": (
+        "(self, kind: 'str', *, now: 'datetime | None' = None, bypass: "
+        "'Iterable[str] | None' = None) -> 'tuple[bool, str, datetime | None]'",
+        ("kind", "now", "bypass", "return"),
+    ),
+    "HeartbeatCadence.daily_anchor_due": (
+        "(self, now: 'datetime | None' = None, *, kind: 'str' = "
+        "'daily_anchor') -> 'bool'",
+        ("now", "kind", "return"),
+    ),
+    "HeartbeatCadence.mark_daily_anchor": (
+        "(self, epoch: 'str | None' = None, *, kind: 'str' = 'daily_anchor', "
+        "now: 'datetime | None' = None) -> 'str'",
+        ("epoch", "kind", "now", "return"),
+    ),
+    "HeartbeatCadence.next_judge_at": (
+        "(self, now: 'datetime | None' = None) -> 'datetime'",
+        ("now", "return"),
+    ),
+    "HeartbeatCadence.mark_judge": (
+        "(self, *, now: 'datetime | None' = None, next_judge_at: "
+        "'datetime | str | None' = None, cadence_minutes: 'int | None' = None, "
+        "anchor_epoch: 'str | None' = None, anchor_kind: 'str | None' = None) "
+        "-> 'datetime'",
+        (
+            "now",
+            "next_judge_at",
+            "cadence_minutes",
+            "anchor_epoch",
+            "anchor_kind",
+            "return",
+        ),
+    ),
     "HeartbeatCadence.snapshot": (
         "(self, *, now: 'datetime | None' = None) -> 'dict[str, Any]'",
         ("now", "return"),
@@ -247,4 +297,10 @@ def test_public_signatures_and_type_hints_remain_compatible(
 def test_cadence_observer_status_keeps_read_only_contract_docstring() -> None:
     assert inspect.getdoc(heartbeat.HeartbeatCadence.observer_status) == (
         "Project cadence state without normalising, pruning, or locking."
+    )
+
+
+def test_cadence_silence_backoff_keeps_atomic_contract_docstring() -> None:
+    assert inspect.getdoc(heartbeat.HeartbeatCadence.apply_silence_backoff) == (
+        "Atomically dedupe a settled silence and update cadence cooldown."
     )

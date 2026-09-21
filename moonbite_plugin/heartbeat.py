@@ -15,8 +15,13 @@ from typing import Any, Callable, Protocol
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from ._heartbeat.cadence import (
+    anchor_epoch as _cadence_anchor_epoch,
     apply_silence_backoff as _cadence_apply_silence_backoff,
     cooldown as _cadence_cooldown,
+    daily_anchor_due as _cadence_daily_anchor_due,
+    mark_daily_anchor as _cadence_mark_daily_anchor,
+    mark_judge as _cadence_mark_judge,
+    next_judge_at as _cadence_next_judge_at,
     observe_private_reply as _cadence_observe_private_reply,
     resume as _cadence_resume,
     snooze as _cadence_snooze,
@@ -27,7 +32,6 @@ from ._heartbeat.cadence_codec import (
     CADENCE_SCHEMA_V2 as CADENCE_SCHEMA_V2,
     CADENCE_SCHEMA_V3 as CADENCE_SCHEMA_V3,
     CADENCE_SCHEMA_V4 as CADENCE_SCHEMA_V4,
-    DAILY_ANCHOR_MAX as _DAILY_ANCHOR_MAX,
     EFFECT_REF_MAX as _EFFECT_REF_MAX,
     EFFECT_TERMINAL_MAX as _EFFECT_TERMINAL_MAX,
     HEARTBEAT_CADENCE_SCHEMA as HEARTBEAT_CADENCE_SCHEMA,
@@ -39,14 +43,12 @@ from ._heartbeat.cadence_codec import (
     aware as _aware,
     compact_contacts as _compact_contacts,
     compact_tail as _compact_tail,
-    daily_anchor_kind as _daily_anchor_kind,
     empty_state as _empty_state,
     json_time as _json_time,
     normalise_cadence_state as _normalise_cadence_state,
     normalise_daily_anchor_state as _normalise_daily_anchor_state,
     optional_time as _optional_time,
     serialise_cadence_state as _serialise_cadence_state,
-    strict_iso_date as _strict_iso_date,
 )
 from ._heartbeat.observation import (
     cadence_observer_status as _cadence_observer_status,
@@ -842,11 +844,7 @@ class HeartbeatCadence:
         return blocked, reason
 
     def _anchor_epoch(self, now: datetime) -> str:
-        local = _aware(now).astimezone(self.timezone)
-        date = local.date()
-        if local.hour < self.anchor_hour:
-            date -= timedelta(days=1)
-        return date.isoformat()
+        return _cadence_anchor_epoch(self, now)
 
     def daily_anchor_epoch(self, now: datetime | None = None) -> str:
         return self._anchor_epoch(self._now(now))
@@ -854,15 +852,7 @@ class HeartbeatCadence:
     def daily_anchor_due(
         self, now: datetime | None = None, *, kind: str = "daily_anchor"
     ) -> bool:
-        selected_kind = _daily_anchor_kind(kind)
-        epoch = self.daily_anchor_epoch(now)
-        if not self.path.exists():
-            return True
-        with file_lock(self.lock_path):
-            state = self._load()
-        if state["daily_anchor_legacy_epoch"] == epoch:
-            return False
-        return state["daily_anchor_epochs"].get(selected_kind) != epoch
+        return _cadence_daily_anchor_due(self, now, kind=kind)
 
     def mark_daily_anchor(
         self,
@@ -871,34 +861,10 @@ class HeartbeatCadence:
         kind: str = "daily_anchor",
         now: datetime | None = None,
     ) -> str:
-        selected_kind = _daily_anchor_kind(kind)
-        selected = epoch if epoch is not None else self.daily_anchor_epoch(now)
-        _strict_iso_date(selected, "daily anchor epoch")
-        with file_lock(self.lock_path):
-            state = self._load()
-            epochs = dict(state["daily_anchor_epochs"])
-            if selected_kind not in epochs and len(epochs) >= _DAILY_ANCHOR_MAX:
-                raise StateError("heartbeat daily_anchor_epochs exceeds its bound")
-            epochs[selected_kind] = selected
-            state["daily_anchor_epochs"] = epochs
-            state["daily_anchor_epoch"] = (
-                epochs.get("daily_anchor") or state["daily_anchor_legacy_epoch"]
-            )
-            state["daily_anchor_completed"] = bool(state["daily_anchor_epoch"])
-            self._save(state)
-        return selected
+        return _cadence_mark_daily_anchor(self, epoch, kind=kind, now=now)
 
     def next_judge_at(self, now: datetime | None = None) -> datetime:
-        effective_now = self._now(now)
-        if not self.path.exists():
-            return effective_now
-        with file_lock(self.lock_path):
-            state = self._load()
-        value = _optional_time(state["next_judge_at"], "next_judge_at")
-        if value is not None:
-            return value
-        last = _optional_time(state["last_judge_at"], "last_judge_at")
-        return effective_now if last is None else last + self.judge_interval
+        return _cadence_next_judge_at(self, now)
 
     def mark_judge(
         self,
@@ -909,56 +875,14 @@ class HeartbeatCadence:
         anchor_epoch: str | None = None,
         anchor_kind: str | None = None,
     ) -> datetime:
-        effective_now = self._now(now)
-        if anchor_kind is not None and anchor_epoch is None:
-            raise ValueError("anchor_kind requires anchor_epoch")
-        if anchor_epoch is not None:
-            _strict_iso_date(anchor_epoch, "anchor_epoch")
-        selected_anchor_kind = (
-            _daily_anchor_kind(anchor_kind)
-            if anchor_kind is not None
-            else "daily_anchor"
+        return _cadence_mark_judge(
+            self,
+            now=now,
+            next_judge_at=next_judge_at,
+            cadence_minutes=cadence_minutes,
+            anchor_epoch=anchor_epoch,
+            anchor_kind=anchor_kind,
         )
-        if next_judge_at is not None:
-            selected = _optional_time(next_judge_at, "next_judge_at")
-            assert selected is not None
-            if selected <= effective_now:
-                raise ValueError("next_judge_at must be later than now")
-        elif cadence_minutes is not None:
-            if type(cadence_minutes) is not int or not 1 <= cadence_minutes <= 10080:
-                raise ValueError("cadence_minutes is out of bounds")
-            selected = effective_now + timedelta(minutes=cadence_minutes)
-        elif anchor_epoch is not None:
-            local = effective_now.astimezone(self.timezone)
-            next_date = local.date() + timedelta(days=1)
-            selected = datetime(
-                next_date.year,
-                next_date.month,
-                next_date.day,
-                self.anchor_hour,
-                tzinfo=self.timezone,
-            ).astimezone(effective_now.tzinfo)
-        else:
-            selected = effective_now + self.judge_interval
-        with file_lock(self.lock_path):
-            state = self._load()
-            state["last_judge_at"] = isoformat(effective_now)
-            state["next_judge_at"] = isoformat(selected)
-            if anchor_epoch is not None:
-                epochs = dict(state["daily_anchor_epochs"])
-                if (
-                    selected_anchor_kind not in epochs
-                    and len(epochs) >= _DAILY_ANCHOR_MAX
-                ):
-                    raise StateError("heartbeat daily_anchor_epochs exceeds its bound")
-                epochs[selected_anchor_kind] = anchor_epoch
-                state["daily_anchor_epochs"] = epochs
-                state["daily_anchor_epoch"] = (
-                    epochs.get("daily_anchor") or state["daily_anchor_legacy_epoch"]
-                )
-                state["daily_anchor_completed"] = bool(state["daily_anchor_epoch"])
-            self._save(state)
-        return selected
 
     def record_private_contact(
         self,
