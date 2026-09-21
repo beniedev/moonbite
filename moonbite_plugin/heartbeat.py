@@ -15,8 +15,8 @@ from typing import Any, Callable, Protocol
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from ._heartbeat.observation import (
-    cadence_observer_status,
-    engine_observer_status,
+    cadence_observer_status as _cadence_observer_status,
+    engine_observer_status as _engine_observer_status,
 )
 from .control import ControlStore, GateResult, evaluate_gate
 from .effects import (
@@ -24,7 +24,7 @@ from .effects import (
     EffectReceipt,
     EffectRecord,
 )
-from .observer import ObservationFact
+from .observer import ObservationFact, RecoveryEvidence as RecoveryEvidence
 from .runtime_core import (
     EventBus,
     FileRuntimeLocks,
@@ -1808,7 +1808,7 @@ class HeartbeatCadence:
     def observer_status(
         self, *, target_date: date, now: datetime
     ) -> tuple[ObservationFact, ...]:
-        return cadence_observer_status(
+        return _cadence_observer_status(
             path=self.path,
             anchor_epoch=self._anchor_epoch,
             ensure_aware=_aware,
@@ -2424,7 +2424,7 @@ class HeartbeatEngine:
         if type(target_date) is not date:
             raise TypeError("target_date must be a date")
         _aware(now, "now")
-        return engine_observer_status(
+        return _engine_observer_status(
             cadence=self.cadence,
             effect_ledger=self.effect_ledger,
             target_date=target_date,
