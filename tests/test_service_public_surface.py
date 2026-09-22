@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import inspect
 import typing
+from types import FunctionType
 
 import moonbite_plugin.service as service
 from moonbite_plugin._service.assembly import ComponentAssemblyMethods
@@ -97,6 +98,8 @@ METHOD_GROUPS = (
     DiaryUseCaseMethods,
 )
 
+METHOD_DESCRIPTOR_TYPES = (FunctionType, classmethod, staticmethod, property)
+
 
 def _implementation(descriptor):
     if isinstance(descriptor, (classmethod, staticmethod)):
@@ -116,7 +119,7 @@ def test_runtime_facade_preserves_descriptors_and_reflection():
     installed = set()
     for group in METHOD_GROUPS:
         for name, descriptor in vars(group).items():
-            if name in {"__module__", "__dict__", "__weakref__", "__doc__"}:
+            if not isinstance(descriptor, METHOD_DESCRIPTOR_TYPES):
                 continue
             public_descriptor = inspect.getattr_static(service.MoonbiteRuntime, name)
             assert type(public_descriptor) is type(descriptor)
@@ -131,8 +134,8 @@ def test_runtime_facade_preserves_descriptors_and_reflection():
 
     runtime_names = {
         name
-        for name in vars(service.MoonbiteRuntime)
-        if name not in {"__module__", "__dict__", "__weakref__", "__doc__"}
+        for name, descriptor in vars(service.MoonbiteRuntime).items()
+        if isinstance(descriptor, METHOD_DESCRIPTOR_TYPES)
     }
     assert runtime_names == installed
     assert service.MoonbiteRuntime.__mro__ == (service.MoonbiteRuntime, object)
