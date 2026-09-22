@@ -5,7 +5,6 @@ from __future__ import annotations
 import hashlib
 import inspect
 import json
-import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timedelta
@@ -60,6 +59,35 @@ from ._heartbeat.observation import (
     cadence_observer_status as _cadence_observer_status,
     engine_observer_status as _engine_observer_status,
 )
+from ._heartbeat.plans import (
+    DELEGATED_DELIVERY_IDEMPOTENCY_SUFFIX as _DELEGATED_DELIVERY_IDEMPOTENCY_SUFFIX,
+    HEARTBEAT_EFFECT_PLAN_SCHEMA as HEARTBEAT_EFFECT_PLAN_SCHEMA,
+    effect_plan as _plans_effect_plan,
+    effect_plan_for_candidate as _plans_effect_plan_for_candidate,
+    effect_plan_for_occurrence as _plans_effect_plan_for_occurrence,
+    effect_plan_incomplete as _plans_effect_plan_incomplete,
+    effect_plan_rows as _plans_effect_plan_rows,
+    ensure_effect_plan as _plans_ensure_effect_plan,
+    infer_legacy_plan_public_epoch as _plans_infer_legacy_plan_public_epoch,
+    plan_effect as _plans_plan_effect,
+    plan_effect_identity as _plans_plan_effect_identity,
+    plan_effect_key_matches as _plans_plan_effect_key_matches,
+    plan_matches as _plans_plan_matches,
+    plan_public_epoch_candidates as _plans_plan_public_epoch_candidates,
+    validate_effect_plan as _plans_validate_effect_plan,
+    validate_plan_record as _plans_validate_plan_record,
+)
+from ._heartbeat.recovery import (
+    canonical_terminal as _recovery_canonical_terminal,
+    candidate_existing_effects as _recovery_candidate_existing_effects,
+    effect_failure_audit_statuses as _recovery_effect_failure_audit_statuses,
+    existing_effect as _recovery_existing_effect,
+    existing_terminal_result as _recovery_existing_terminal_result,
+    has_explicit_occurrence as _recovery_has_explicit_occurrence,
+    public_epoch_from_effect as _recovery_public_epoch_from_effect,
+    replay_effects as _recovery_replay_effects,
+    result_public_epoch as _recovery_result_public_epoch,
+)
 from .control import ControlStore, GateResult, evaluate_gate
 from .effects import (
     EffectLedger,
@@ -80,7 +108,6 @@ from .runtime_core import (
 )
 from .session import SessionHookReceipt
 
-HEARTBEAT_EFFECT_PLAN_SCHEMA = "moon.heartbeat.effect_plan.v1"
 DEFAULT_JUDGE_INTERVAL = timedelta(hours=1)
 DEFAULT_AUTOMATIC_COOLDOWN = timedelta(hours=1)
 DEFAULT_MANUAL_COOLDOWN = timedelta(hours=1)
@@ -99,38 +126,6 @@ HEARTBEAT_WAKE_TERMINALS = frozenset(
 )
 HEARTBEAT_DELIVERY_TERMINALS = frozenset(
     {"verified", "unverified", "failed", "not_requested", "unknown"}
-)
-_EFFECT_PLAN_FIELDS = frozenset(
-    {
-        "schema_version",
-        "candidate_id",
-        "source_event_id",
-        "epoch_id",
-        "public_epoch_id",
-        "closed",
-        "effects",
-    }
-)
-_LEGACY_EFFECT_PLAN_FIELDS = frozenset(
-    {
-        "schema_version",
-        "candidate_id",
-        "source_event_id",
-        "epoch_id",
-        "closed",
-        "effects",
-    }
-)
-_EFFECT_PLAN_EFFECT_FIELDS = frozenset(
-    {
-        "effect_id",
-        "kind",
-        "source_event_id",
-        "epoch_id",
-        "idempotency_key",
-        "content_sha256",
-        "content_length",
-    }
 )
 
 
@@ -967,7 +962,6 @@ _ACCEPTED = frozenset(
         "executed_unverified",
     }
 )
-_DELEGATED_DELIVERY_IDEMPOTENCY_SUFFIX = ":delegated"
 _DELEGATED_FAILURE_REASON = "delegated_delivery_failed"
 
 
@@ -1068,226 +1062,81 @@ class HeartbeatEngine:
     def _plan_effect_identity(
         value: Mapping[str, Any], *, label: str = "heartbeat effect plan"
     ) -> dict[str, Any]:
-        if not isinstance(value, Mapping) or set(value) != _EFFECT_PLAN_EFFECT_FIELDS:
-            raise StateError(f"{label} effect has invalid fields")
-        for field_name in (
-            "effect_id",
-            "kind",
-            "source_event_id",
-            "epoch_id",
-            "idempotency_key",
-        ):
-            field_value = value[field_name]
-            if type(field_value) is not str or not field_value.strip():
-                raise StateError(f"{label} effect has invalid {field_name}")
-        if value["kind"] not in {"heartbeat_delivery", "heartbeat_wake"}:
-            raise StateError(f"{label} effect has invalid kind")
-        content_sha256 = value["content_sha256"]
-        if (
-            type(content_sha256) is not str
-            or re.fullmatch(r"[0-9a-f]{64}", content_sha256) is None
-        ):
-            raise StateError(f"{label} effect has invalid content hash")
-        content_length = value["content_length"]
-        if type(content_length) is not int or content_length <= 0:
-            raise StateError(f"{label} effect has invalid content length")
-        return dict(value)
+        return _plans_plan_effect_identity(value, label=label)
 
     @classmethod
     def _validate_effect_plan(cls, value: Mapping[str, Any]) -> dict[str, Any]:
-        if not isinstance(value, Mapping) or set(value) not in {
-            _EFFECT_PLAN_FIELDS,
-            _LEGACY_EFFECT_PLAN_FIELDS,
-        }:
-            raise StateError("heartbeat effect plan has invalid fields")
-        if value["schema_version"] != HEARTBEAT_EFFECT_PLAN_SCHEMA:
-            raise StateError("heartbeat effect plan has unsupported schema")
-        for field_name in ("candidate_id", "source_event_id", "epoch_id"):
-            field_value = value[field_name]
-            if type(field_value) is not str or not field_value.strip():
-                raise StateError(f"heartbeat effect plan has invalid {field_name}")
-        if value["closed"] is not True:
-            raise StateError("heartbeat effect plan must be closed")
-        effects = value["effects"]
-        if not isinstance(effects, list) or not 1 <= len(effects) <= 2:
-            raise StateError("heartbeat effect plan has invalid effect set")
-        selected = [cls._plan_effect_identity(effect) for effect in effects]
-        kinds = [effect["kind"] for effect in selected]
-        ids = [effect["effect_id"] for effect in selected]
-        idempotency = [effect["idempotency_key"] for effect in selected]
-        if len(set(kinds)) != len(kinds):
-            raise StateError("heartbeat effect plan repeats an effect kind")
-        if len(set(ids)) != len(ids) or len(set(idempotency)) != len(idempotency):
-            raise StateError("heartbeat effect plan repeats an effect identity")
-        if "public_epoch_id" in value:
-            public_epoch = value["public_epoch_id"]
-            if public_epoch is not None and (
-                type(public_epoch) is not str or not public_epoch.strip()
-            ):
-                raise StateError("heartbeat effect plan has invalid public epoch")
-        else:
-            public_epoch = cls._infer_legacy_plan_public_epoch(selected)
-        if value["epoch_id"] != (public_epoch or "heartbeat"):
-            raise StateError("heartbeat effect plan public epoch conflicts")
-        for effect in selected:
-            if (
-                effect["source_event_id"] != value["source_event_id"]
-                or effect["epoch_id"] != value["epoch_id"]
-            ):
-                raise StateError("heartbeat effect plan identity conflicts")
-            if not cls._plan_effect_key_matches(effect, public_epoch):
-                raise StateError("heartbeat effect plan public epoch conflicts")
-        return {
-            **dict(value),
-            "public_epoch_id": public_epoch,
-            "effects": selected,
-        }
+        return _plans_validate_effect_plan(
+            value,
+            validate_effect=cls._plan_effect_identity,
+            infer_public_epoch=cls._infer_legacy_plan_public_epoch,
+            effect_key_matches=cls._plan_effect_key_matches,
+        )
 
     def _effect_plan_rows(self) -> tuple[dict[str, Any], ...]:
-        ledger = self._effect_plans
-        if ledger is None or not ledger.path.exists():
-            return ()
-        try:
-            rows = ledger.rows()
-        except Exception as exc:
-            raise StateError("heartbeat effect plan is unreadable") from exc
-        return tuple(self._validate_effect_plan(row) for row in rows)
+        return _plans_effect_plan_rows(
+            self._effect_plans,
+            validate_plan=self._validate_effect_plan,
+        )
 
     @staticmethod
     def _plan_public_epoch_candidates(
         value: Mapping[str, Any],
     ) -> frozenset[str | None]:
-        internal_epoch = value["epoch_id"]
-        candidates = {
-            public_epoch
-            for public_epoch in (None, internal_epoch)
-            if internal_epoch == (public_epoch or "heartbeat")
-            and HeartbeatEngine._plan_effect_key_matches(value, public_epoch)
-        }
-        return frozenset(candidates)
+        return _plans_plan_public_epoch_candidates(
+            value,
+            effect_key_matches=HeartbeatEngine._plan_effect_key_matches,
+        )
 
     @classmethod
     def _infer_legacy_plan_public_epoch(
         cls, effects: Iterable[Mapping[str, Any]]
     ) -> str | None:
-        candidate_sets = tuple(
-            cls._plan_public_epoch_candidates(effect) for effect in effects
+        return _plans_infer_legacy_plan_public_epoch(
+            effects,
+            public_epoch_candidates=cls._plan_public_epoch_candidates,
         )
-        if not candidate_sets or any(not candidates for candidates in candidate_sets):
-            raise StateError("heartbeat effect plan public epoch is unproven")
-        common = set(candidate_sets[0]).intersection(*candidate_sets[1:])
-        if len(common) != 1:
-            raise StateError("heartbeat effect plan public epoch is ambiguous")
-        return next(iter(common))
 
     @staticmethod
     def _plan_effect_key_matches(
         effect: Mapping[str, Any], public_epoch_id: str | None
     ) -> bool:
-        base = (
-            f"heartbeat:{effect['source_event_id']}:"
-            f"{effect['kind'].removeprefix('heartbeat_')}"
-        )
-        prefix = base if public_epoch_id is None else f"{base}:{public_epoch_id}"
-        expected = {prefix}
-        if effect["kind"] == "heartbeat_delivery":
-            expected.add(prefix + _DELEGATED_DELIVERY_IDEMPOTENCY_SUFFIX)
-        return effect["idempotency_key"] in expected
+        return _plans_plan_effect_key_matches(effect, public_epoch_id)
 
     def _effect_plan(
         self, source_event_id: str, public_epoch_id: str | None
     ) -> dict[str, Any] | None:
-        matches = tuple(
-            row
-            for row in self._effect_plan_rows()
-            if row["source_event_id"] == source_event_id
-            and row["public_epoch_id"] == public_epoch_id
+        return _plans_effect_plan(
+            self._effect_plan_rows(), source_event_id, public_epoch_id
         )
-        if len(matches) > 1:
-            first = matches[0]
-            if any(row != first for row in matches[1:]):
-                raise StateError("heartbeat effect plan identity conflict")
-        return matches[0] if matches else None
 
     def _effect_plan_for_candidate(
         self, candidate: HeartbeatCandidate
     ) -> dict[str, Any] | None:
-        source = (
-            candidate.context.get("source_event_id")
-            or candidate.context.get("event_id")
-            or candidate.candidate_id
+        return _plans_effect_plan_for_candidate(
+            candidate,
+            candidate_epoch=self._candidate_epoch,
+            find_effect_plan=self._effect_plan,
         )
-        public_epoch = self._candidate_epoch(candidate)
-        if type(source) is not str or not source.strip():
-            return None
-        return self._effect_plan(source, public_epoch)
 
     def _effect_plan_for_occurrence(
         self, occurrence_id: str, epoch_id: str | None
     ) -> dict[str, Any] | None:
-        matches = tuple(
-            row
-            for row in self._effect_plan_rows()
-            if row["public_epoch_id"] == epoch_id
-            and (
-                row["candidate_id"] == occurrence_id
-                or row["source_event_id"] == occurrence_id
-            )
+        return _plans_effect_plan_for_occurrence(
+            self._effect_plan_rows(), occurrence_id, epoch_id
         )
-        if len(matches) > 1:
-            first = matches[0]
-            if any(row != first for row in matches[1:]):
-                raise StateError("heartbeat effect plan occurrence conflict")
-        return matches[0] if matches else None
 
     @staticmethod
     def _plan_effect(
         plan: Mapping[str, Any] | None, kind: str
     ) -> Mapping[str, Any] | None:
-        if plan is None:
-            return None
-        return next(
-            (
-                effect
-                for effect in plan["effects"]
-                if effect["kind"] == f"heartbeat_{kind}"
-            ),
-            None,
-        )
+        return _plans_plan_effect(plan, kind)
 
     @staticmethod
     def _plan_matches(
         existing: Mapping[str, Any], candidate: Mapping[str, Any]
     ) -> bool:
-        if any(
-            existing[field_name] != candidate[field_name]
-            for field_name in (
-                "candidate_id",
-                "source_event_id",
-                "epoch_id",
-                "public_epoch_id",
-                "closed",
-            )
-        ):
-            return False
-        by_kind = {effect["kind"]: effect for effect in existing["effects"]}
-        for effect in candidate["effects"]:
-            current = by_kind.get(effect["kind"])
-            if current is None:
-                return False
-            if any(
-                current[field_name] != effect[field_name]
-                for field_name in (
-                    "kind",
-                    "source_event_id",
-                    "epoch_id",
-                    "idempotency_key",
-                    "content_sha256",
-                    "content_length",
-                )
-            ):
-                return False
-        return len(by_kind) == len(candidate["effects"])
+        return _plans_plan_matches(existing, candidate)
 
     def _ensure_effect_plan(
         self,
@@ -1295,124 +1144,32 @@ class HeartbeatEngine:
         decision: JudgeDecision,
         now: datetime,
     ) -> dict[str, Any] | None:
-        if not decision.dm_user and not decision.wake_main:
-            return None
-        if self._effect_plans is None:
-            raise StateError(
-                "heartbeat closed effect plan requires a durable cadence root"
-            )
-        source = (
-            candidate.context.get("source_event_id")
-            or candidate.context.get("event_id")
-            or candidate.candidate_id
+        return _plans_ensure_effect_plan(
+            self._effect_plans,
+            candidate,
+            decision,
+            now,
+            candidate_epoch=self._candidate_epoch,
+            effect_body=_effect_body,
+            new_effect_id=lambda: new_id("effect"),
+            validate_plan=self._validate_effect_plan,
+            plans_match=self._plan_matches,
         )
-        public_epoch = self._candidate_epoch(candidate)
-        epoch = public_epoch or "heartbeat"
-        if type(source) is not str or not source.strip():
-            raise StateError("heartbeat effect plan source is invalid")
-        effects: list[dict[str, Any]] = []
-        for kind, enabled in (
-            ("delivery", decision.dm_user),
-            ("wake", decision.wake_main),
-        ):
-            if not enabled:
-                continue
-            body = _effect_body(kind, candidate, decision)
-            idempotency_key = f"heartbeat:{source}:{kind}"
-            if public_epoch is not None:
-                idempotency_key += f":{public_epoch}"
-            if kind == "delivery" and decision.delivery_mode == "delegated":
-                idempotency_key += _DELEGATED_DELIVERY_IDEMPOTENCY_SUFFIX
-            effects.append(
-                {
-                    "effect_id": new_id("effect"),
-                    "kind": f"heartbeat_{kind}",
-                    "source_event_id": source,
-                    "epoch_id": epoch,
-                    "idempotency_key": idempotency_key,
-                    "content_sha256": hashlib.sha256(body).hexdigest(),
-                    "content_length": len(body),
-                }
-            )
-        if not effects:
-            return None
-        plan = self._validate_effect_plan(
-            {
-                "schema_version": HEARTBEAT_EFFECT_PLAN_SCHEMA,
-                "candidate_id": candidate.candidate_id,
-                "source_event_id": source,
-                "epoch_id": epoch,
-                "public_epoch_id": public_epoch,
-                "closed": True,
-                "effects": effects,
-            }
-        )
-        try:
-            existing, _created = self._effect_plans.get_or_append(
-                plan,
-                matcher=lambda row: (
-                    isinstance(row, Mapping)
-                    and row.get("schema_version") == HEARTBEAT_EFFECT_PLAN_SCHEMA
-                    and row.get("source_event_id") == source
-                    and row.get("epoch_id") == epoch
-                    and self._validate_effect_plan(row)["public_epoch_id"]
-                    == public_epoch
-                ),
-            )
-        except Exception as exc:
-            raise StateError("heartbeat effect plan write failed") from exc
-        existing_plan = self._validate_effect_plan(existing)
-        if not self._plan_matches(existing_plan, plan):
-            raise StateError("heartbeat effect plan decision conflict")
-        return existing_plan
 
     def _effect_plan_incomplete(self, candidate: HeartbeatCandidate) -> bool:
-        plan = self._effect_plan_for_candidate(candidate)
-        if plan is None or self.effect_ledger is None:
-            return False
-        ledger_get = getattr(self.effect_ledger, "get", None)
-        if not callable(ledger_get):
-            raise StateError("effect ledger replay port is unavailable")
-        terminals: Mapping[str, Any] = {}
-        cadence_snapshot = getattr(self.cadence, "snapshot", None)
-        if callable(cadence_snapshot):
-            try:
-                snapshot = cadence_snapshot()
-            except AttributeError:
-                snapshot = None
-            if isinstance(snapshot, Mapping):
-                raw_terminals = snapshot.get("effect_terminals", {})
-                if isinstance(raw_terminals, Mapping):
-                    terminals = raw_terminals
-        for expected in plan["effects"]:
-            if terminals.get(expected["effect_id"]) in {
-                "pending",
-                "executed_unverified",
-            }:
-                continue
-            record = ledger_get(expected["effect_id"])
-            if record is None or record.state == "intent":
-                return True
-            self._validate_plan_record(record, expected)
-        return False
+        return _plans_effect_plan_incomplete(
+            candidate,
+            find_effect_plan=self._effect_plan_for_candidate,
+            effect_ledger=self.effect_ledger,
+            cadence=self.cadence,
+            validate_record=self._validate_plan_record,
+        )
 
     @staticmethod
     def _validate_plan_record(
         record: EffectRecord, expected: Mapping[str, Any]
     ) -> None:
-        if not isinstance(record, EffectRecord):
-            raise StateError("heartbeat effect plan record is invalid")
-        for field_name in (
-            "effect_id",
-            "kind",
-            "source_event_id",
-            "epoch_id",
-            "idempotency_key",
-            "content_sha256",
-            "content_length",
-        ):
-            if getattr(record, field_name) != expected[field_name]:
-                raise StateError("heartbeat effect plan record identity conflict")
+        _plans_validate_plan_record(record, expected)
 
     def kind_policy(self, kind: str) -> HeartbeatKindPolicy | None:
         if type(kind) is not str or _HEARTBEAT_KIND_PATTERN.fullmatch(kind) is None:
@@ -1566,84 +1323,19 @@ class HeartbeatEngine:
     @staticmethod
     def _canonical_terminal(result: HeartbeatResult) -> str | None:
         """Return a terminal only when durable effect truth is settled."""
-
-        if result.status == "skipped":
-            if result.reason_code is HeartbeatReasonCode.EXECUTION_LOCK:
-                # The lock only says another invocation is still deciding;
-                # it is not a settlement for this occurrence.
-                return None
-            return (
-                result.reason_code.value
-                if result.reason_code is not None
-                else "skipped"
-            )
-        if result.status == "allowed":
-            return "allowed"
-        if result.status == "completed":
-            if result.effects and not all(effect.verified for effect in result.effects):
-                return None
-            return "verified" if result.effects else "completed"
-        if result.status == "intentional_silence":
-            if not result.effects or any(
-                effect.terminal not in {"intentional_silence", "verified"}
-                for effect in result.effects
-            ):
-                return None
-            if not any(
-                effect.terminal == "intentional_silence" for effect in result.effects
-            ):
-                return None
-            return "intentional_silence"
-        if result.status == "failed":
-            if result.effects and any(
-                effect.terminal not in {"failed", "intentional_silence", "verified"}
-                for effect in result.effects
-            ):
-                return None
-            return "failed"
-        return None
+        return _recovery_canonical_terminal(
+            result,
+            execution_lock_code=HeartbeatReasonCode.EXECUTION_LOCK,
+        )
 
     @staticmethod
     def _public_epoch_from_effect(record: Any) -> Any:
         """Return the explicit epoch while hiding the legacy ledger default."""
-
-        epoch_id = getattr(record, "epoch_id", None)
-        if epoch_id is None:
-            return None
-        if epoch_id != "heartbeat":
-            return epoch_id
-        source = getattr(record, "source_event_id", None)
-        kind = getattr(record, "kind", None)
-        key = getattr(record, "idempotency_key", None)
-        if (
-            type(source) is str
-            and type(kind) is str
-            and type(key) is str
-            and kind.startswith("heartbeat_")
-        ):
-            legacy = f"heartbeat:{source}:{kind.removeprefix('heartbeat_')}"
-            if key in {legacy, legacy + _DELEGATED_DELIVERY_IDEMPOTENCY_SUFFIX}:
-                return None
-        return epoch_id
+        return _recovery_public_epoch_from_effect(record)
 
     def _result_public_epoch(self, result: HeartbeatResult) -> str | None:
         """Recover explicit terminal epoch without promoting legacy defaults."""
-
-        epoch_id = result.epoch_id
-        for effect in result.effects:
-            candidate_epoch: Any = None
-            if effect.receipt is not None:
-                candidate_epoch = effect.receipt.epoch_id
-                if candidate_epoch == "heartbeat":
-                    candidate_epoch = None
-            if candidate_epoch is None:
-                continue
-            if type(candidate_epoch) is not str or not candidate_epoch.strip():
-                raise ValueError("heartbeat epoch_id must be non-empty when provided")
-            if epoch_id is not None and epoch_id != candidate_epoch:
-                raise StateError("heartbeat epoch identity conflict")
-            epoch_id = candidate_epoch
-        return epoch_id
+        return _recovery_result_public_epoch(result)
 
     def _finish(self, result: HeartbeatResult) -> HeartbeatResult:
         result = replace(result, epoch_id=self._result_public_epoch(result))
@@ -1746,21 +1438,7 @@ class HeartbeatEngine:
     @staticmethod
     def _effect_failure_audit_statuses(record: EffectRecord) -> frozenset[str]:
         """Return the bounded failure statuses emitted for one effect."""
-
-        reason = record.reason
-        if not isinstance(reason, str) or not reason.strip():
-            return frozenset({"failed"})
-        if reason == "intentional_silence":
-            return frozenset({"intentional_silence"})
-
-        statuses = {"failed", reason}
-        if reason.startswith("adapter_error:"):
-            error_name = reason.removeprefix("adapter_error:")
-            if record.kind == "heartbeat_delivery":
-                statuses.add(f"delivery_error:{error_name}")
-            elif record.kind == "heartbeat_wake":
-                statuses.add(f"wake_error:{error_name}")
-        return frozenset(statuses)
+        return _recovery_effect_failure_audit_statuses(record)
 
     @staticmethod
     def _audit_details(result: HeartbeatResult) -> dict[str, Any]:
@@ -1830,332 +1508,25 @@ class HeartbeatEngine:
     def _existing_terminal_result(
         self, candidate_id: str, *, epoch_id: str | None = None
     ) -> HeartbeatResult | None:
-        finder = getattr(self.bus, "find_audit_terminal", None)
-        if not callable(finder):
-            return None
-        if _accepts_keyword(finder, "epoch_id"):
-            event = finder("heartbeat", candidate_id, epoch_id=epoch_id)
-        elif epoch_id is None:
-            event = finder("heartbeat", candidate_id)
-        else:
-            raise StateError("heartbeat audit epoch is unsupported")
-        if event is None:
-            return None
-        payload = event.payload
-        status = payload.get("status")
-        if not isinstance(status, str) or not status.strip():
-            raise StateError("heartbeat terminal audit has invalid status")
-        allowed_statuses = {
-            "skipped",
-            "allowed",
-            "completed",
-            "failed",
-            "intentional_silence",
-        }
-        if status not in allowed_statuses:
-            raise StateError("heartbeat terminal audit has invalid status")
-        terminal = payload.get("terminal")
-        if type(terminal) is not str or not terminal.strip():
-            raise StateError("heartbeat terminal audit has invalid terminal")
-
-        def validate_status(expected_terminal: str) -> None:
-            expected_statuses = {
-                "verified": {"completed", "allowed"},
-                "failed": {"failed"},
-                "intentional_silence": {"completed", "intentional_silence"},
-            }
-            if (
-                expected_terminal in expected_statuses
-                and status not in expected_statuses[expected_terminal]
-            ):
-                raise StateError(
-                    "heartbeat audit status conflicts with effect terminal"
-                )
-
-        effect_owner = self._effect_owner_exists() and self.effect_ledger is not None
-        if terminal == "verified" and not effect_owner:
-            raise StateError("heartbeat verified audit effect ledger is unavailable")
-        matching: list[EffectRecord] = []
-        plan = self._effect_plan_for_occurrence(candidate_id, epoch_id)
-        if plan is not None and not effect_owner:
-            raise StateError("heartbeat audit effect evidence is missing")
-        if effect_owner:
-            all_records = tuple(self.effect_ledger.records())
-            raw_source = payload.get("source_event_id")
-            if raw_source is not None and (
-                type(raw_source) is not str or not raw_source.strip()
-            ):
-                raise StateError("heartbeat terminal audit has invalid source")
-            expected_source = (
-                plan["source_event_id"]
-                if plan is not None
-                else raw_source or candidate_id
-            )
-            if (
-                plan is not None
-                and raw_source is not None
-                and raw_source != expected_source
-            ):
-                raise StateError("heartbeat audit source identity conflict")
-            matching = [
-                record
-                for record in all_records
-                if record.kind in {"heartbeat_delivery", "heartbeat_wake"}
-                and record.source_event_id == expected_source
-                and self._public_epoch_from_effect(record) == epoch_id
-            ]
-            if raw_source is not None and not matching:
-                raise StateError("heartbeat audit source identity conflict")
-            expected_records: list[EffectRecord] | None = None
-            if plan is not None:
-                expected_records = []
-                for expected in plan["effects"]:
-                    record = next(
-                        (
-                            item
-                            for item in all_records
-                            if item.effect_id == expected["effect_id"]
-                        ),
-                        None,
-                    )
-                    if record is None:
-                        raise StateError("heartbeat audit effect is missing")
-                    self._validate_plan_record(record, expected)
-                    expected_records.append(record)
-                matching = expected_records
-            raw_effect_ids = payload.get("effect_ids")
-            audit_effect_ids: list[str] | None = None
-            if raw_effect_ids is not None:
-                if (
-                    not isinstance(raw_effect_ids, list)
-                    or not raw_effect_ids
-                    or any(
-                        type(effect_id) is not str or not effect_id.strip()
-                        for effect_id in raw_effect_ids
-                    )
-                    or len(set(raw_effect_ids)) != len(raw_effect_ids)
-                ):
-                    raise StateError("heartbeat terminal audit has invalid effects")
-                audit_effect_ids = list(raw_effect_ids)
-                if plan is not None and set(audit_effect_ids) != {
-                    effect["effect_id"] for effect in plan["effects"]
-                }:
-                    raise StateError("heartbeat audit effect conflict")
-                if plan is None and set(audit_effect_ids) != {
-                    record.effect_id for record in matching
-                }:
-                    raise StateError("heartbeat audit effect set is unproven")
-                effect_records = [
-                    record
-                    for record in all_records
-                    if record.effect_id in set(audit_effect_ids)
-                ]
-                if len(effect_records) != len(audit_effect_ids):
-                    raise StateError("heartbeat audit effect conflict")
-                if any(
-                    record.kind not in {"heartbeat_delivery", "heartbeat_wake"}
-                    for record in effect_records
-                ):
-                    raise StateError("heartbeat audit effect conflict")
-                if any(
-                    record.source_event_id != expected_source
-                    or self._public_epoch_from_effect(record) != epoch_id
-                    for record in effect_records
-                ):
-                    raise StateError("heartbeat audit effect conflict")
-                matching = effect_records
-            elif plan is None and (
-                len(matching) > 1
-                or (terminal == "verified" and payload.get("effect_id") is None)
-            ):
-                legacy_effect_ids: list[str] = []
-                for field_name in ("delivery", "wake"):
-                    nested = payload.get(field_name)
-                    if not isinstance(nested, Mapping):
-                        continue
-                    effect_id = nested.get("effect_id")
-                    if effect_id is None:
-                        continue
-                    if type(effect_id) is not str or not effect_id.strip():
-                        raise StateError("heartbeat audit effect conflict")
-                    legacy_effect_ids.append(effect_id)
-                if (
-                    not isinstance(payload.get("decision"), Mapping)
-                    or len(set(legacy_effect_ids)) != len(legacy_effect_ids)
-                    or set(legacy_effect_ids)
-                    != {record.effect_id for record in matching}
-                ):
-                    raise StateError("heartbeat audit effect set is unproven")
-                audit_effect_ids = legacy_effect_ids
-            audit_effect_id = payload.get("effect_id")
-            if audit_effect_id is not None:
-                if type(audit_effect_id) is not str or not audit_effect_id.strip():
-                    raise StateError("heartbeat terminal audit has invalid effect")
-                if audit_effect_ids is not None and audit_effect_ids != [
-                    audit_effect_id
-                ]:
-                    raise StateError("heartbeat audit effect conflict")
-                if plan is not None and len(plan["effects"]) != 1:
-                    raise StateError("heartbeat audit effect conflict")
-                effect_records = [
-                    record
-                    for record in all_records
-                    if record.effect_id == audit_effect_id
-                ]
-                if len(effect_records) != 1:
-                    raise StateError("heartbeat audit effect conflict")
-                effect = effect_records[0]
-                if (
-                    effect.kind not in {"heartbeat_delivery", "heartbeat_wake"}
-                    or effect.source_event_id != expected_source
-                    or self._public_epoch_from_effect(effect) != epoch_id
-                ):
-                    raise StateError("heartbeat audit effect conflict")
-                if plan is None and len(matching) > 1 and audit_effect_ids is None:
-                    raise StateError("heartbeat audit effect set is unproven")
-                if effect.state == "verified":
-                    expected = "verified"
-                elif effect.state == "failed":
-                    expected = (
-                        "intentional_silence"
-                        if effect.reason == "intentional_silence"
-                        else "failed"
-                    )
-                else:
-                    raise StateError("heartbeat audit effect conflict")
-                if terminal != expected:
-                    raise StateError("heartbeat audit effect conflict")
-                validate_status(expected)
-
-            if terminal == "verified" and not matching:
-                raise StateError("heartbeat verified audit effect is missing")
-            elif matching:
-                # An occurrence-level terminal emitted by ``_finish`` is valid
-                # only after every sibling effect has reached durable truth.
-                if plan is None and len(matching) > 1 and audit_effect_ids is None:
-                    raise StateError("heartbeat audit effect set is unproven")
-                if any(
-                    record.state not in {"verified", "failed"} for record in matching
-                ):
-                    raise StateError("heartbeat audit effect conflict")
-                real_failure = any(
-                    record.state == "failed" and record.reason != "intentional_silence"
-                    for record in matching
-                )
-                intentional_silence = any(
-                    record.state == "failed" and record.reason == "intentional_silence"
-                    for record in matching
-                )
-                expected = (
-                    "failed"
-                    if real_failure
-                    else "intentional_silence"
-                    if intentional_silence
-                    else "verified"
-                )
-                if terminal != expected:
-                    raise StateError("heartbeat audit effect conflict")
-                validate_status(expected)
-        records_by_id = {record.effect_id: record for record in matching}
-        for field_name, expected_kind in (
-            ("delivery", "heartbeat_delivery"),
-            ("wake", "heartbeat_wake"),
-        ):
-            if field_name not in payload or payload.get(field_name) is None:
-                continue
-            nested = payload.get(field_name)
-            if not isinstance(nested, Mapping):
-                raise StateError("heartbeat audit effect conflict")
-            effect_id = nested.get("effect_id")
-            if effect_id is None:
-                if any(
-                    key in nested
-                    for key in ("ok", "status", "terminal", "verified", "receipt")
-                ):
-                    raise StateError("heartbeat audit effect conflict")
-                continue
-            if type(effect_id) is not str or not effect_id.strip():
-                raise StateError("heartbeat audit effect conflict")
-            record = records_by_id.get(effect_id)
-            if record is None or record.kind != expected_kind:
-                raise StateError("heartbeat audit effect conflict")
-            if record.state == "verified" and record.receipt is not None:
-                if (
-                    nested.get("ok") is not True
-                    or nested.get("status") != "verified"
-                    or nested.get("terminal") != "verified"
-                    or nested.get("verified") is not True
-                    or nested.get("receipt") != record.receipt.to_dict()
-                ):
-                    raise StateError("heartbeat audit receipt conflict")
-            elif record.state == "failed":
-                expected_nested_statuses = self._effect_failure_audit_statuses(record)
-                expected_nested_terminal = (
-                    "intentional_silence"
-                    if record.reason == "intentional_silence"
-                    else "failed"
-                )
-                if (
-                    nested.get("ok") is not False
-                    or nested.get("status") not in expected_nested_statuses
-                    or nested.get("terminal") != expected_nested_terminal
-                    or nested.get("verified") is not False
-                    or nested.get("receipt") is not None
-                ):
-                    raise StateError("heartbeat audit receipt conflict")
-            else:
-                raise StateError("heartbeat audit effect conflict")
-        has_declared_effect = (
-            payload.get("effect_ids") is not None
-            or payload.get("effect_id") is not None
-        )
-        if not matching and has_declared_effect:
-            raise StateError("heartbeat audit effect evidence is missing")
-        if not matching and not has_declared_effect:
-            try:
-                effectless_code = HeartbeatReasonCode(payload.get("reason_code"))
-            except (TypeError, ValueError):
-                effectless_code = None
-            expected = self._canonical_terminal(
-                HeartbeatResult(
-                    status=status,
-                    reason=terminal,
-                    candidate_id=candidate_id,
-                    gate=GateResult(True, "replay", "already_settled", None),
-                    reason_code=effectless_code,
-                )
-            )
-            if expected is None or terminal != expected:
-                raise StateError(
-                    "heartbeat audit status conflicts with effect terminal"
-                )
-        raw_gate = payload.get("gate")
-        if isinstance(raw_gate, Mapping):
-            gate = GateResult(
-                bool(raw_gate.get("allowed", False)),
-                str(raw_gate.get("mode", "replay")),
-                str(raw_gate.get("reason", terminal)),
-                raw_gate.get("control_id")
-                if isinstance(raw_gate.get("control_id"), str)
-                else None,
-            )
-        else:
-            gate = GateResult(True, "replay", "already_settled", None)
-        raw_code = payload.get("reason_code")
-        try:
-            reason_code = HeartbeatReasonCode(raw_code)
-        except (TypeError, ValueError):
-            reason_code = None
-        replay_status = "completed" if status == "intentional_silence" else status
-        return HeartbeatResult(
-            status=replay_status,
-            reason=terminal,
-            candidate_id=candidate_id,
-            gate=gate,
-            reason_code=reason_code,
-            degraded=payload.get("degraded") is True,
-            projection_errors=(),
+        ledger = self.effect_ledger
+        return _recovery_existing_terminal_result(
+            candidate_id,
             epoch_id=epoch_id,
+            finder=getattr(self.bus, "find_audit_terminal", None),
+            accepts_keyword=_accepts_keyword,
+            effect_owner_exists=lambda: (
+                self._effect_owner_exists() and ledger is not None
+            ),
+            effect_records=(
+                lambda: tuple(ledger.records()) if ledger is not None else ()
+            ),
+            find_plan=self._effect_plan_for_occurrence,
+            validate_plan_record=self._validate_plan_record,
+            public_epoch=self._public_epoch_from_effect,
+            failure_audit_statuses=self._effect_failure_audit_statuses,
+            canonical_result_terminal=self._canonical_terminal,
+            result_type=HeartbeatResult,
+            reason_code_type=HeartbeatReasonCode,
         )
 
     @staticmethod
@@ -2183,13 +1554,7 @@ class HeartbeatEngine:
 
     @staticmethod
     def _has_explicit_occurrence(candidate: HeartbeatCandidate) -> bool:
-        if candidate.candidate_id.strip():
-            return True
-        return any(
-            type(candidate.context.get(key)) is str
-            and bool(candidate.context.get(key).strip())
-            for key in ("event_id", "source_event_id", "candidate_id")
-        )
+        return _recovery_has_explicit_occurrence(candidate)
 
     @staticmethod
     def _context_receipt(
@@ -2925,54 +2290,18 @@ class HeartbeatEngine:
     def _existing_effect(
         self, record: EffectRecord, now: datetime
     ) -> EffectResult | None:
-        if record.state == "verified":
-            return self._effect_result(record, "verified")
-        if record.state in {"pending", "executed_unverified"}:
-            if record.expires_at >= now:
-                return self._effect_result(
-                    record, "queued_unverified", HeartbeatReasonCode.EFFECT_PENDING
-                )
-            try:
-                self.effect_ledger.expire(record.effect_id, now=now)
-                record = self.effect_ledger.requeue(
-                    record.effect_id, expires_at=now + self.effect_ttl
-                )
-            except Exception:
-                return self._fail_effect(
-                    record,
-                    "effect_reconciliation_error",
-                    "effect_reconciliation_error",
-                    HeartbeatReasonCode.EFFECT_REPLAY_ERROR,
-                    True,
-                )
-            return self._effect_result(
-                record, "requeued", HeartbeatReasonCode.EFFECT_EXPIRED
-            )
-        if record.state == "expired":
-            try:
-                record = self.effect_ledger.requeue(
-                    record.effect_id, expires_at=now + self.effect_ttl
-                )
-            except Exception:
-                return self._fail_effect(
-                    record,
-                    "effect_reconciliation_error",
-                    "effect_reconciliation_error",
-                    HeartbeatReasonCode.EFFECT_REPLAY_ERROR,
-                    True,
-                )
-            return self._effect_result(
-                record, "requeued", HeartbeatReasonCode.EFFECT_EXPIRED
-            )
-        if record.state == "requeued":
-            return self._effect_result(
-                record, "requeued", HeartbeatReasonCode.EFFECT_EXPIRED
-            )
-        if record.state == "failed":
-            return self._effect_result(
-                record, record.reason or "failed", HeartbeatReasonCode.EFFECT_ERROR
-            )
-        return None
+        return _recovery_existing_effect(
+            record,
+            now,
+            effect_ledger=self.effect_ledger,
+            effect_ttl=self.effect_ttl,
+            effect_result=self._effect_result,
+            fail_effect=self._fail_effect,
+            pending_code=HeartbeatReasonCode.EFFECT_PENDING,
+            expired_code=HeartbeatReasonCode.EFFECT_EXPIRED,
+            replay_error_code=HeartbeatReasonCode.EFFECT_REPLAY_ERROR,
+            effect_error_code=HeartbeatReasonCode.EFFECT_ERROR,
+        )
 
     @staticmethod
     def _invoke(
@@ -3272,257 +2601,26 @@ class HeartbeatEngine:
         uses only public ledger ports, so a duplicate never invokes private
         replay access or another adapter call.
         """
-        if not self._effect_owner_exists():
-            return None
-        source = (
-            candidate.context.get("source_event_id")
-            or candidate.context.get("event_id")
-            or candidate.candidate_id
+        return _recovery_candidate_existing_effects(
+            candidate,
+            now,
+            effect_owner_exists=self._effect_owner_exists,
+            candidate_epoch=self._candidate_epoch,
+            find_plan=self._effect_plan,
+            cadence=self.cadence,
+            effect_ledger=self.effect_ledger,
+            effect_ttl=self.effect_ttl,
+            validate_plan_record=self._validate_plan_record,
+            resolve_existing_effect=self._existing_effect,
+            effect_result=self._effect_result,
+            find_existing_terminal=self._existing_terminal_result,
+            public_epoch=self._public_epoch_from_effect,
+            accepts_keyword=_accepts_keyword,
+            result_type=EffectResult,
+            pending_code=HeartbeatReasonCode.EFFECT_PENDING,
+            expired_code=HeartbeatReasonCode.EFFECT_EXPIRED,
+            effect_error_code=HeartbeatReasonCode.EFFECT_ERROR,
         )
-        public_epoch = self._candidate_epoch(candidate)
-        plan = self._effect_plan(source, public_epoch)
-        if plan is not None:
-            terminals: Mapping[str, Any] = {}
-            cadence_snapshot = getattr(self.cadence, "snapshot", None)
-            if callable(cadence_snapshot):
-                try:
-                    snapshot = cadence_snapshot()
-                except AttributeError:
-                    snapshot = None
-                if isinstance(snapshot, Mapping):
-                    raw_terminals = snapshot.get("effect_terminals", {})
-                    if isinstance(raw_terminals, Mapping):
-                        terminals = raw_terminals
-            ledger_get = getattr(self.effect_ledger, "get", None)
-            if not callable(ledger_get):
-                raise StateError("effect ledger replay port is unavailable")
-            results: dict[str, EffectResult] = {}
-            for expected in plan["effects"]:
-                effect_id = expected["effect_id"]
-                terminal = terminals.get(effect_id)
-                if terminal in {"pending", "executed_unverified"}:
-                    expire = getattr(self.effect_ledger, "expire", None)
-                    requeue = getattr(self.effect_ledger, "requeue", None)
-                    if callable(expire) and callable(requeue):
-                        try:
-                            expire(effect_id, now=now)
-                        except ValueError as exc:
-                            if str(exc).strip().lower() != "effect has not expired":
-                                raise StateError(
-                                    "effect reconciliation failed"
-                                ) from exc
-                            result = EffectResult(
-                                True,
-                                "queued_unverified",
-                                effect_id=effect_id,
-                                terminal=terminal,
-                                reason_code=HeartbeatReasonCode.EFFECT_PENDING,
-                            )
-                        except Exception as exc:
-                            raise StateError("effect reconciliation failed") from exc
-                        else:
-                            try:
-                                requeued = requeue(
-                                    effect_id, expires_at=now + self.effect_ttl
-                                )
-                            except Exception as exc:
-                                raise StateError("effect requeue failed") from exc
-                            result = self._effect_result(
-                                requeued,
-                                "requeued",
-                                HeartbeatReasonCode.EFFECT_EXPIRED,
-                            )
-                    else:
-                        result = EffectResult(
-                            True,
-                            "queued_unverified",
-                            effect_id=effect_id,
-                            terminal=terminal,
-                            reason_code=HeartbeatReasonCode.EFFECT_PENDING,
-                        )
-                    results[expected["kind"].removeprefix("heartbeat_")] = result
-                    continue
-                if terminal == "failed":
-                    results[expected["kind"].removeprefix("heartbeat_")] = EffectResult(
-                        False,
-                        "failed",
-                        effect_id=effect_id,
-                        terminal=terminal,
-                        reason_code=HeartbeatReasonCode.EFFECT_ERROR,
-                    )
-                    continue
-                if terminal == "requeued":
-                    results[expected["kind"].removeprefix("heartbeat_")] = EffectResult(
-                        True,
-                        "requeued",
-                        effect_id=effect_id,
-                        terminal=terminal,
-                        reason_code=HeartbeatReasonCode.EFFECT_EXPIRED,
-                    )
-                    continue
-                record = ledger_get(effect_id)
-                if record is None:
-                    return None
-                self._validate_plan_record(record, expected)
-                kind = expected["kind"].removeprefix("heartbeat_")
-                result = self._existing_effect(record, now)
-                if result is None:
-                    return None
-                results[kind] = result
-            return results.get("delivery"), results.get("wake")
-        legacy_siblings = tuple(
-            record
-            for record in self.effect_ledger.records()
-            if record.kind in {"heartbeat_delivery", "heartbeat_wake"}
-            and record.source_event_id == source
-            and self._public_epoch_from_effect(record) == public_epoch
-        )
-        if len(legacy_siblings) > 1:
-            raise StateError(
-                "heartbeat effect plan is unavailable for multiple effects"
-            )
-        if len(legacy_siblings) == 1:
-            canonical = self._existing_terminal_result(
-                candidate.candidate_id,
-                epoch_id=public_epoch,
-            )
-            if canonical is None:
-                record = legacy_siblings[0]
-                unresolved = EffectResult(
-                    True,
-                    "awaiting_effect_plan",
-                    effect_id=record.effect_id,
-                    terminal=record.state,
-                    reason_code=HeartbeatReasonCode.EFFECT_PENDING,
-                )
-                return (
-                    unresolved if record.kind == "heartbeat_delivery" else None,
-                    unresolved if record.kind == "heartbeat_wake" else None,
-                )
-        selected: dict[str, EffectRecord] = {}
-        precomputed: dict[str, EffectResult] = {}
-        terminals: Mapping[str, Any] = {}
-        cadence_snapshot = getattr(self.cadence, "snapshot", None)
-        if callable(cadence_snapshot):
-            try:
-                snapshot = cadence_snapshot()
-            except AttributeError:
-                snapshot = None
-            if isinstance(snapshot, Mapping):
-                raw_terminals = snapshot.get("effect_terminals", {})
-                if isinstance(raw_terminals, Mapping):
-                    terminals = raw_terminals
-        effect_ref = getattr(self.cadence, "effect_ref", None)
-        ledger_get = getattr(self.effect_ledger, "get", None)
-        if callable(effect_ref) and callable(ledger_get):
-            for kind in ("delivery", "wake"):
-                try:
-                    ref_kwargs = (
-                        {"epoch_id": public_epoch}
-                        if _accepts_keyword(effect_ref, "epoch_id")
-                        else {}
-                    )
-                    effect_id = effect_ref(
-                        source,
-                        f"heartbeat_{kind}",
-                        **ref_kwargs,
-                    )
-                except (AttributeError, TypeError, ValueError):
-                    effect_id = None
-                if effect_id is None:
-                    continue
-                terminal = terminals.get(effect_id)
-                if terminal in {"pending", "executed_unverified"}:
-                    expire = getattr(self.effect_ledger, "expire", None)
-                    requeue = getattr(self.effect_ledger, "requeue", None)
-                    if callable(expire) and callable(requeue):
-                        try:
-                            expire(effect_id, now=now)
-                        except ValueError as exc:
-                            if str(exc).strip().lower() != "effect has not expired":
-                                raise StateError(
-                                    "effect reconciliation failed"
-                                ) from exc
-                            precomputed[kind] = EffectResult(
-                                True,
-                                "queued_unverified",
-                                effect_id=effect_id,
-                                terminal=terminal,
-                                reason_code=HeartbeatReasonCode.EFFECT_PENDING,
-                            )
-                            continue
-                        except Exception as exc:
-                            raise StateError("effect reconciliation failed") from exc
-                        try:
-                            requeued = requeue(
-                                effect_id, expires_at=now + self.effect_ttl
-                            )
-                        except Exception as exc:
-                            raise StateError("effect requeue failed") from exc
-                        precomputed[kind] = self._effect_result(
-                            requeued,
-                            "requeued",
-                            HeartbeatReasonCode.EFFECT_EXPIRED,
-                        )
-                        continue
-                if terminal == "requeued":
-                    precomputed[kind] = EffectResult(
-                        True,
-                        "requeued",
-                        effect_id=effect_id,
-                        terminal=terminal,
-                        reason_code=HeartbeatReasonCode.EFFECT_EXPIRED,
-                    )
-                    continue
-                if terminal == "failed":
-                    precomputed[kind] = EffectResult(
-                        False,
-                        "failed",
-                        effect_id=effect_id,
-                        terminal=terminal,
-                        reason_code=HeartbeatReasonCode.EFFECT_ERROR,
-                    )
-                    continue
-                try:
-                    record = ledger_get(effect_id)
-                except Exception as exc:
-                    raise StateError("effect ledger replay failed") from exc
-                if record is not None and (
-                    record.source_event_id != source
-                    or self._public_epoch_from_effect(record) != public_epoch
-                ):
-                    continue
-                if record is not None:
-                    selected[kind] = record
-        if not precomputed and callable(
-            getattr(self.effect_ledger, "pending_for_reconciliation", None)
-        ):
-            try:
-                pending = self.effect_ledger.pending_for_reconciliation(now=now)
-            except Exception as exc:
-                raise StateError("effect ledger replay failed") from exc
-            for record in pending:
-                if (
-                    record.source_event_id != source
-                    or self._public_epoch_from_effect(record) != public_epoch
-                ):
-                    continue
-                if record.kind == "heartbeat_delivery":
-                    selected.setdefault("delivery", record)
-                elif record.kind == "heartbeat_wake":
-                    selected.setdefault("wake", record)
-        if not selected and not precomputed:
-            return None
-        results = dict(precomputed)
-        results.update(
-            {
-                kind: self._existing_effect(record, now)
-                for kind, record in selected.items()
-            }
-        )
-        if any(result is None for result in results.values()):
-            return None
-        return results.get("delivery"), results.get("wake")
 
     def run(
         self,
@@ -3664,73 +2762,17 @@ class HeartbeatEngine:
         def replay_effects(
             existing: tuple[EffectResult | None, EffectResult | None],
         ) -> HeartbeatResult:
-            delivery, wake = existing
-            effects = [x for x in existing if x is not None]
-            real_failures = [
-                effect
-                for effect in effects
-                if not effect.ok and effect.terminal != "intentional_silence"
-            ]
-            if real_failures:
-                failure_code = next(
-                    (x.reason_code for x in real_failures if x.reason_code is not None),
-                    HeartbeatReasonCode.EFFECT_ERROR,
-                )
-                return make_result(
-                    "failed",
-                    "effect_failed",
-                    candidate_id,
-                    gate,
-                    code=failure_code,
-                    delivery=delivery,
-                    wake=wake,
-                    next_judge_at=now,
-                )
-            if any(
-                effect.terminal == "intentional_silence" for effect in effects
-            ) and all(
-                effect.verified or effect.terminal == "intentional_silence"
-                for effect in effects
-            ):
-                return make_result(
-                    "intentional_silence",
-                    "effects_settled_silent",
-                    candidate_id,
-                    gate,
-                    code=HeartbeatReasonCode.DENIED,
-                    delivery=delivery,
-                    wake=wake,
-                    next_judge_at=now,
-                )
-            if all(x.verified for x in effects):
-                return make_result(
-                    "completed",
-                    "effects_verified",
-                    candidate_id,
-                    gate,
-                    code=HeartbeatReasonCode.ALLOWED,
-                    delivery=delivery,
-                    wake=wake,
-                    next_judge_at=now,
-                )
-            reason = (
-                "awaiting_effect_plan"
-                if any(x.status == "awaiting_effect_plan" for x in effects)
-                else "expired_effect"
-                if any(x.terminal == "requeued" for x in effects)
-                else "awaiting_receipt"
-            )
-            return make_result(
-                "requeued" if reason == "expired_effect" else "pending",
-                reason,
-                candidate_id,
-                gate,
-                code=HeartbeatReasonCode.EFFECT_EXPIRED
-                if reason == "expired_effect"
-                else HeartbeatReasonCode.EFFECT_PENDING,
-                delivery=delivery,
-                wake=wake,
-                next_judge_at=now,
+            return _recovery_replay_effects(
+                existing,
+                make_result=make_result,
+                candidate_id=candidate_id,
+                gate=gate,
+                now=now,
+                effect_error_code=HeartbeatReasonCode.EFFECT_ERROR,
+                denied_code=HeartbeatReasonCode.DENIED,
+                allowed_code=HeartbeatReasonCode.ALLOWED,
+                expired_code=HeartbeatReasonCode.EFFECT_EXPIRED,
+                pending_code=HeartbeatReasonCode.EFFECT_PENDING,
             )
 
         if existing_effects is not None:

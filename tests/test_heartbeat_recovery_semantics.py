@@ -14,6 +14,7 @@ from moonbite_plugin.control import ControlStore
 from moonbite_plugin.effects import EffectLedger, EffectReceipt
 from moonbite_plugin.heartbeat import (
     EffectResult,
+    HEARTBEAT_EFFECT_PLAN_SCHEMA,
     HeartbeatCadence,
     HeartbeatCandidate,
     HeartbeatEngine,
@@ -961,6 +962,62 @@ def test_legacy_plan_explicit_epoch_replays_without_rewrite(tmp_path, capsys):
     assert replay_sink.calls == []
     assert plan_path.read_bytes() == plan_before
     assert audit_path.read_bytes() == audit_before
+
+
+def test_legacy_plan_epoch_inference_uses_dynamic_matcher(monkeypatch):
+    calls: list[str | None] = []
+    legacy_plan = {
+        "schema_version": HEARTBEAT_EFFECT_PLAN_SCHEMA,
+        "candidate_id": "candidate-legacy-matcher",
+        "source_event_id": "source-legacy-matcher",
+        "epoch_id": "heartbeat",
+        "closed": True,
+        "effects": [
+            {
+                "effect_id": "effect-legacy-matcher",
+                "kind": "heartbeat_wake",
+                "source_event_id": "source-legacy-matcher",
+                "epoch_id": "heartbeat",
+                "idempotency_key": "host-custom-key",
+                "content_sha256": "0" * 64,
+                "content_length": 1,
+            }
+        ],
+    }
+    original = deepcopy(legacy_plan)
+
+    def custom_matcher(effect, public_epoch_id):
+        calls.append(public_epoch_id)
+        return (
+            effect["idempotency_key"] == "host-custom-key" and public_epoch_id is None
+        )
+
+    monkeypatch.setattr(
+        HeartbeatEngine,
+        "_plan_effect_key_matches",
+        staticmethod(custom_matcher),
+    )
+    validated = HeartbeatEngine._validate_effect_plan(legacy_plan)
+
+    assert validated["public_epoch_id"] is None
+    assert validated["effects"] == legacy_plan["effects"]
+    assert calls == [None, "heartbeat", None]
+    assert legacy_plan == original
+
+    def failing_matcher(_effect, public_epoch_id):
+        calls.append(public_epoch_id)
+        raise RuntimeError("synthetic dynamic matcher failure")
+
+    calls.clear()
+    monkeypatch.setattr(
+        HeartbeatEngine,
+        "_plan_effect_key_matches",
+        staticmethod(failing_matcher),
+    )
+    with pytest.raises(RuntimeError, match="synthetic dynamic matcher failure"):
+        HeartbeatEngine._validate_effect_plan(legacy_plan)
+    assert calls == [None]
+    assert legacy_plan == original
 
 
 def test_plan_public_epoch_tamper_fails_closed(tmp_path, capsys):
