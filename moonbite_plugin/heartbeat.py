@@ -5,7 +5,6 @@ from __future__ import annotations
 import hashlib
 import inspect
 import json
-import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timedelta
@@ -60,6 +59,24 @@ from ._heartbeat.observation import (
     cadence_observer_status as _cadence_observer_status,
     engine_observer_status as _engine_observer_status,
 )
+from ._heartbeat.plans import (
+    DELEGATED_DELIVERY_IDEMPOTENCY_SUFFIX as _DELEGATED_DELIVERY_IDEMPOTENCY_SUFFIX,
+    HEARTBEAT_EFFECT_PLAN_SCHEMA as HEARTBEAT_EFFECT_PLAN_SCHEMA,
+    effect_plan as _plans_effect_plan,
+    effect_plan_for_candidate as _plans_effect_plan_for_candidate,
+    effect_plan_for_occurrence as _plans_effect_plan_for_occurrence,
+    effect_plan_incomplete as _plans_effect_plan_incomplete,
+    effect_plan_rows as _plans_effect_plan_rows,
+    ensure_effect_plan as _plans_ensure_effect_plan,
+    infer_legacy_plan_public_epoch as _plans_infer_legacy_plan_public_epoch,
+    plan_effect as _plans_plan_effect,
+    plan_effect_identity as _plans_plan_effect_identity,
+    plan_effect_key_matches as _plans_plan_effect_key_matches,
+    plan_matches as _plans_plan_matches,
+    plan_public_epoch_candidates as _plans_plan_public_epoch_candidates,
+    validate_effect_plan as _plans_validate_effect_plan,
+    validate_plan_record as _plans_validate_plan_record,
+)
 from .control import ControlStore, GateResult, evaluate_gate
 from .effects import (
     EffectLedger,
@@ -80,7 +97,6 @@ from .runtime_core import (
 )
 from .session import SessionHookReceipt
 
-HEARTBEAT_EFFECT_PLAN_SCHEMA = "moon.heartbeat.effect_plan.v1"
 DEFAULT_JUDGE_INTERVAL = timedelta(hours=1)
 DEFAULT_AUTOMATIC_COOLDOWN = timedelta(hours=1)
 DEFAULT_MANUAL_COOLDOWN = timedelta(hours=1)
@@ -99,38 +115,6 @@ HEARTBEAT_WAKE_TERMINALS = frozenset(
 )
 HEARTBEAT_DELIVERY_TERMINALS = frozenset(
     {"verified", "unverified", "failed", "not_requested", "unknown"}
-)
-_EFFECT_PLAN_FIELDS = frozenset(
-    {
-        "schema_version",
-        "candidate_id",
-        "source_event_id",
-        "epoch_id",
-        "public_epoch_id",
-        "closed",
-        "effects",
-    }
-)
-_LEGACY_EFFECT_PLAN_FIELDS = frozenset(
-    {
-        "schema_version",
-        "candidate_id",
-        "source_event_id",
-        "epoch_id",
-        "closed",
-        "effects",
-    }
-)
-_EFFECT_PLAN_EFFECT_FIELDS = frozenset(
-    {
-        "effect_id",
-        "kind",
-        "source_event_id",
-        "epoch_id",
-        "idempotency_key",
-        "content_sha256",
-        "content_length",
-    }
 )
 
 
@@ -967,7 +951,6 @@ _ACCEPTED = frozenset(
         "executed_unverified",
     }
 )
-_DELEGATED_DELIVERY_IDEMPOTENCY_SUFFIX = ":delegated"
 _DELEGATED_FAILURE_REASON = "delegated_delivery_failed"
 
 
@@ -1068,226 +1051,78 @@ class HeartbeatEngine:
     def _plan_effect_identity(
         value: Mapping[str, Any], *, label: str = "heartbeat effect plan"
     ) -> dict[str, Any]:
-        if not isinstance(value, Mapping) or set(value) != _EFFECT_PLAN_EFFECT_FIELDS:
-            raise StateError(f"{label} effect has invalid fields")
-        for field_name in (
-            "effect_id",
-            "kind",
-            "source_event_id",
-            "epoch_id",
-            "idempotency_key",
-        ):
-            field_value = value[field_name]
-            if type(field_value) is not str or not field_value.strip():
-                raise StateError(f"{label} effect has invalid {field_name}")
-        if value["kind"] not in {"heartbeat_delivery", "heartbeat_wake"}:
-            raise StateError(f"{label} effect has invalid kind")
-        content_sha256 = value["content_sha256"]
-        if (
-            type(content_sha256) is not str
-            or re.fullmatch(r"[0-9a-f]{64}", content_sha256) is None
-        ):
-            raise StateError(f"{label} effect has invalid content hash")
-        content_length = value["content_length"]
-        if type(content_length) is not int or content_length <= 0:
-            raise StateError(f"{label} effect has invalid content length")
-        return dict(value)
+        return _plans_plan_effect_identity(value, label=label)
 
     @classmethod
     def _validate_effect_plan(cls, value: Mapping[str, Any]) -> dict[str, Any]:
-        if not isinstance(value, Mapping) or set(value) not in {
-            _EFFECT_PLAN_FIELDS,
-            _LEGACY_EFFECT_PLAN_FIELDS,
-        }:
-            raise StateError("heartbeat effect plan has invalid fields")
-        if value["schema_version"] != HEARTBEAT_EFFECT_PLAN_SCHEMA:
-            raise StateError("heartbeat effect plan has unsupported schema")
-        for field_name in ("candidate_id", "source_event_id", "epoch_id"):
-            field_value = value[field_name]
-            if type(field_value) is not str or not field_value.strip():
-                raise StateError(f"heartbeat effect plan has invalid {field_name}")
-        if value["closed"] is not True:
-            raise StateError("heartbeat effect plan must be closed")
-        effects = value["effects"]
-        if not isinstance(effects, list) or not 1 <= len(effects) <= 2:
-            raise StateError("heartbeat effect plan has invalid effect set")
-        selected = [cls._plan_effect_identity(effect) for effect in effects]
-        kinds = [effect["kind"] for effect in selected]
-        ids = [effect["effect_id"] for effect in selected]
-        idempotency = [effect["idempotency_key"] for effect in selected]
-        if len(set(kinds)) != len(kinds):
-            raise StateError("heartbeat effect plan repeats an effect kind")
-        if len(set(ids)) != len(ids) or len(set(idempotency)) != len(idempotency):
-            raise StateError("heartbeat effect plan repeats an effect identity")
-        if "public_epoch_id" in value:
-            public_epoch = value["public_epoch_id"]
-            if public_epoch is not None and (
-                type(public_epoch) is not str or not public_epoch.strip()
-            ):
-                raise StateError("heartbeat effect plan has invalid public epoch")
-        else:
-            public_epoch = cls._infer_legacy_plan_public_epoch(selected)
-        if value["epoch_id"] != (public_epoch or "heartbeat"):
-            raise StateError("heartbeat effect plan public epoch conflicts")
-        for effect in selected:
-            if (
-                effect["source_event_id"] != value["source_event_id"]
-                or effect["epoch_id"] != value["epoch_id"]
-            ):
-                raise StateError("heartbeat effect plan identity conflicts")
-            if not cls._plan_effect_key_matches(effect, public_epoch):
-                raise StateError("heartbeat effect plan public epoch conflicts")
-        return {
-            **dict(value),
-            "public_epoch_id": public_epoch,
-            "effects": selected,
-        }
+        return _plans_validate_effect_plan(
+            value,
+            validate_effect=cls._plan_effect_identity,
+            infer_public_epoch=cls._infer_legacy_plan_public_epoch,
+            effect_key_matches=cls._plan_effect_key_matches,
+        )
 
     def _effect_plan_rows(self) -> tuple[dict[str, Any], ...]:
-        ledger = self._effect_plans
-        if ledger is None or not ledger.path.exists():
-            return ()
-        try:
-            rows = ledger.rows()
-        except Exception as exc:
-            raise StateError("heartbeat effect plan is unreadable") from exc
-        return tuple(self._validate_effect_plan(row) for row in rows)
+        return _plans_effect_plan_rows(
+            self._effect_plans,
+            validate_plan=self._validate_effect_plan,
+        )
 
     @staticmethod
     def _plan_public_epoch_candidates(
         value: Mapping[str, Any],
     ) -> frozenset[str | None]:
-        internal_epoch = value["epoch_id"]
-        candidates = {
-            public_epoch
-            for public_epoch in (None, internal_epoch)
-            if internal_epoch == (public_epoch or "heartbeat")
-            and HeartbeatEngine._plan_effect_key_matches(value, public_epoch)
-        }
-        return frozenset(candidates)
+        return _plans_plan_public_epoch_candidates(value)
 
     @classmethod
     def _infer_legacy_plan_public_epoch(
         cls, effects: Iterable[Mapping[str, Any]]
     ) -> str | None:
-        candidate_sets = tuple(
-            cls._plan_public_epoch_candidates(effect) for effect in effects
+        return _plans_infer_legacy_plan_public_epoch(
+            effects,
+            public_epoch_candidates=cls._plan_public_epoch_candidates,
         )
-        if not candidate_sets or any(not candidates for candidates in candidate_sets):
-            raise StateError("heartbeat effect plan public epoch is unproven")
-        common = set(candidate_sets[0]).intersection(*candidate_sets[1:])
-        if len(common) != 1:
-            raise StateError("heartbeat effect plan public epoch is ambiguous")
-        return next(iter(common))
 
     @staticmethod
     def _plan_effect_key_matches(
         effect: Mapping[str, Any], public_epoch_id: str | None
     ) -> bool:
-        base = (
-            f"heartbeat:{effect['source_event_id']}:"
-            f"{effect['kind'].removeprefix('heartbeat_')}"
-        )
-        prefix = base if public_epoch_id is None else f"{base}:{public_epoch_id}"
-        expected = {prefix}
-        if effect["kind"] == "heartbeat_delivery":
-            expected.add(prefix + _DELEGATED_DELIVERY_IDEMPOTENCY_SUFFIX)
-        return effect["idempotency_key"] in expected
+        return _plans_plan_effect_key_matches(effect, public_epoch_id)
 
     def _effect_plan(
         self, source_event_id: str, public_epoch_id: str | None
     ) -> dict[str, Any] | None:
-        matches = tuple(
-            row
-            for row in self._effect_plan_rows()
-            if row["source_event_id"] == source_event_id
-            and row["public_epoch_id"] == public_epoch_id
+        return _plans_effect_plan(
+            self._effect_plan_rows(), source_event_id, public_epoch_id
         )
-        if len(matches) > 1:
-            first = matches[0]
-            if any(row != first for row in matches[1:]):
-                raise StateError("heartbeat effect plan identity conflict")
-        return matches[0] if matches else None
 
     def _effect_plan_for_candidate(
         self, candidate: HeartbeatCandidate
     ) -> dict[str, Any] | None:
-        source = (
-            candidate.context.get("source_event_id")
-            or candidate.context.get("event_id")
-            or candidate.candidate_id
+        return _plans_effect_plan_for_candidate(
+            candidate,
+            candidate_epoch=self._candidate_epoch,
+            find_effect_plan=self._effect_plan,
         )
-        public_epoch = self._candidate_epoch(candidate)
-        if type(source) is not str or not source.strip():
-            return None
-        return self._effect_plan(source, public_epoch)
 
     def _effect_plan_for_occurrence(
         self, occurrence_id: str, epoch_id: str | None
     ) -> dict[str, Any] | None:
-        matches = tuple(
-            row
-            for row in self._effect_plan_rows()
-            if row["public_epoch_id"] == epoch_id
-            and (
-                row["candidate_id"] == occurrence_id
-                or row["source_event_id"] == occurrence_id
-            )
+        return _plans_effect_plan_for_occurrence(
+            self._effect_plan_rows(), occurrence_id, epoch_id
         )
-        if len(matches) > 1:
-            first = matches[0]
-            if any(row != first for row in matches[1:]):
-                raise StateError("heartbeat effect plan occurrence conflict")
-        return matches[0] if matches else None
 
     @staticmethod
     def _plan_effect(
         plan: Mapping[str, Any] | None, kind: str
     ) -> Mapping[str, Any] | None:
-        if plan is None:
-            return None
-        return next(
-            (
-                effect
-                for effect in plan["effects"]
-                if effect["kind"] == f"heartbeat_{kind}"
-            ),
-            None,
-        )
+        return _plans_plan_effect(plan, kind)
 
     @staticmethod
     def _plan_matches(
         existing: Mapping[str, Any], candidate: Mapping[str, Any]
     ) -> bool:
-        if any(
-            existing[field_name] != candidate[field_name]
-            for field_name in (
-                "candidate_id",
-                "source_event_id",
-                "epoch_id",
-                "public_epoch_id",
-                "closed",
-            )
-        ):
-            return False
-        by_kind = {effect["kind"]: effect for effect in existing["effects"]}
-        for effect in candidate["effects"]:
-            current = by_kind.get(effect["kind"])
-            if current is None:
-                return False
-            if any(
-                current[field_name] != effect[field_name]
-                for field_name in (
-                    "kind",
-                    "source_event_id",
-                    "epoch_id",
-                    "idempotency_key",
-                    "content_sha256",
-                    "content_length",
-                )
-            ):
-                return False
-        return len(by_kind) == len(candidate["effects"])
+        return _plans_plan_matches(existing, candidate)
 
     def _ensure_effect_plan(
         self,
@@ -1295,124 +1130,32 @@ class HeartbeatEngine:
         decision: JudgeDecision,
         now: datetime,
     ) -> dict[str, Any] | None:
-        if not decision.dm_user and not decision.wake_main:
-            return None
-        if self._effect_plans is None:
-            raise StateError(
-                "heartbeat closed effect plan requires a durable cadence root"
-            )
-        source = (
-            candidate.context.get("source_event_id")
-            or candidate.context.get("event_id")
-            or candidate.candidate_id
+        return _plans_ensure_effect_plan(
+            self._effect_plans,
+            candidate,
+            decision,
+            now,
+            candidate_epoch=self._candidate_epoch,
+            effect_body=_effect_body,
+            new_effect_id=lambda: new_id("effect"),
+            validate_plan=self._validate_effect_plan,
+            plans_match=self._plan_matches,
         )
-        public_epoch = self._candidate_epoch(candidate)
-        epoch = public_epoch or "heartbeat"
-        if type(source) is not str or not source.strip():
-            raise StateError("heartbeat effect plan source is invalid")
-        effects: list[dict[str, Any]] = []
-        for kind, enabled in (
-            ("delivery", decision.dm_user),
-            ("wake", decision.wake_main),
-        ):
-            if not enabled:
-                continue
-            body = _effect_body(kind, candidate, decision)
-            idempotency_key = f"heartbeat:{source}:{kind}"
-            if public_epoch is not None:
-                idempotency_key += f":{public_epoch}"
-            if kind == "delivery" and decision.delivery_mode == "delegated":
-                idempotency_key += _DELEGATED_DELIVERY_IDEMPOTENCY_SUFFIX
-            effects.append(
-                {
-                    "effect_id": new_id("effect"),
-                    "kind": f"heartbeat_{kind}",
-                    "source_event_id": source,
-                    "epoch_id": epoch,
-                    "idempotency_key": idempotency_key,
-                    "content_sha256": hashlib.sha256(body).hexdigest(),
-                    "content_length": len(body),
-                }
-            )
-        if not effects:
-            return None
-        plan = self._validate_effect_plan(
-            {
-                "schema_version": HEARTBEAT_EFFECT_PLAN_SCHEMA,
-                "candidate_id": candidate.candidate_id,
-                "source_event_id": source,
-                "epoch_id": epoch,
-                "public_epoch_id": public_epoch,
-                "closed": True,
-                "effects": effects,
-            }
-        )
-        try:
-            existing, _created = self._effect_plans.get_or_append(
-                plan,
-                matcher=lambda row: (
-                    isinstance(row, Mapping)
-                    and row.get("schema_version") == HEARTBEAT_EFFECT_PLAN_SCHEMA
-                    and row.get("source_event_id") == source
-                    and row.get("epoch_id") == epoch
-                    and self._validate_effect_plan(row)["public_epoch_id"]
-                    == public_epoch
-                ),
-            )
-        except Exception as exc:
-            raise StateError("heartbeat effect plan write failed") from exc
-        existing_plan = self._validate_effect_plan(existing)
-        if not self._plan_matches(existing_plan, plan):
-            raise StateError("heartbeat effect plan decision conflict")
-        return existing_plan
 
     def _effect_plan_incomplete(self, candidate: HeartbeatCandidate) -> bool:
-        plan = self._effect_plan_for_candidate(candidate)
-        if plan is None or self.effect_ledger is None:
-            return False
-        ledger_get = getattr(self.effect_ledger, "get", None)
-        if not callable(ledger_get):
-            raise StateError("effect ledger replay port is unavailable")
-        terminals: Mapping[str, Any] = {}
-        cadence_snapshot = getattr(self.cadence, "snapshot", None)
-        if callable(cadence_snapshot):
-            try:
-                snapshot = cadence_snapshot()
-            except AttributeError:
-                snapshot = None
-            if isinstance(snapshot, Mapping):
-                raw_terminals = snapshot.get("effect_terminals", {})
-                if isinstance(raw_terminals, Mapping):
-                    terminals = raw_terminals
-        for expected in plan["effects"]:
-            if terminals.get(expected["effect_id"]) in {
-                "pending",
-                "executed_unverified",
-            }:
-                continue
-            record = ledger_get(expected["effect_id"])
-            if record is None or record.state == "intent":
-                return True
-            self._validate_plan_record(record, expected)
-        return False
+        return _plans_effect_plan_incomplete(
+            candidate,
+            find_effect_plan=self._effect_plan_for_candidate,
+            effect_ledger=self.effect_ledger,
+            cadence=self.cadence,
+            validate_record=self._validate_plan_record,
+        )
 
     @staticmethod
     def _validate_plan_record(
         record: EffectRecord, expected: Mapping[str, Any]
     ) -> None:
-        if not isinstance(record, EffectRecord):
-            raise StateError("heartbeat effect plan record is invalid")
-        for field_name in (
-            "effect_id",
-            "kind",
-            "source_event_id",
-            "epoch_id",
-            "idempotency_key",
-            "content_sha256",
-            "content_length",
-        ):
-            if getattr(record, field_name) != expected[field_name]:
-                raise StateError("heartbeat effect plan record identity conflict")
+        _plans_validate_plan_record(record, expected)
 
     def kind_policy(self, kind: str) -> HeartbeatKindPolicy | None:
         if type(kind) is not str or _HEARTBEAT_KIND_PATTERN.fullmatch(kind) is None:
