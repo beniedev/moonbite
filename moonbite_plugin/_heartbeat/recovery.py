@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
+from datetime import datetime, timedelta
 from typing import Any, Protocol
 
 from ..control import GateResult
@@ -450,4 +451,400 @@ def existing_terminal_result(
         degraded=payload.get("degraded") is True,
         projection_errors=(),
         epoch_id=epoch_id,
+    )
+
+
+def existing_effect(
+    record: EffectRecord,
+    now: datetime,
+    *,
+    effect_ledger: Any,
+    effect_ttl: timedelta,
+    effect_result: Callable[..., Any],
+    fail_effect: Callable[..., Any],
+    pending_code: Any,
+    expired_code: Any,
+    replay_error_code: Any,
+    effect_error_code: Any,
+) -> Any | None:
+    if record.state == "verified":
+        return effect_result(record, "verified")
+    if record.state in {"pending", "executed_unverified"}:
+        if record.expires_at >= now:
+            return effect_result(record, "queued_unverified", pending_code)
+        try:
+            effect_ledger.expire(record.effect_id, now=now)
+            record = effect_ledger.requeue(
+                record.effect_id, expires_at=now + effect_ttl
+            )
+        except Exception:
+            return fail_effect(
+                record,
+                "effect_reconciliation_error",
+                "effect_reconciliation_error",
+                replay_error_code,
+                True,
+            )
+        return effect_result(record, "requeued", expired_code)
+    if record.state == "expired":
+        try:
+            record = effect_ledger.requeue(
+                record.effect_id, expires_at=now + effect_ttl
+            )
+        except Exception:
+            return fail_effect(
+                record,
+                "effect_reconciliation_error",
+                "effect_reconciliation_error",
+                replay_error_code,
+                True,
+            )
+        return effect_result(record, "requeued", expired_code)
+    if record.state == "requeued":
+        return effect_result(record, "requeued", expired_code)
+    if record.state == "failed":
+        return effect_result(record, record.reason or "failed", effect_error_code)
+    return None
+
+
+def candidate_existing_effects(
+    candidate: _Candidate,
+    now: datetime,
+    *,
+    effect_owner_exists: Callable[[], bool],
+    candidate_epoch: Callable[[_Candidate], str | None],
+    find_plan: Callable[[str, str | None], Mapping[str, Any] | None],
+    cadence: Any,
+    effect_ledger: Any,
+    effect_ttl: timedelta,
+    validate_plan_record: Callable[[EffectRecord, Mapping[str, Any]], None],
+    resolve_existing_effect: Callable[[EffectRecord, datetime], Any | None],
+    effect_result: Callable[..., Any],
+    find_existing_terminal: Callable[..., Any],
+    public_epoch: Callable[[Any], Any],
+    accepts_keyword: Callable[[Callable[..., Any], str], bool],
+    result_type: Callable[..., Any],
+    pending_code: Any,
+    expired_code: Any,
+    effect_error_code: Any,
+) -> tuple[Any | None, Any | None] | None:
+    if not effect_owner_exists():
+        return None
+    source = (
+        candidate.context.get("source_event_id")
+        or candidate.context.get("event_id")
+        or candidate.candidate_id
+    )
+    selected_epoch = candidate_epoch(candidate)
+    plan = find_plan(source, selected_epoch)
+    if plan is not None:
+        terminals: Mapping[str, Any] = {}
+        cadence_snapshot = getattr(cadence, "snapshot", None)
+        if callable(cadence_snapshot):
+            try:
+                snapshot = cadence_snapshot()
+            except AttributeError:
+                snapshot = None
+            if isinstance(snapshot, Mapping):
+                raw_terminals = snapshot.get("effect_terminals", {})
+                if isinstance(raw_terminals, Mapping):
+                    terminals = raw_terminals
+        ledger_get = getattr(effect_ledger, "get", None)
+        if not callable(ledger_get):
+            raise StateError("effect ledger replay port is unavailable")
+        results: dict[str, Any] = {}
+        for expected in plan["effects"]:
+            effect_id = expected["effect_id"]
+            terminal = terminals.get(effect_id)
+            if terminal in {"pending", "executed_unverified"}:
+                expire = getattr(effect_ledger, "expire", None)
+                requeue = getattr(effect_ledger, "requeue", None)
+                if callable(expire) and callable(requeue):
+                    try:
+                        expire(effect_id, now=now)
+                    except ValueError as exc:
+                        if str(exc).strip().lower() != "effect has not expired":
+                            raise StateError("effect reconciliation failed") from exc
+                        result = result_type(
+                            True,
+                            "queued_unverified",
+                            effect_id=effect_id,
+                            terminal=terminal,
+                            reason_code=pending_code,
+                        )
+                    except Exception as exc:
+                        raise StateError("effect reconciliation failed") from exc
+                    else:
+                        try:
+                            requeued = requeue(effect_id, expires_at=now + effect_ttl)
+                        except Exception as exc:
+                            raise StateError("effect requeue failed") from exc
+                        result = effect_result(requeued, "requeued", expired_code)
+                else:
+                    result = result_type(
+                        True,
+                        "queued_unverified",
+                        effect_id=effect_id,
+                        terminal=terminal,
+                        reason_code=pending_code,
+                    )
+                results[expected["kind"].removeprefix("heartbeat_")] = result
+                continue
+            if terminal == "failed":
+                results[expected["kind"].removeprefix("heartbeat_")] = result_type(
+                    False,
+                    "failed",
+                    effect_id=effect_id,
+                    terminal=terminal,
+                    reason_code=effect_error_code,
+                )
+                continue
+            if terminal == "requeued":
+                results[expected["kind"].removeprefix("heartbeat_")] = result_type(
+                    True,
+                    "requeued",
+                    effect_id=effect_id,
+                    terminal=terminal,
+                    reason_code=expired_code,
+                )
+                continue
+            record = ledger_get(effect_id)
+            if record is None:
+                return None
+            validate_plan_record(record, expected)
+            kind = expected["kind"].removeprefix("heartbeat_")
+            result = resolve_existing_effect(record, now)
+            if result is None:
+                return None
+            results[kind] = result
+        return results.get("delivery"), results.get("wake")
+    legacy_siblings = tuple(
+        record
+        for record in effect_ledger.records()
+        if record.kind in {"heartbeat_delivery", "heartbeat_wake"}
+        and record.source_event_id == source
+        and public_epoch(record) == selected_epoch
+    )
+    if len(legacy_siblings) > 1:
+        raise StateError("heartbeat effect plan is unavailable for multiple effects")
+    if len(legacy_siblings) == 1:
+        canonical = find_existing_terminal(
+            candidate.candidate_id,
+            epoch_id=selected_epoch,
+        )
+        if canonical is None:
+            record = legacy_siblings[0]
+            unresolved = result_type(
+                True,
+                "awaiting_effect_plan",
+                effect_id=record.effect_id,
+                terminal=record.state,
+                reason_code=pending_code,
+            )
+            return (
+                unresolved if record.kind == "heartbeat_delivery" else None,
+                unresolved if record.kind == "heartbeat_wake" else None,
+            )
+    selected: dict[str, EffectRecord] = {}
+    precomputed: dict[str, Any] = {}
+    terminals: Mapping[str, Any] = {}
+    cadence_snapshot = getattr(cadence, "snapshot", None)
+    if callable(cadence_snapshot):
+        try:
+            snapshot = cadence_snapshot()
+        except AttributeError:
+            snapshot = None
+        if isinstance(snapshot, Mapping):
+            raw_terminals = snapshot.get("effect_terminals", {})
+            if isinstance(raw_terminals, Mapping):
+                terminals = raw_terminals
+    effect_ref = getattr(cadence, "effect_ref", None)
+    ledger_get = getattr(effect_ledger, "get", None)
+    if callable(effect_ref) and callable(ledger_get):
+        for kind in ("delivery", "wake"):
+            try:
+                ref_kwargs = (
+                    {"epoch_id": selected_epoch}
+                    if accepts_keyword(effect_ref, "epoch_id")
+                    else {}
+                )
+                effect_id = effect_ref(
+                    source,
+                    f"heartbeat_{kind}",
+                    **ref_kwargs,
+                )
+            except (AttributeError, TypeError, ValueError):
+                effect_id = None
+            if effect_id is None:
+                continue
+            terminal = terminals.get(effect_id)
+            if terminal in {"pending", "executed_unverified"}:
+                expire = getattr(effect_ledger, "expire", None)
+                requeue = getattr(effect_ledger, "requeue", None)
+                if callable(expire) and callable(requeue):
+                    try:
+                        expire(effect_id, now=now)
+                    except ValueError as exc:
+                        if str(exc).strip().lower() != "effect has not expired":
+                            raise StateError("effect reconciliation failed") from exc
+                        precomputed[kind] = result_type(
+                            True,
+                            "queued_unverified",
+                            effect_id=effect_id,
+                            terminal=terminal,
+                            reason_code=pending_code,
+                        )
+                        continue
+                    except Exception as exc:
+                        raise StateError("effect reconciliation failed") from exc
+                    try:
+                        requeued = requeue(effect_id, expires_at=now + effect_ttl)
+                    except Exception as exc:
+                        raise StateError("effect requeue failed") from exc
+                    precomputed[kind] = effect_result(
+                        requeued,
+                        "requeued",
+                        expired_code,
+                    )
+                    continue
+            if terminal == "requeued":
+                precomputed[kind] = result_type(
+                    True,
+                    "requeued",
+                    effect_id=effect_id,
+                    terminal=terminal,
+                    reason_code=expired_code,
+                )
+                continue
+            if terminal == "failed":
+                precomputed[kind] = result_type(
+                    False,
+                    "failed",
+                    effect_id=effect_id,
+                    terminal=terminal,
+                    reason_code=effect_error_code,
+                )
+                continue
+            try:
+                record = ledger_get(effect_id)
+            except Exception as exc:
+                raise StateError("effect ledger replay failed") from exc
+            if record is not None and (
+                record.source_event_id != source
+                or public_epoch(record) != selected_epoch
+            ):
+                continue
+            if record is not None:
+                selected[kind] = record
+    if not precomputed and callable(
+        getattr(effect_ledger, "pending_for_reconciliation", None)
+    ):
+        try:
+            pending = effect_ledger.pending_for_reconciliation(now=now)
+        except Exception as exc:
+            raise StateError("effect ledger replay failed") from exc
+        for record in pending:
+            if (
+                record.source_event_id != source
+                or public_epoch(record) != selected_epoch
+            ):
+                continue
+            if record.kind == "heartbeat_delivery":
+                selected.setdefault("delivery", record)
+            elif record.kind == "heartbeat_wake":
+                selected.setdefault("wake", record)
+    if not selected and not precomputed:
+        return None
+    results = dict(precomputed)
+    results.update(
+        {
+            kind: resolve_existing_effect(record, now)
+            for kind, record in selected.items()
+        }
+    )
+    if any(result is None for result in results.values()):
+        return None
+    return results.get("delivery"), results.get("wake")
+
+
+def replay_effects(
+    existing: tuple[Any | None, Any | None],
+    *,
+    make_result: Callable[..., Any],
+    candidate_id: str,
+    gate: GateResult,
+    now: datetime,
+    effect_error_code: Any,
+    denied_code: Any,
+    allowed_code: Any,
+    expired_code: Any,
+    pending_code: Any,
+) -> Any:
+    delivery, wake = existing
+    effects = [effect for effect in existing if effect is not None]
+    real_failures = [
+        effect
+        for effect in effects
+        if not effect.ok and effect.terminal != "intentional_silence"
+    ]
+    if real_failures:
+        failure_code = next(
+            (
+                effect.reason_code
+                for effect in real_failures
+                if effect.reason_code is not None
+            ),
+            effect_error_code,
+        )
+        return make_result(
+            "failed",
+            "effect_failed",
+            candidate_id,
+            gate,
+            code=failure_code,
+            delivery=delivery,
+            wake=wake,
+            next_judge_at=now,
+        )
+    if any(effect.terminal == "intentional_silence" for effect in effects) and all(
+        effect.verified or effect.terminal == "intentional_silence"
+        for effect in effects
+    ):
+        return make_result(
+            "intentional_silence",
+            "effects_settled_silent",
+            candidate_id,
+            gate,
+            code=denied_code,
+            delivery=delivery,
+            wake=wake,
+            next_judge_at=now,
+        )
+    if all(effect.verified for effect in effects):
+        return make_result(
+            "completed",
+            "effects_verified",
+            candidate_id,
+            gate,
+            code=allowed_code,
+            delivery=delivery,
+            wake=wake,
+            next_judge_at=now,
+        )
+    reason = (
+        "awaiting_effect_plan"
+        if any(effect.status == "awaiting_effect_plan" for effect in effects)
+        else "expired_effect"
+        if any(effect.terminal == "requeued" for effect in effects)
+        else "awaiting_receipt"
+    )
+    return make_result(
+        "requeued" if reason == "expired_effect" else "pending",
+        reason,
+        candidate_id,
+        gate,
+        code=expired_code if reason == "expired_effect" else pending_code,
+        delivery=delivery,
+        wake=wake,
+        next_judge_at=now,
     )

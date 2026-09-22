@@ -79,10 +79,13 @@ from ._heartbeat.plans import (
 )
 from ._heartbeat.recovery import (
     canonical_terminal as _recovery_canonical_terminal,
+    candidate_existing_effects as _recovery_candidate_existing_effects,
     effect_failure_audit_statuses as _recovery_effect_failure_audit_statuses,
+    existing_effect as _recovery_existing_effect,
     existing_terminal_result as _recovery_existing_terminal_result,
     has_explicit_occurrence as _recovery_has_explicit_occurrence,
     public_epoch_from_effect as _recovery_public_epoch_from_effect,
+    replay_effects as _recovery_replay_effects,
     result_public_epoch as _recovery_result_public_epoch,
 )
 from .control import ControlStore, GateResult, evaluate_gate
@@ -2284,54 +2287,18 @@ class HeartbeatEngine:
     def _existing_effect(
         self, record: EffectRecord, now: datetime
     ) -> EffectResult | None:
-        if record.state == "verified":
-            return self._effect_result(record, "verified")
-        if record.state in {"pending", "executed_unverified"}:
-            if record.expires_at >= now:
-                return self._effect_result(
-                    record, "queued_unverified", HeartbeatReasonCode.EFFECT_PENDING
-                )
-            try:
-                self.effect_ledger.expire(record.effect_id, now=now)
-                record = self.effect_ledger.requeue(
-                    record.effect_id, expires_at=now + self.effect_ttl
-                )
-            except Exception:
-                return self._fail_effect(
-                    record,
-                    "effect_reconciliation_error",
-                    "effect_reconciliation_error",
-                    HeartbeatReasonCode.EFFECT_REPLAY_ERROR,
-                    True,
-                )
-            return self._effect_result(
-                record, "requeued", HeartbeatReasonCode.EFFECT_EXPIRED
-            )
-        if record.state == "expired":
-            try:
-                record = self.effect_ledger.requeue(
-                    record.effect_id, expires_at=now + self.effect_ttl
-                )
-            except Exception:
-                return self._fail_effect(
-                    record,
-                    "effect_reconciliation_error",
-                    "effect_reconciliation_error",
-                    HeartbeatReasonCode.EFFECT_REPLAY_ERROR,
-                    True,
-                )
-            return self._effect_result(
-                record, "requeued", HeartbeatReasonCode.EFFECT_EXPIRED
-            )
-        if record.state == "requeued":
-            return self._effect_result(
-                record, "requeued", HeartbeatReasonCode.EFFECT_EXPIRED
-            )
-        if record.state == "failed":
-            return self._effect_result(
-                record, record.reason or "failed", HeartbeatReasonCode.EFFECT_ERROR
-            )
-        return None
+        return _recovery_existing_effect(
+            record,
+            now,
+            effect_ledger=self.effect_ledger,
+            effect_ttl=self.effect_ttl,
+            effect_result=self._effect_result,
+            fail_effect=self._fail_effect,
+            pending_code=HeartbeatReasonCode.EFFECT_PENDING,
+            expired_code=HeartbeatReasonCode.EFFECT_EXPIRED,
+            replay_error_code=HeartbeatReasonCode.EFFECT_REPLAY_ERROR,
+            effect_error_code=HeartbeatReasonCode.EFFECT_ERROR,
+        )
 
     @staticmethod
     def _invoke(
@@ -2631,257 +2598,26 @@ class HeartbeatEngine:
         uses only public ledger ports, so a duplicate never invokes private
         replay access or another adapter call.
         """
-        if not self._effect_owner_exists():
-            return None
-        source = (
-            candidate.context.get("source_event_id")
-            or candidate.context.get("event_id")
-            or candidate.candidate_id
+        return _recovery_candidate_existing_effects(
+            candidate,
+            now,
+            effect_owner_exists=self._effect_owner_exists,
+            candidate_epoch=self._candidate_epoch,
+            find_plan=self._effect_plan,
+            cadence=self.cadence,
+            effect_ledger=self.effect_ledger,
+            effect_ttl=self.effect_ttl,
+            validate_plan_record=self._validate_plan_record,
+            resolve_existing_effect=self._existing_effect,
+            effect_result=self._effect_result,
+            find_existing_terminal=self._existing_terminal_result,
+            public_epoch=self._public_epoch_from_effect,
+            accepts_keyword=_accepts_keyword,
+            result_type=EffectResult,
+            pending_code=HeartbeatReasonCode.EFFECT_PENDING,
+            expired_code=HeartbeatReasonCode.EFFECT_EXPIRED,
+            effect_error_code=HeartbeatReasonCode.EFFECT_ERROR,
         )
-        public_epoch = self._candidate_epoch(candidate)
-        plan = self._effect_plan(source, public_epoch)
-        if plan is not None:
-            terminals: Mapping[str, Any] = {}
-            cadence_snapshot = getattr(self.cadence, "snapshot", None)
-            if callable(cadence_snapshot):
-                try:
-                    snapshot = cadence_snapshot()
-                except AttributeError:
-                    snapshot = None
-                if isinstance(snapshot, Mapping):
-                    raw_terminals = snapshot.get("effect_terminals", {})
-                    if isinstance(raw_terminals, Mapping):
-                        terminals = raw_terminals
-            ledger_get = getattr(self.effect_ledger, "get", None)
-            if not callable(ledger_get):
-                raise StateError("effect ledger replay port is unavailable")
-            results: dict[str, EffectResult] = {}
-            for expected in plan["effects"]:
-                effect_id = expected["effect_id"]
-                terminal = terminals.get(effect_id)
-                if terminal in {"pending", "executed_unverified"}:
-                    expire = getattr(self.effect_ledger, "expire", None)
-                    requeue = getattr(self.effect_ledger, "requeue", None)
-                    if callable(expire) and callable(requeue):
-                        try:
-                            expire(effect_id, now=now)
-                        except ValueError as exc:
-                            if str(exc).strip().lower() != "effect has not expired":
-                                raise StateError(
-                                    "effect reconciliation failed"
-                                ) from exc
-                            result = EffectResult(
-                                True,
-                                "queued_unverified",
-                                effect_id=effect_id,
-                                terminal=terminal,
-                                reason_code=HeartbeatReasonCode.EFFECT_PENDING,
-                            )
-                        except Exception as exc:
-                            raise StateError("effect reconciliation failed") from exc
-                        else:
-                            try:
-                                requeued = requeue(
-                                    effect_id, expires_at=now + self.effect_ttl
-                                )
-                            except Exception as exc:
-                                raise StateError("effect requeue failed") from exc
-                            result = self._effect_result(
-                                requeued,
-                                "requeued",
-                                HeartbeatReasonCode.EFFECT_EXPIRED,
-                            )
-                    else:
-                        result = EffectResult(
-                            True,
-                            "queued_unverified",
-                            effect_id=effect_id,
-                            terminal=terminal,
-                            reason_code=HeartbeatReasonCode.EFFECT_PENDING,
-                        )
-                    results[expected["kind"].removeprefix("heartbeat_")] = result
-                    continue
-                if terminal == "failed":
-                    results[expected["kind"].removeprefix("heartbeat_")] = EffectResult(
-                        False,
-                        "failed",
-                        effect_id=effect_id,
-                        terminal=terminal,
-                        reason_code=HeartbeatReasonCode.EFFECT_ERROR,
-                    )
-                    continue
-                if terminal == "requeued":
-                    results[expected["kind"].removeprefix("heartbeat_")] = EffectResult(
-                        True,
-                        "requeued",
-                        effect_id=effect_id,
-                        terminal=terminal,
-                        reason_code=HeartbeatReasonCode.EFFECT_EXPIRED,
-                    )
-                    continue
-                record = ledger_get(effect_id)
-                if record is None:
-                    return None
-                self._validate_plan_record(record, expected)
-                kind = expected["kind"].removeprefix("heartbeat_")
-                result = self._existing_effect(record, now)
-                if result is None:
-                    return None
-                results[kind] = result
-            return results.get("delivery"), results.get("wake")
-        legacy_siblings = tuple(
-            record
-            for record in self.effect_ledger.records()
-            if record.kind in {"heartbeat_delivery", "heartbeat_wake"}
-            and record.source_event_id == source
-            and self._public_epoch_from_effect(record) == public_epoch
-        )
-        if len(legacy_siblings) > 1:
-            raise StateError(
-                "heartbeat effect plan is unavailable for multiple effects"
-            )
-        if len(legacy_siblings) == 1:
-            canonical = self._existing_terminal_result(
-                candidate.candidate_id,
-                epoch_id=public_epoch,
-            )
-            if canonical is None:
-                record = legacy_siblings[0]
-                unresolved = EffectResult(
-                    True,
-                    "awaiting_effect_plan",
-                    effect_id=record.effect_id,
-                    terminal=record.state,
-                    reason_code=HeartbeatReasonCode.EFFECT_PENDING,
-                )
-                return (
-                    unresolved if record.kind == "heartbeat_delivery" else None,
-                    unresolved if record.kind == "heartbeat_wake" else None,
-                )
-        selected: dict[str, EffectRecord] = {}
-        precomputed: dict[str, EffectResult] = {}
-        terminals: Mapping[str, Any] = {}
-        cadence_snapshot = getattr(self.cadence, "snapshot", None)
-        if callable(cadence_snapshot):
-            try:
-                snapshot = cadence_snapshot()
-            except AttributeError:
-                snapshot = None
-            if isinstance(snapshot, Mapping):
-                raw_terminals = snapshot.get("effect_terminals", {})
-                if isinstance(raw_terminals, Mapping):
-                    terminals = raw_terminals
-        effect_ref = getattr(self.cadence, "effect_ref", None)
-        ledger_get = getattr(self.effect_ledger, "get", None)
-        if callable(effect_ref) and callable(ledger_get):
-            for kind in ("delivery", "wake"):
-                try:
-                    ref_kwargs = (
-                        {"epoch_id": public_epoch}
-                        if _accepts_keyword(effect_ref, "epoch_id")
-                        else {}
-                    )
-                    effect_id = effect_ref(
-                        source,
-                        f"heartbeat_{kind}",
-                        **ref_kwargs,
-                    )
-                except (AttributeError, TypeError, ValueError):
-                    effect_id = None
-                if effect_id is None:
-                    continue
-                terminal = terminals.get(effect_id)
-                if terminal in {"pending", "executed_unverified"}:
-                    expire = getattr(self.effect_ledger, "expire", None)
-                    requeue = getattr(self.effect_ledger, "requeue", None)
-                    if callable(expire) and callable(requeue):
-                        try:
-                            expire(effect_id, now=now)
-                        except ValueError as exc:
-                            if str(exc).strip().lower() != "effect has not expired":
-                                raise StateError(
-                                    "effect reconciliation failed"
-                                ) from exc
-                            precomputed[kind] = EffectResult(
-                                True,
-                                "queued_unverified",
-                                effect_id=effect_id,
-                                terminal=terminal,
-                                reason_code=HeartbeatReasonCode.EFFECT_PENDING,
-                            )
-                            continue
-                        except Exception as exc:
-                            raise StateError("effect reconciliation failed") from exc
-                        try:
-                            requeued = requeue(
-                                effect_id, expires_at=now + self.effect_ttl
-                            )
-                        except Exception as exc:
-                            raise StateError("effect requeue failed") from exc
-                        precomputed[kind] = self._effect_result(
-                            requeued,
-                            "requeued",
-                            HeartbeatReasonCode.EFFECT_EXPIRED,
-                        )
-                        continue
-                if terminal == "requeued":
-                    precomputed[kind] = EffectResult(
-                        True,
-                        "requeued",
-                        effect_id=effect_id,
-                        terminal=terminal,
-                        reason_code=HeartbeatReasonCode.EFFECT_EXPIRED,
-                    )
-                    continue
-                if terminal == "failed":
-                    precomputed[kind] = EffectResult(
-                        False,
-                        "failed",
-                        effect_id=effect_id,
-                        terminal=terminal,
-                        reason_code=HeartbeatReasonCode.EFFECT_ERROR,
-                    )
-                    continue
-                try:
-                    record = ledger_get(effect_id)
-                except Exception as exc:
-                    raise StateError("effect ledger replay failed") from exc
-                if record is not None and (
-                    record.source_event_id != source
-                    or self._public_epoch_from_effect(record) != public_epoch
-                ):
-                    continue
-                if record is not None:
-                    selected[kind] = record
-        if not precomputed and callable(
-            getattr(self.effect_ledger, "pending_for_reconciliation", None)
-        ):
-            try:
-                pending = self.effect_ledger.pending_for_reconciliation(now=now)
-            except Exception as exc:
-                raise StateError("effect ledger replay failed") from exc
-            for record in pending:
-                if (
-                    record.source_event_id != source
-                    or self._public_epoch_from_effect(record) != public_epoch
-                ):
-                    continue
-                if record.kind == "heartbeat_delivery":
-                    selected.setdefault("delivery", record)
-                elif record.kind == "heartbeat_wake":
-                    selected.setdefault("wake", record)
-        if not selected and not precomputed:
-            return None
-        results = dict(precomputed)
-        results.update(
-            {
-                kind: self._existing_effect(record, now)
-                for kind, record in selected.items()
-            }
-        )
-        if any(result is None for result in results.values()):
-            return None
-        return results.get("delivery"), results.get("wake")
 
     def run(
         self,
@@ -3023,73 +2759,17 @@ class HeartbeatEngine:
         def replay_effects(
             existing: tuple[EffectResult | None, EffectResult | None],
         ) -> HeartbeatResult:
-            delivery, wake = existing
-            effects = [x for x in existing if x is not None]
-            real_failures = [
-                effect
-                for effect in effects
-                if not effect.ok and effect.terminal != "intentional_silence"
-            ]
-            if real_failures:
-                failure_code = next(
-                    (x.reason_code for x in real_failures if x.reason_code is not None),
-                    HeartbeatReasonCode.EFFECT_ERROR,
-                )
-                return make_result(
-                    "failed",
-                    "effect_failed",
-                    candidate_id,
-                    gate,
-                    code=failure_code,
-                    delivery=delivery,
-                    wake=wake,
-                    next_judge_at=now,
-                )
-            if any(
-                effect.terminal == "intentional_silence" for effect in effects
-            ) and all(
-                effect.verified or effect.terminal == "intentional_silence"
-                for effect in effects
-            ):
-                return make_result(
-                    "intentional_silence",
-                    "effects_settled_silent",
-                    candidate_id,
-                    gate,
-                    code=HeartbeatReasonCode.DENIED,
-                    delivery=delivery,
-                    wake=wake,
-                    next_judge_at=now,
-                )
-            if all(x.verified for x in effects):
-                return make_result(
-                    "completed",
-                    "effects_verified",
-                    candidate_id,
-                    gate,
-                    code=HeartbeatReasonCode.ALLOWED,
-                    delivery=delivery,
-                    wake=wake,
-                    next_judge_at=now,
-                )
-            reason = (
-                "awaiting_effect_plan"
-                if any(x.status == "awaiting_effect_plan" for x in effects)
-                else "expired_effect"
-                if any(x.terminal == "requeued" for x in effects)
-                else "awaiting_receipt"
-            )
-            return make_result(
-                "requeued" if reason == "expired_effect" else "pending",
-                reason,
-                candidate_id,
-                gate,
-                code=HeartbeatReasonCode.EFFECT_EXPIRED
-                if reason == "expired_effect"
-                else HeartbeatReasonCode.EFFECT_PENDING,
-                delivery=delivery,
-                wake=wake,
-                next_judge_at=now,
+            return _recovery_replay_effects(
+                existing,
+                make_result=make_result,
+                candidate_id=candidate_id,
+                gate=gate,
+                now=now,
+                effect_error_code=HeartbeatReasonCode.EFFECT_ERROR,
+                denied_code=HeartbeatReasonCode.DENIED,
+                allowed_code=HeartbeatReasonCode.ALLOWED,
+                expired_code=HeartbeatReasonCode.EFFECT_EXPIRED,
+                pending_code=HeartbeatReasonCode.EFFECT_PENDING,
             )
 
         if existing_effects is not None:
