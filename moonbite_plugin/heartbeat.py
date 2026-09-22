@@ -73,6 +73,7 @@ from ._heartbeat.execution import (
     prepare_effect_intent as _execution_prepare_effect_intent,
     run_effect as _execution_run_effect,
 )
+from ._heartbeat.engine import execute_decision as _engine_execute_decision
 from ._heartbeat.plans import (
     DELEGATED_DELIVERY_IDEMPOTENCY_SUFFIX as _DELEGATED_DELIVERY_IDEMPOTENCY_SUFFIX,
     HEARTBEAT_EFFECT_PLAN_SCHEMA as HEARTBEAT_EFFECT_PLAN_SCHEMA,
@@ -2562,192 +2563,22 @@ class HeartbeatEngine:
                 gate,
                 code=HeartbeatReasonCode.JUDGE_MALFORMED,
             )
-        anchor_epoch = None
-        if policy.profile == "daily_anchor":
-            daily_anchor_epoch = getattr(self.cadence, "daily_anchor_epoch", None)
-            if callable(daily_anchor_epoch):
-                try:
-                    anchor_epoch = daily_anchor_epoch(now)
-                except Exception:
-                    return make_result(
-                        "failed",
-                        "cadence_state_error",
-                        candidate_id,
-                        gate,
-                        code=HeartbeatReasonCode.CADENCE_ERROR,
-                        decision=decision,
-                    )
-        # Keep the approved effect set durable before consuming cadence. A
-        # crash after mark_judge must replay as pending rather than silently
-        # skipping a daily anchor whose effect intents were never created.
-        try:
-            effect_plan = self._ensure_effect_plan(candidate, decision, now)
-        except (StateError, TypeError, ValueError) as exc:
-            return make_result(
-                "failed",
-                "effect_replay_error",
-                candidate_id,
-                gate,
-                code=HeartbeatReasonCode.EFFECT_REPLAY_ERROR,
-                decision=decision,
-                projection_errors=(f"effect_plan:{type(exc).__name__}",),
-            )
-        mark_judge = getattr(self.cadence, "mark_judge", None)
-        if callable(mark_judge):
-            mark_kwargs = {
-                "now": now,
-                "next_judge_at": decision.next_judge_at,
-                "cadence_minutes": decision.cadence_minutes,
-                "anchor_epoch": anchor_epoch,
-            }
-            if anchor_epoch is not None and _accepts_keyword(mark_judge, "anchor_kind"):
-                mark_kwargs["anchor_kind"] = candidate.kind
-        if not callable(mark_judge):
-            next_judge = (
-                _optional_time(decision.next_judge_at, "next_judge_at")
-                if decision.next_judge_at is not None
-                else None
-            )
-        else:
-            try:
-                next_judge = mark_judge(**mark_kwargs)
-            except Exception:
-                return make_result(
-                    "failed",
-                    "cadence_state_error",
-                    candidate_id,
-                    gate,
-                    code=HeartbeatReasonCode.CADENCE_ERROR,
-                    decision=decision,
-                )
-        if not decision.wake_main and not decision.dm_user:
-            if decision.allow_autonomy is True or decision.maintenance is True:
-                return make_result(
-                    "allowed",
-                    "allowed",
-                    candidate_id,
-                    gate,
-                    code=HeartbeatReasonCode.ALLOWED,
-                    decision=decision,
-                    next_judge_at=next_judge,
-                )
-            return make_result(
-                "skipped",
-                decision.reason,
-                candidate_id,
-                gate,
-                code=HeartbeatReasonCode.DENIED,
-                decision=decision,
-                next_judge_at=next_judge,
-            )
-        prepared: dict[str, EffectRecord] = {}
-        try:
-            for kind, enabled in (
-                ("delivery", decision.dm_user),
-                ("wake", decision.wake_main),
-            ):
-                if enabled:
-                    prepared[kind] = self._prepare_effect_intent(
-                        kind,
-                        candidate,
-                        decision,
-                        now,
-                        planned=self._plan_effect(effect_plan, kind),
-                    )
-        except (StateError, TypeError, ValueError) as exc:
-            if effect_plan is not None:
-                return make_result(
-                    "pending",
-                    "awaiting_effect_intent",
-                    candidate_id,
-                    gate,
-                    code=HeartbeatReasonCode.EFFECT_PENDING,
-                    decision=decision,
-                    next_judge_at=now
-                    + getattr(
-                        self.cadence,
-                        "recent_contact_window",
-                        DEFAULT_RECENT_CONTACT_WINDOW,
-                    ),
-                    projection_errors=(f"effect_intent:{type(exc).__name__}",),
-                )
-            return make_result(
-                "failed",
-                "effect_intent_error",
-                candidate_id,
-                gate,
-                code=HeartbeatReasonCode.EFFECT_REPLAY_ERROR,
-                decision=decision,
-                next_judge_at=next_judge,
-                projection_errors=(f"effect_intent:{type(exc).__name__}",),
-            )
-        delivery = (
-            self._run_effect(
-                "delivery",
-                candidate,
-                decision,
-                now,
-                planned=self._plan_effect(effect_plan, "delivery"),
-                prepared=prepared.get("delivery"),
-            )
-            if decision.dm_user
-            else None
-        )
-        wake = (
-            self._run_effect(
-                "wake",
-                candidate,
-                decision,
-                now,
-                planned=self._plan_effect(effect_plan, "wake"),
-                prepared=prepared.get("wake"),
-            )
-            if decision.wake_main
-            else None
-        )
-        effects = [x for x in (delivery, wake) if x is not None]
-        if any(not x.ok for x in effects):
-            failure_code = next(
-                (
-                    x.reason_code
-                    for x in effects
-                    if not x.ok and x.reason_code is not None
-                ),
-                HeartbeatReasonCode.EFFECT_ERROR,
-            )
-            return make_result(
-                "failed",
-                "effect_failed",
-                candidate_id,
-                gate,
-                code=failure_code,
-                decision=decision,
-                delivery=delivery,
-                wake=wake,
-                next_judge_at=next_judge,
-            )
-        if all(x.verified for x in effects):
-            return make_result(
-                "completed",
-                "effects_verified",
-                candidate_id,
-                gate,
-                code=HeartbeatReasonCode.ALLOWED,
-                decision=decision,
-                delivery=delivery,
-                wake=wake,
-                next_judge_at=next_judge,
-            )
-        return make_result(
-            "pending",
-            "effects_accepted_unverified",
-            candidate_id,
+        return _engine_execute_decision(
+            candidate,
+            decision,
+            now,
             gate,
-            code=HeartbeatReasonCode.EFFECT_PENDING,
-            decision=decision,
-            delivery=delivery,
-            wake=wake,
-            next_judge_at=next_judge,
+            policy,
+            make_result=make_result,
+            cadence=self.cadence,
+            ensure_effect_plan=self._ensure_effect_plan,
+            accepts_keyword=_accepts_keyword,
+            optional_time=_optional_time,
+            prepare_effect_intent=self._prepare_effect_intent,
+            plan_effect=self._plan_effect,
+            run_effect=self._run_effect,
+            reason_codes=HeartbeatReasonCode,
+            default_recent_contact_window=DEFAULT_RECENT_CONTACT_WINDOW,
         )
 
 
