@@ -563,15 +563,36 @@ def candidate_existing_effects(
                     try:
                         expire(effect_id, now=now)
                     except ValueError as exc:
-                        if str(exc).strip().lower() != "effect has not expired":
+                        message = str(exc).strip().lower()
+                        if message == "effect has not expired":
+                            result = result_type(
+                                True,
+                                "queued_unverified",
+                                effect_id=effect_id,
+                                terminal=terminal,
+                                reason_code=pending_code,
+                            )
+                        elif message.endswith(" from failed"):
+                            # The marker is stale; the durable failure
+                            # (including intentional_silence) is the
+                            # projection truth.
+                            try:
+                                stale = ledger_get(effect_id)
+                            except Exception as read_exc:
+                                raise StateError(
+                                    "effect ledger replay failed"
+                                ) from read_exc
+                            if stale is None or stale.state != "failed":
+                                raise StateError(
+                                    "effect reconciliation failed"
+                                ) from exc
+                            result = effect_result(
+                                stale,
+                                stale.reason or "failed",
+                                effect_error_code,
+                            )
+                        else:
                             raise StateError("effect reconciliation failed") from exc
-                        result = result_type(
-                            True,
-                            "queued_unverified",
-                            effect_id=effect_id,
-                            terminal=terminal,
-                            reason_code=pending_code,
-                        )
                     except Exception as exc:
                         raise StateError("effect reconciliation failed") from exc
                     else:
@@ -591,12 +612,26 @@ def candidate_existing_effects(
                 results[expected["kind"].removeprefix("heartbeat_")] = result
                 continue
             if terminal == "failed":
-                results[expected["kind"].removeprefix("heartbeat_")] = result_type(
-                    False,
-                    "failed",
-                    effect_id=effect_id,
-                    terminal=terminal,
-                    reason_code=effect_error_code,
+                try:
+                    record = ledger_get(effect_id)
+                except Exception as exc:
+                    raise StateError("effect ledger replay failed") from exc
+                # A durable failed record keeps its reason-derived terminal
+                # (intentional_silence is not an effect_error).
+                results[expected["kind"].removeprefix("heartbeat_")] = (
+                    effect_result(
+                        record,
+                        record.reason or "failed",
+                        effect_error_code,
+                    )
+                    if record is not None and record.state == "failed"
+                    else result_type(
+                        False,
+                        "failed",
+                        effect_id=effect_id,
+                        terminal=terminal,
+                        reason_code=effect_error_code,
+                    )
                 )
                 continue
             if terminal == "requeued":
@@ -685,16 +720,37 @@ def candidate_existing_effects(
                     try:
                         expire(effect_id, now=now)
                     except ValueError as exc:
-                        if str(exc).strip().lower() != "effect has not expired":
-                            raise StateError("effect reconciliation failed") from exc
-                        precomputed[kind] = result_type(
-                            True,
-                            "queued_unverified",
-                            effect_id=effect_id,
-                            terminal=terminal,
-                            reason_code=pending_code,
-                        )
-                        continue
+                        message = str(exc).strip().lower()
+                        if message == "effect has not expired":
+                            precomputed[kind] = result_type(
+                                True,
+                                "queued_unverified",
+                                effect_id=effect_id,
+                                terminal=terminal,
+                                reason_code=pending_code,
+                            )
+                            continue
+                        if message.endswith(" from failed"):
+                            # The marker is stale; the durable failure
+                            # (including intentional_silence) is the
+                            # projection truth.
+                            try:
+                                stale = ledger_get(effect_id)
+                            except Exception as read_exc:
+                                raise StateError(
+                                    "effect ledger replay failed"
+                                ) from read_exc
+                            if stale is None or stale.state != "failed":
+                                raise StateError(
+                                    "effect reconciliation failed"
+                                ) from exc
+                            precomputed[kind] = effect_result(
+                                stale,
+                                stale.reason or "failed",
+                                effect_error_code,
+                            )
+                            continue
+                        raise StateError("effect reconciliation failed") from exc
                     except Exception as exc:
                         raise StateError("effect reconciliation failed") from exc
                     try:
@@ -717,12 +773,26 @@ def candidate_existing_effects(
                 )
                 continue
             if terminal == "failed":
-                precomputed[kind] = result_type(
-                    False,
-                    "failed",
-                    effect_id=effect_id,
-                    terminal=terminal,
-                    reason_code=effect_error_code,
+                try:
+                    record = ledger_get(effect_id)
+                except Exception as exc:
+                    raise StateError("effect ledger replay failed") from exc
+                # A durable failed record keeps its reason-derived terminal
+                # (intentional_silence is not an effect_error).
+                precomputed[kind] = (
+                    effect_result(
+                        record,
+                        record.reason or "failed",
+                        effect_error_code,
+                    )
+                    if record is not None and record.state == "failed"
+                    else result_type(
+                        False,
+                        "failed",
+                        effect_id=effect_id,
+                        terminal=terminal,
+                        reason_code=effect_error_code,
+                    )
                 )
                 continue
             try:
