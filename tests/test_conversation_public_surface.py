@@ -35,6 +35,12 @@ PUBLIC_TYPES = (
     "ConversationSnapshot",
 )
 
+PUBLIC_DATA_TYPES = (
+    "CheckpointRequest",
+    "ConversationReceipt",
+    "ConversationSnapshot",
+)
+
 PUBLIC_SIGNATURES = {
     "ConversationBridge.observer_status": (
         "(self, *, target_date: 'date', now: 'datetime') -> "
@@ -125,6 +131,14 @@ def test_moved_public_types_keep_identity_and_reflection(name: str) -> None:
     assert public_type is internal_type
     assert public_type.__module__ == "moonbite_plugin.conversation"
     assert public_type.__qualname__ == name
+
+
+@pytest.mark.parametrize("name", PUBLIC_DATA_TYPES)
+def test_public_data_type_hints_remain_resolvable(name: str) -> None:
+    hints = get_type_hints(getattr(conversation, name))
+
+    assert hints
+    assert all(not isinstance(value, str) for value in hints.values())
 
 
 def test_bridge_keeps_historical_mro_and_direct_descriptor_surface() -> None:

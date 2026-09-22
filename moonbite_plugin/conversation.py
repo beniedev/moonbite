@@ -7,6 +7,10 @@ accepts or persists a message body.
 
 from __future__ import annotations
 
+from collections.abc import Mapping  # noqa: F401
+from datetime import datetime  # noqa: F401
+from typing import Any, ClassVar  # noqa: F401
+
 from ._conversation.contracts import (
     CHECKPOINT_FAILED_STATES,
     CHECKPOINT_PENDING_STATES,
@@ -31,6 +35,9 @@ _PUBLIC_TYPES = (
     ConversationReceipt,
     ConversationSnapshot,
 )
+# Public classes retain their historical import and pickle identity. Their
+# definitions remain in the focused internal modules, so class-level source
+# discovery is not part of this compatibility facade's contract.
 for _public_type in _PUBLIC_TYPES:
     _public_type.__module__ = __name__
 
