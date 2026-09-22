@@ -6,6 +6,7 @@ import typing
 from moonbite_plugin import memory_orchestration
 from moonbite_plugin._memory_orchestration import contracts
 from moonbite_plugin._memory_orchestration import exposure
+from moonbite_plugin._memory_orchestration import maintenance
 from moonbite_plugin._memory_orchestration import sources
 
 
@@ -79,6 +80,11 @@ def test_public_exports_and_moved_type_identity_remain_stable() -> None:
         assert public is getattr(exposure, name)
         assert public.__module__ == "moonbite_plugin.memory_orchestration"
         assert public.__qualname__ == name
+    for name in ("MaintenanceApprovalAdapter", "MemoryMaintenanceFacade"):
+        public = getattr(memory_orchestration, name)
+        assert public is getattr(maintenance, name)
+        assert public.__module__ == "moonbite_plugin.memory_orchestration"
+        assert public.__qualname__ == name
 
 
 def test_moved_contract_signatures_and_type_hints_remain_resolvable() -> None:
@@ -137,12 +143,40 @@ def test_moved_contract_signatures_and_type_hints_remain_resolvable() -> None:
             "'Callable[[str, str], bool] | None' = None, "
             "first_turn: 'bool | None' = None) -> \"'ExposurePlan'\""
         ),
+        "MaintenanceApprovalAdapter.approval_required": (
+            "(self, proposal: 'Mapping[str, Any]') -> 'bool'"
+        ),
+        "MemoryMaintenanceFacade": (
+            "(memory_store: 'Any', *, approval_adapter: 'Any' = None, "
+            "root: 'Path | None' = None, clock: 'Callable[[], datetime]' = "
+            "<function utc_now at "
+        ),
+        "MemoryMaintenanceFacade.propose": (
+            "(self, *, request_id: 'str', operation: 'str', "
+            "evidence_refs: 'Iterable[str]', reason: 'str', "
+            "proposed_value: 'Any' = None, approval_required: 'bool | None' = None, "
+            "sensitive: 'bool | None' = None) -> 'Mapping[str, Any]'"
+        ),
+        "MemoryMaintenanceFacade.apply": (
+            "(self, proposal_id: 'str', *, activity: 'str', permission: 'str', "
+            "approval_evidence: 'Any' = None, approval: 'bool | None' = None) "
+            "-> 'Mapping[str, Any]'"
+        ),
+        "MemoryMaintenanceFacade.observer_status": (
+            "(self, *, target_date: 'date', now: 'datetime') "
+            "-> 'tuple[ObservationFact, ...]'"
+        ),
     }
     for path, signature in expected.items():
         value = memory_orchestration
         for part in path.split("."):
             value = getattr(value, part)
-        assert str(inspect.signature(value)) == signature
+        actual = str(inspect.signature(value))
+        if path == "MemoryMaintenanceFacade":
+            assert actual.startswith(signature)
+            assert actual.endswith(") -> 'None'")
+        else:
+            assert actual == signature
         typing.get_type_hints(value)
 
 
