@@ -59,6 +59,55 @@ PUBLIC_SIGNATURES = {
     ),
 }
 
+DIRECT_METHODS = (
+    "__init__",
+    "_window",
+    "_new_state",
+    "_same_checkpoint_identity",
+    "_checkpoint_is_active",
+    "_checkpoint_for_reconcile",
+    "_new_cycle",
+    "_current_cycle_for_dirty",
+    "_apply_event",
+    "_replay_unlocked",
+    "_session_snapshot",
+    "_effect_receipt",
+    "_effect_record",
+    "_effect_evidence",
+    "_checkpoint_status",
+    "_build_snapshot",
+    "_receipt_event_matches",
+    "_observer_apply_event",
+    "_observer_replay",
+    "_observer_checkpoint_fact",
+    "observer_status",
+    "observe",
+    "_snapshot_unlocked",
+    "snapshot",
+    "evaluate",
+    "snapshots",
+    "replay",
+    "_validate_checkpoint_arguments",
+    "_effect_identity_matches_request",
+    "request_checkpoint",
+    "reconcile",
+    "reconcile_all",
+)
+
+STATIC_METHODS = {
+    "_window",
+    "_new_state",
+    "_same_checkpoint_identity",
+    "_new_cycle",
+    "_effect_receipt",
+    "_effect_evidence",
+    "_receipt_event_matches",
+    "_observer_apply_event",
+    "_observer_checkpoint_fact",
+    "_validate_checkpoint_arguments",
+    "_effect_identity_matches_request",
+}
+
 
 def test_conversation_public_manifest_is_exact() -> None:
     assert conversation.__all__ == EXPECTED_EXPORTS
@@ -76,6 +125,24 @@ def test_moved_public_types_keep_identity_and_reflection(name: str) -> None:
     assert public_type is internal_type
     assert public_type.__module__ == "moonbite_plugin.conversation"
     assert public_type.__qualname__ == name
+
+
+def test_bridge_keeps_historical_mro_and_direct_descriptor_surface() -> None:
+    assert conversation.ConversationBridge.__mro__ == (
+        conversation.ConversationBridge,
+        object,
+    )
+    assert all(
+        name in conversation.ConversationBridge.__dict__ for name in DIRECT_METHODS
+    )
+    assert {
+        name
+        for name in DIRECT_METHODS
+        if isinstance(
+            conversation.ConversationBridge.__dict__[name],
+            staticmethod,
+        )
+    } == STATIC_METHODS
 
 
 @pytest.mark.parametrize(("path", "expected_signature"), PUBLIC_SIGNATURES.items())

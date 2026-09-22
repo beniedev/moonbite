@@ -26,7 +26,7 @@ from .observer import _ObserverMixin
 from .replay import _ReplayMixin
 
 
-class ConversationBridge(_ReplayMixin, _CheckpointMixin, _ObserverMixin):
+class ConversationBridge:
     """Replayable dirty/settled/checkpoint bridge.
 
     SessionLifecycleStore and EffectLedger are dependencies rather than
@@ -235,3 +235,55 @@ class ConversationBridge(_ReplayMixin, _CheckpointMixin, _ObserverMixin):
         """Validate and return all durable bridge snapshots."""
 
         return self.snapshots()
+
+
+_RESPONSIBILITY_METHODS = (
+    (
+        _ReplayMixin,
+        (
+            "_new_state",
+            "_same_checkpoint_identity",
+            "_checkpoint_is_active",
+            "_checkpoint_for_reconcile",
+            "_new_cycle",
+            "_current_cycle_for_dirty",
+            "_apply_event",
+            "_replay_unlocked",
+            "_receipt_event_matches",
+        ),
+    ),
+    (
+        _CheckpointMixin,
+        (
+            "_session_snapshot",
+            "_effect_receipt",
+            "_effect_record",
+            "_effect_evidence",
+            "_checkpoint_status",
+            "_build_snapshot",
+            "_validate_checkpoint_arguments",
+            "_effect_identity_matches_request",
+            "request_checkpoint",
+            "reconcile",
+            "reconcile_all",
+        ),
+    ),
+    (
+        _ObserverMixin,
+        (
+            "_observer_apply_event",
+            "_observer_replay",
+            "_observer_checkpoint_fact",
+            "observer_status",
+        ),
+    ),
+)
+for _responsibility, _method_names in _RESPONSIBILITY_METHODS:
+    for _method_name in _method_names:
+        setattr(
+            ConversationBridge,
+            _method_name,
+            _responsibility.__dict__[_method_name],
+        )
+
+del _method_name, _method_names, _responsibility
