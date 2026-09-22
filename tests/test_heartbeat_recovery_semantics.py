@@ -374,6 +374,129 @@ def test_failed_effect_reconciliation_survives_control_gate(tmp_path, epoch):
     assert replay.status == "failed"
 
 
+def _terminal_audits(engine, source):
+    return [
+        event
+        for event in engine.bus.read_audit()
+        if event.payload.get("occurrence_id") == source
+        and event.payload.get("terminal") is not None
+    ]
+
+
+def _settle_delivery_as_silence(engine, first):
+    """Verify the wake, then fail the delivery durably without a projection
+    pass, leaving the cadence marker stale."""
+    ledger = engine.effect_ledger
+    engine.reconcile_heartbeat_wake(
+        first.wake.effect_id,
+        ReceiptWakeSink._receipt(ledger.get(first.wake.effect_id), "wake"),
+    )
+    ledger.fail(first.delivery.effect_id, "intentional_silence", retryable=False)
+
+
+def test_failed_marker_replays_durable_silence_as_silence(tmp_path):
+    """A cadence "failed" marker left by an earlier projection must not turn a
+    durable intentional_silence record into a failed/effect_error replay."""
+    engine = make_engine(
+        tmp_path,
+        JudgeDecision(True, True, "contact", "hello", delivery_mode="delegated"),
+        sink=QueueingDelegatedSink(),
+    )
+    first = engine.run(candidate("marker-failed-silence"))
+    assert first.status == "pending"
+    _settle_delivery_as_silence(engine, first)
+    engine.cadence.record_effect_terminal(first.delivery.effect_id, "failed")
+
+    replay = engine.run(candidate("marker-failed-silence"))
+
+    assert replay.status == "intentional_silence"
+    assert replay.reason_code.value == "denied"
+    audits = _terminal_audits(engine, "marker-failed-silence")
+    assert len(audits) == 1
+    assert audits[0].payload["terminal"] == "intentional_silence"
+    assert audits[0].payload["delivery"]["terminal"] == "intentional_silence"
+
+
+def test_stale_unverified_marker_replays_durable_silence_as_silence(tmp_path):
+    """A stale executed_unverified marker must not expire or requeue a record
+    the durable ledger already holds as failed."""
+    engine = make_engine(
+        tmp_path,
+        JudgeDecision(True, True, "contact", "hello", delivery_mode="delegated"),
+        sink=QueueingDelegatedSink(),
+    )
+    first = engine.run(candidate("marker-stale-silence"))
+    assert first.status == "pending"
+    _settle_delivery_as_silence(engine, first)
+    assert (
+        engine.cadence.snapshot()["effect_terminals"][first.delivery.effect_id]
+        == "executed_unverified"
+    )
+
+    replay = engine.run(candidate("marker-stale-silence"))
+
+    assert replay.status == "intentional_silence"
+    assert replay.reason_code.value == "denied"
+    assert engine.effect_ledger.get(first.delivery.effect_id).state == "failed"
+    audits = _terminal_audits(engine, "marker-stale-silence")
+    assert len(audits) == 1
+    assert audits[0].payload["terminal"] == "intentional_silence"
+
+
+def test_failed_marker_replays_durable_failure_with_its_reason(tmp_path):
+    """A durable failure with a real reason keeps failing on marker replay."""
+    engine = make_engine(
+        tmp_path,
+        JudgeDecision(True, True, "contact", "hello", delivery_mode="delegated"),
+        sink=QueueingDelegatedSink(),
+    )
+    first = engine.run(candidate("marker-failed-error"))
+    assert first.status == "pending"
+    ledger = engine.effect_ledger
+    engine.reconcile_heartbeat_wake(
+        first.wake.effect_id,
+        ReceiptWakeSink._receipt(ledger.get(first.wake.effect_id), "wake"),
+    )
+    ledger.fail(first.delivery.effect_id, "effect_error", retryable=False)
+    engine.cadence.record_effect_terminal(first.delivery.effect_id, "failed")
+
+    replay = engine.run(candidate("marker-failed-error"))
+
+    assert replay.status == "failed"
+    assert replay.reason_code.value == "effect_error"
+
+
+def test_snapshot_marker_replay_projects_durable_silence(tmp_path):
+    """Without an effect-plan row, cadence-marker replay must still project
+    the durable record's own terminal."""
+    engine = make_engine(
+        tmp_path,
+        JudgeDecision(True, False, "wake"),
+        sink=QueueingDelegatedSink(),
+    )
+    first = engine.run(candidate("marker-snapshot-silence"))
+    assert first.status == "pending"
+    assert first.wake is not None
+    engine.effect_ledger.fail(
+        first.wake.effect_id, "intentional_silence", retryable=False
+    )
+    # A projection pass writes the canonical occurrence terminal.
+    replay = engine.run(candidate("marker-snapshot-silence"))
+    assert replay.status == "intentional_silence"
+    # Lose the plan ledger; cadence refs and terminal markers remain.
+    (tmp_path / "heartbeat_effect_plans.jsonl").unlink()
+    engine.cadence.record_effect_terminal(first.wake.effect_id, "failed")
+
+    existing = engine._candidate_existing_effects(
+        candidate("marker-snapshot-silence"), NOW
+    )
+
+    assert existing is not None
+    assert existing[0] is None
+    assert existing[1] is not None
+    assert existing[1].terminal == "intentional_silence"
+
+
 def test_exception_effect_failure_status_replays_through_registered_cli(
     tmp_path, capsys
 ):
