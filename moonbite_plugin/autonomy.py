@@ -40,6 +40,14 @@ from ._autonomy.observation import (
     engine_observer_status as _engine_observer_status,
     _read_audit_rows_lock_free as _read_autonomy_audit_rows_lock_free,
 )
+from ._autonomy.outcomes import (
+    bound_control_id as _outcomes_bound_control_id,
+    consume_verified as _outcomes_consume_verified,
+    fail as _outcomes_fail,
+    finish as _outcomes_finish,
+    reconcile as _outcomes_reconcile,
+    settle_expired_unverified as _outcomes_settle_expired_unverified,
+)
 from ._autonomy.recovery import (
     audit_identity_for_record as _recovery_audit_identity_for_record,
     canonical_terminal as _recovery_canonical_terminal,
@@ -547,82 +555,15 @@ class AutonomyEngine:
         *,
         record_terminal: bool = True,
     ) -> ActivityResult:
-        occurrence_id, epoch_id = self._terminal_identity(result)
-        result = replace(
+        return _outcomes_finish(
             result,
-            source_event_id=result.source_event_id or occurrence_id,
-            canonical_event_id=result.canonical_event_id or occurrence_id,
-            epoch_id=epoch_id,
+            gate,
+            record_terminal=record_terminal,
+            terminal_identity=lambda selected: self._terminal_identity(selected),
+            canonical_terminal=lambda selected: self._canonical_terminal(selected),
+            reason_code=lambda reason: self._reason_code(reason),
+            bus=self.bus,
         )
-        terminal = self._canonical_terminal(result) if record_terminal else None
-        evidence = None
-        if result.evidence:
-            evidence = {
-                key: result.evidence[key]
-                for key in (
-                    "state",
-                    "receipt_id",
-                    "event_id",
-                    "epoch_id",
-                    "content_sha256",
-                    "content_length",
-                )
-                if key in result.evidence
-            }
-        details = {
-            "provider": result.provider,
-            "reason": self._reason_code(result.reason),
-            "run_id": result.run_id,
-            "effect_id": result.effect_id,
-            "source_event_id": result.source_event_id,
-            "epoch_id": epoch_id,
-            "idempotency_key": result.idempotency_key,
-            "control_id": gate.control_id,
-            "evidence": evidence,
-            "gate": {
-                "allowed": gate.allowed,
-                "mode": gate.mode,
-                "reason": self._reason_code(gate.reason),
-                "control_id": gate.control_id,
-            },
-        }
-        if occurrence_id is not None:
-            details["occurrence_id"] = occurrence_id
-        try:
-            if terminal is not None and occurrence_id is not None:
-                self.bus.record_audit_terminal(
-                    "autonomy",
-                    occurrence_id=occurrence_id,
-                    epoch_id=epoch_id,
-                    terminal=terminal,
-                    status=result.status,
-                    source="autonomy",
-                    details=details,
-                )
-            else:
-                self.bus.record_audit(
-                    "autonomy",
-                    status=result.status,
-                    source="autonomy",
-                    details=details,
-                )
-        except Exception as exc:
-            if isinstance(exc, RuntimeError) and "conflict" in str(exc).lower():
-                return replace(
-                    result,
-                    status="failed",
-                    reason="terminal_conflict",
-                    audit_status="degraded",
-                    audit_error=f"audit_terminal_conflict:{type(exc).__name__}",
-                )
-            # The EffectLedger is the state owner.  A failed audit projection
-            # must not erase a verified effect or invite a second execution.
-            return replace(
-                result,
-                audit_status="degraded",
-                audit_error=f"audit_error:{type(exc).__name__}",
-            )
-        return result
 
     @staticmethod
     def _canonical_terminal(result: ActivityResult) -> str | None:
@@ -716,13 +657,10 @@ class AutonomyEngine:
         )
 
     def _bound_control_id(self, effect_id: str) -> str | None:
-        for row in self._audit_history():
-            if row.get("effect_id") != effect_id:
-                continue
-            control_id = row.get("control_id")
-            if isinstance(control_id, str) and control_id:
-                return control_id
-        return None
+        return _outcomes_bound_control_id(
+            effect_id,
+            audit_history=lambda: self._audit_history(),
+        )
 
     @staticmethod
     def _record_time(record: Any) -> datetime | None:
@@ -903,21 +841,14 @@ class AutonomyEngine:
         allow_current: bool = False,
         original_control_id: str | None = None,
     ) -> bool:
-        if gate.mode != "play_next" or not gate.control_id:
-            return False
-        if effect_id is not None and not allow_current:
-            durable_bound = self._bound_control_id(effect_id)
-            if (
-                durable_bound is not None
-                and original_control_id is not None
-                and original_control_id != durable_bound
-            ):
-                return False
-            bound = durable_bound or original_control_id
-            if bound is None or bound != gate.control_id:
-                return False
-        self.controls.consume(gate.control_id)
-        return True
+        return _outcomes_consume_verified(
+            gate,
+            effect_id=effect_id,
+            allow_current=allow_current,
+            original_control_id=original_control_id,
+            bound_control_id=lambda selected: self._bound_control_id(selected),
+            consume_control=lambda control_id: self.controls.consume(control_id),
+        )
 
     def _existing_result(
         self,
@@ -988,109 +919,53 @@ class AutonomyEngine:
         fail-closed and cannot be used to consume a play-next control.
         """
 
-        if not isinstance(receipt, EffectReceipt):
-            raise TypeError("receipt must be an EffectReceipt")
-        record = self.effect_ledger.get(effect_id)
-        if record is None:
-            raise ValueError("autonomy effect does not exist")
-        if self._record_value(record, "kind") != AUTONOMY_EFFECT_KIND:
-            raise ValueError("effect is not an autonomy completion")
-        provider = self._record_provider(record) or "unknown"
-        gate = evaluate_gate(self.controls.resolve("autonomy"))
-        state = self._record_state(record)
-        expires_at = self._record_value(record, "expires_at")
-        if state == "expired" or (
-            state not in {"verified", "failed"}
-            and isinstance(expires_at, datetime)
-            and self.clock() >= expires_at
-        ):
-            return self._finish(
-                ActivityResult(
-                    "awaiting_reconciliation",
-                    provider,
-                    "expired_requeue_required",
-                    effect_id=effect_id,
-                    evidence=self._record_evidence(record),
-                    source_event_id=self._record_value(record, "source_event_id"),
-                    idempotency_key=self._record_value(record, "idempotency_key"),
-                    effect_record=record if isinstance(record, EffectRecord) else None,
-                    canonical_event_id=self._record_value(record, "source_event_id"),
-                ),
-                gate,
-            )
-        try:
-            verified = self.effect_ledger.verify(effect_id, receipt)
-        except Exception:
-            try:
-                failed = self.effect_ledger.fail(effect_id, "receipt_mismatch", False)
-            except Exception:
-                failed = record
-            return self._finish(
-                ActivityResult(
-                    "failed",
-                    provider,
-                    "receipt_mismatch",
-                    effect_id=effect_id,
-                    evidence=self._record_evidence(failed),
-                    source_event_id=self._record_value(record, "source_event_id"),
-                    idempotency_key=self._record_value(record, "idempotency_key"),
-                    effect_record=failed if isinstance(failed, EffectRecord) else None,
-                    canonical_event_id=self._record_value(record, "source_event_id"),
-                ),
-                gate,
-            )
-        self._consume_verified(
-            gate, effect_id=effect_id, original_control_id=control_id
-        )
-        return self._finish(
-            ActivityResult(
-                "completed",
-                provider,
-                "verified_reconciliation",
-                effect_id=effect_id,
-                evidence=self._record_evidence(verified),
-                source_event_id=self._record_value(verified, "source_event_id"),
-                idempotency_key=self._record_value(verified, "idempotency_key"),
-                effect_record=verified if isinstance(verified, EffectRecord) else None,
-                canonical_event_id=self._record_value(verified, "source_event_id"),
+        return _outcomes_reconcile(
+            effect_id,
+            receipt,
+            control_id=control_id,
+            receipt_type=EffectReceipt,
+            effect_record_type=EffectRecord,
+            effect_kind=AUTONOMY_EFFECT_KIND,
+            effect_ledger=self.effect_ledger,
+            resolve_control=lambda name: self.controls.resolve(name),
+            evaluate_gate_fn=evaluate_gate,
+            clock=self.clock,
+            record_value=lambda record, key, default=None: self._record_value(
+                record, key, default
             ),
-            gate,
+            record_provider=lambda record: self._record_provider(record),
+            record_state=lambda record: self._record_state(record),
+            record_evidence=lambda record: self._record_evidence(record),
+            consume_verified=lambda gate, **kwargs: self._consume_verified(
+                gate, **kwargs
+            ),
+            finish=lambda result, gate, **kwargs: self._finish(result, gate, **kwargs),
+            result_type=ActivityResult,
         )
 
     def fail(self, effect_id: str, reason: str) -> ActivityResult:
         """Settle an asynchronous provider with an explicit host failure."""
 
-        failure_reason = _bounded(reason, "failure reason", max_bytes=128)
-        record = self.effect_ledger.get(effect_id)
-        if record is None:
-            raise ValueError("autonomy effect does not exist")
-        if self._record_value(record, "kind") != AUTONOMY_EFFECT_KIND:
-            raise ValueError("effect is not an autonomy completion")
-        provider = self._record_provider(record) or "unknown"
-        gate = evaluate_gate(self.controls.resolve("autonomy"))
-        if self._record_state(record) in {"verified", "failed"}:
-            existing = self._existing_result(
-                record,
-                provider=provider,
-                gate=gate,
-                run_id=self._record_value(record, "effect_id"),
-            )
-            if existing is not None:
-                return existing
-        failed = self.effect_ledger.fail(effect_id, failure_reason, False)
-        return self._finish(
-            ActivityResult(
-                "failed",
-                provider,
-                failure_reason,
-                effect_id=effect_id,
-                evidence=self._record_evidence(failed),
-                source_event_id=self._record_value(failed, "source_event_id"),
-                idempotency_key=self._record_value(failed, "idempotency_key"),
-                effect_record=failed if isinstance(failed, EffectRecord) else None,
-                canonical_event_id=self._record_value(failed, "source_event_id"),
+        return _outcomes_fail(
+            effect_id,
+            reason,
+            bounded=_bounded,
+            effect_record_type=EffectRecord,
+            effect_kind=AUTONOMY_EFFECT_KIND,
+            effect_ledger=self.effect_ledger,
+            resolve_control=lambda name: self.controls.resolve(name),
+            evaluate_gate_fn=evaluate_gate,
+            record_value=lambda record, key, default=None: self._record_value(
+                record, key, default
             ),
-            gate,
+            record_provider=lambda record: self._record_provider(record),
+            record_state=lambda record: self._record_state(record),
+            record_evidence=lambda record: self._record_evidence(record),
+            existing_result=lambda record, **kwargs: self._existing_result(
+                record, **kwargs
+            ),
+            finish=lambda result, gate, **kwargs: self._finish(result, gate, **kwargs),
+            result_type=ActivityResult,
         )
 
     def _settle_expired_unverified(
@@ -1101,46 +976,23 @@ class AutonomyEngine:
     ) -> None:
         """Fail old unverified autonomy effects without replaying providers."""
 
-        for record in self.effect_ledger.records():
-            if self._record_value(
-                record, "kind"
-            ) != AUTONOMY_EFFECT_KIND or self._record_state(record) not in {
-                "pending",
-                "executed_unverified",
-            }:
-                continue
-            expires_at = self._record_value(record, "expires_at")
-            if not isinstance(expires_at, datetime) or not expires_at < now:
-                continue
-            effect_id = self._record_value(record, "effect_id")
-            provider = self._record_provider(record) or "unknown"
-            try:
-                failed = self.effect_ledger.fail(
-                    effect_id,
-                    "effect_expired_unverified",
-                    False,
-                )
-            except Exception:
-                current = self.effect_ledger.get(effect_id)
-                if self._record_state(current) in {"verified", "failed"}:
-                    continue
-                raise
-            self._finish(
-                ActivityResult(
-                    "failed",
-                    provider,
-                    "effect_expired_unverified",
-                    effect_id=effect_id,
-                    evidence=self._record_evidence(failed),
-                    source_event_id=self._record_value(failed, "source_event_id"),
-                    idempotency_key=self._record_value(failed, "idempotency_key"),
-                    effect_record=(
-                        failed if isinstance(failed, EffectRecord) else None
-                    ),
-                    canonical_event_id=self._record_value(failed, "source_event_id"),
-                ),
-                gate,
-            )
+        return _outcomes_settle_expired_unverified(
+            now=now,
+            gate=gate,
+            effect_record_type=EffectRecord,
+            effect_kind=AUTONOMY_EFFECT_KIND,
+            effect_ledger=self.effect_ledger,
+            record_value=lambda record, key, default=None: self._record_value(
+                record, key, default
+            ),
+            record_provider=lambda record: self._record_provider(record),
+            record_state=lambda record: self._record_state(record),
+            record_evidence=lambda record: self._record_evidence(record),
+            finish=lambda result, selected_gate, **kwargs: self._finish(
+                result, selected_gate, **kwargs
+            ),
+            result_type=ActivityResult,
+        )
 
     def run_once(
         self,
