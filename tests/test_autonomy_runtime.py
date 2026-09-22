@@ -4,6 +4,7 @@ import json
 import random
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 
@@ -1560,6 +1561,37 @@ def test_observer_status_discards_unrelated_and_private_audit_payloads(tmp_path)
     assert audit_path.read_bytes() == before
     assert audit_path.stat().st_mtime_ns == before_mtime
     assert not audit_lock.exists()
+
+
+def test_observer_audit_read_failure_is_sanitized_and_read_only(tmp_path, monkeypatch):
+    engine, _controls = make_engine(
+        tmp_path,
+        [ActivityProvider("chosen", lambda _request: None)],
+    )
+    audit_path = engine.bus.audit.path
+    audit_path.parent.mkdir(parents=True, exist_ok=True)
+    audit_path.write_text("", encoding="utf-8")
+    before = audit_path.read_bytes()
+    before_mtime = audit_path.stat().st_mtime_ns
+    original_open = Path.open
+
+    def fail_audit_read(path, *args, **kwargs):
+        if path == audit_path and args and args[0] == "r":
+            raise PermissionError("private read detail")
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", fail_audit_read)
+    facts = engine.observer_status(target_date=NOW.date(), now=NOW)
+
+    assert [fact.code for fact in facts] == [
+        "autonomy_integrity_error:read_PermissionError"
+    ]
+    assert "private read detail" not in json.dumps(
+        [fact.to_dict() for fact in facts], sort_keys=True
+    )
+    assert audit_path.read_bytes() == before
+    assert audit_path.stat().st_mtime_ns == before_mtime
+    assert not engine.bus.audit.lock_path.exists()
 
 
 def test_observer_audit_only_failed_to_completed_stays_unverified(tmp_path):
