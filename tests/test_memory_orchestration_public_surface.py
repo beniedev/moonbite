@@ -5,6 +5,7 @@ import typing
 
 from moonbite_plugin import memory_orchestration
 from moonbite_plugin._memory_orchestration import contracts
+from moonbite_plugin._memory_orchestration import sources
 
 
 EXPECTED_EXPORTS = (
@@ -67,6 +68,11 @@ def test_public_exports_and_moved_type_identity_remain_stable() -> None:
         memory_orchestration.content_descriptor.__module__
         == "moonbite_plugin.memory_orchestration"
     )
+    assert memory_orchestration.SourceRegistry is sources.SourceRegistry
+    assert memory_orchestration.SourceRegistry.__module__ == (
+        "moonbite_plugin.memory_orchestration"
+    )
+    assert memory_orchestration.SourceRegistry.__qualname__ == "SourceRegistry"
 
 
 def test_moved_contract_signatures_and_type_hints_remain_resolvable() -> None:
@@ -100,6 +106,14 @@ def test_moved_contract_signatures_and_type_hints_remain_resolvable() -> None:
         "SourceOpener.open": (
             "(self, source_ref: 'str', *, max_bytes: 'int') "
             "-> \"'SourceMaterial | None'\""
+        ),
+        "SourceRegistry": "(retriever: 'Any' = None, opener: 'Any' = None) -> 'None'",
+        "SourceRegistry.retrieve": (
+            "(self, query: 'str', *, limit: 'int') -> 'tuple[SourceCandidate, ...]'"
+        ),
+        "SourceRegistry.exact_open": (
+            "(self, candidate: 'SourceCandidate', *, max_bytes: 'int' = 65536) "
+            "-> 'SourceMaterial | None'"
         ),
     }
     for path, signature in expected.items():
