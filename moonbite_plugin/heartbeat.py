@@ -59,6 +59,11 @@ from ._heartbeat.observation import (
     cadence_observer_status as _cadence_observer_status,
     engine_observer_status as _engine_observer_status,
 )
+from ._heartbeat.execution import (
+    invoke as _execution_invoke,
+    prepare_effect_intent as _execution_prepare_effect_intent,
+    run_effect as _execution_run_effect,
+)
 from ._heartbeat.plans import (
     DELEGATED_DELIVERY_IDEMPOTENCY_SUFFIX as _DELEGATED_DELIVERY_IDEMPOTENCY_SUFFIX,
     HEARTBEAT_EFFECT_PLAN_SCHEMA as HEARTBEAT_EFFECT_PLAN_SCHEMA,
@@ -2310,32 +2315,7 @@ class HeartbeatEngine:
         decision: JudgeDecision,
         intent: Any,
     ) -> Any:
-        try:
-            signature = inspect.signature(method)
-            params = list(signature.parameters.values())
-            positional = [
-                p
-                for p in params
-                if p.kind
-                in {
-                    inspect.Parameter.POSITIONAL_ONLY,
-                    inspect.Parameter.POSITIONAL_OR_KEYWORD,
-                }
-            ]
-            if len(positional) >= 3 or any(
-                p.kind is inspect.Parameter.VAR_POSITIONAL for p in params
-            ):
-                return method(candidate, decision, intent)
-            for name in ("intent", "effect", "effect_intent"):
-                parameter = signature.parameters.get(name)
-                if (
-                    parameter is not None
-                    and parameter.kind is inspect.Parameter.KEYWORD_ONLY
-                ):
-                    return method(candidate, decision, **{name: intent})
-        except (TypeError, ValueError):
-            pass
-        return method(candidate, decision)
+        return _execution_invoke(method, candidate, decision, intent)
 
     def _run_effect(
         self,
@@ -2347,180 +2327,31 @@ class HeartbeatEngine:
         planned: Mapping[str, Any] | None = None,
         prepared: EffectRecord | None = None,
     ) -> EffectResult:
-        if self.effect_ledger is None:
-            return EffectResult(
-                False,
-                "effect_ledger_unavailable",
-                reason_code=HeartbeatReasonCode.EFFECT_REPLAY_ERROR,
-            )
-        try:
-            record = prepared or self._prepare_effect_intent(
-                kind, candidate, decision, now, planned=planned
-            )
-        except Exception:
-            return EffectResult(
-                False,
-                "effect_intent_error",
-                reason_code=HeartbeatReasonCode.EFFECT_REPLAY_ERROR,
-            )
-        if planned is not None:
-            try:
-                self._validate_plan_record(record, planned)
-            except Exception:
-                return EffectResult(
-                    False,
-                    "effect_intent_error",
-                    effect_id=record.effect_id,
-                    reason_code=HeartbeatReasonCode.EFFECT_REPLAY_ERROR,
-                )
-        existing = self._existing_effect(record, now)
-        if existing is not None:
-            return existing
-        try:
-            record = self.effect_ledger.mark_pending(record.effect_id)
-        except Exception:
-            return EffectResult(
-                False,
-                "effect_pending_error",
-                effect_id=record.effect_id,
-                reason_code=HeartbeatReasonCode.EFFECT_ERROR,
-            )
-        method = getattr(self.sink, "deliver" if kind == "delivery" else "wake", None)
-        if not callable(method):
-            return self._fail_effect(
-                record,
-                "adapter_unavailable",
-                "adapter_unavailable",
-                HeartbeatReasonCode.ADAPTER_UNAVAILABLE,
-                True,
-            )
-        try:
-            raw = self._invoke(method, candidate, decision, record.to_intent())
-        except Exception as exc:
-            return self._fail_effect(
-                record,
-                f"{kind}_error:{type(exc).__name__}",
-                f"adapter_error:{type(exc).__name__}",
-                HeartbeatReasonCode.ADAPTER_ERROR,
-                True,
-            )
-        if isinstance(raw, EffectReceipt):
-            adapter = EffectResult(True, "verified", raw, True)
-        elif isinstance(raw, EffectResult):
-            adapter = raw
-        else:
-            return self._fail_effect(
-                record,
-                "adapter_malformed_return",
-                "adapter_malformed_return",
-                HeartbeatReasonCode.ADAPTER_MALFORMED,
-                False,
-            )
-        if (
-            type(adapter.ok) is not bool
-            or type(adapter.status) is not str
-            or not adapter.status.strip()
-        ):
-            return self._fail_effect(
-                record,
-                "adapter_malformed_result",
-                "adapter_malformed_result",
-                HeartbeatReasonCode.ADAPTER_MALFORMED,
-                False,
-            )
-        if adapter.receipt is not None and not isinstance(
-            adapter.receipt, EffectReceipt
-        ):
-            return self._fail_effect(
-                record,
-                "adapter_malformed_receipt",
-                "adapter_malformed_receipt",
-                HeartbeatReasonCode.ADAPTER_MALFORMED,
-                False,
-            )
-        status = adapter.status.strip().lower()
-        if adapter.receipt is not None:
-            if kind == "delivery" and decision.delivery_mode == "delegated":
-                return self._fail_effect(
-                    record,
-                    "delegated_receipt_not_allowed",
-                    "delegated_receipt_not_allowed",
-                    HeartbeatReasonCode.ADAPTER_MALFORMED,
-                    False,
-                )
-            if not adapter.ok:
-                return self._fail_effect(
-                    record,
-                    "adapter_rejected",
-                    "adapter_rejected",
-                    HeartbeatReasonCode.ADAPTER_REJECTED,
-                    False,
-                )
-            try:
-                self._validate_receipt_time(record, adapter.receipt)
-                verified = self.effect_ledger.verify(record.effect_id, adapter.receipt)
-            except Exception:
-                return self._fail_effect(
-                    record,
-                    "receipt_mismatch",
-                    "receipt_mismatch",
-                    HeartbeatReasonCode.EFFECT_ERROR,
-                    False,
-                )
-            return self._effect_result(verified, "verified")
-        if not adapter.ok:
-            unavailable = any(
-                word in status for word in ("unavailable", "not_configured", "disabled")
-            )
-            return self._fail_effect(
-                record,
-                "adapter_unavailable" if unavailable else "adapter_rejected",
-                "adapter_unavailable" if unavailable else "adapter_rejected",
-                HeartbeatReasonCode.ADAPTER_UNAVAILABLE
-                if unavailable
-                else HeartbeatReasonCode.ADAPTER_REJECTED,
-                unavailable,
-            )
-        if status == "verified":
-            return self._fail_effect(
-                record,
-                "missing_receipt",
-                "missing_receipt",
-                HeartbeatReasonCode.EFFECT_ERROR,
-                False,
-            )
-        if status not in _ACCEPTED:
-            return self._fail_effect(
-                record,
-                "adapter_malformed_status",
-                "adapter_malformed_status",
-                HeartbeatReasonCode.ADAPTER_MALFORMED,
-                False,
-            )
-        try:
-            accepted = self.effect_ledger.mark_queue_accepted(record.effect_id)
-        except Exception:
-            try:
-                current = self.effect_ledger.get(record.effect_id)
-            except Exception:
-                current = None
-            if current is not None and current.state == "verified":
-                return self._effect_result(current, "verified")
-            if current is not None and current.state == "failed":
-                return self._effect_result(
-                    current,
-                    current.reason or "failed",
-                    HeartbeatReasonCode.EFFECT_ERROR,
-                )
-            return self._fail_effect(
-                record,
-                "effect_queue_accept_error",
-                "effect_queue_accept_error",
-                HeartbeatReasonCode.EFFECT_ERROR,
-                True,
-            )
-        return self._effect_result(
-            accepted, "queued_unverified", HeartbeatReasonCode.EFFECT_PENDING
+        return _execution_run_effect(
+            kind,
+            candidate,
+            decision,
+            now,
+            planned=planned,
+            prepared=prepared,
+            effect_ledger=self.effect_ledger,
+            prepare_intent=self._prepare_effect_intent,
+            validate_plan_record=self._validate_plan_record,
+            existing_effect=self._existing_effect,
+            sink=self.sink,
+            invoke_adapter=self._invoke,
+            validate_receipt_time=self._validate_receipt_time,
+            effect_result=self._effect_result,
+            fail_effect=self._fail_effect,
+            result_type=EffectResult,
+            accepted_statuses=_ACCEPTED,
+            replay_error_code=HeartbeatReasonCode.EFFECT_REPLAY_ERROR,
+            effect_error_code=HeartbeatReasonCode.EFFECT_ERROR,
+            adapter_unavailable_code=HeartbeatReasonCode.ADAPTER_UNAVAILABLE,
+            adapter_error_code=HeartbeatReasonCode.ADAPTER_ERROR,
+            adapter_malformed_code=HeartbeatReasonCode.ADAPTER_MALFORMED,
+            adapter_rejected_code=HeartbeatReasonCode.ADAPTER_REJECTED,
+            pending_code=HeartbeatReasonCode.EFFECT_PENDING,
         )
 
     def _prepare_effect_intent(
@@ -2533,64 +2364,21 @@ class HeartbeatEngine:
         planned: Mapping[str, Any] | None = None,
     ) -> EffectRecord:
         """Persist one effect identity before any adapter invocation."""
-
-        if self.effect_ledger is None:
-            raise StateError("effect ledger is unavailable")
-        body = _effect_body(kind, candidate, decision)
-        source = (
-            candidate.context.get("source_event_id")
-            or candidate.context.get("event_id")
-            or candidate.candidate_id
+        return _execution_prepare_effect_intent(
+            kind,
+            candidate,
+            decision,
+            now,
+            planned=planned,
+            effect_ledger=self.effect_ledger,
+            effect_ttl=self.effect_ttl,
+            effect_body=_effect_body,
+            candidate_epoch=self._candidate_epoch,
+            validate_plan_record=self._validate_plan_record,
+            cadence=self.cadence,
+            accepts_keyword=_accepts_keyword,
+            delegated_suffix=_DELEGATED_DELIVERY_IDEMPOTENCY_SUFFIX,
         )
-        public_epoch = self._candidate_epoch(candidate)
-        epoch = public_epoch or "heartbeat"
-        if (
-            type(source) is not str
-            or not source.strip()
-            or type(epoch) is not str
-            or not epoch.strip()
-        ):
-            raise StateError("heartbeat effect identity is invalid")
-        idempotency_key = f"heartbeat:{source}:{kind}"
-        if public_epoch is not None:
-            idempotency_key += f":{public_epoch}"
-        if kind == "delivery" and decision.delivery_mode == "delegated":
-            idempotency_key += _DELEGATED_DELIVERY_IDEMPOTENCY_SUFFIX
-        content_sha256 = hashlib.sha256(body).hexdigest()
-        content_length = len(body)
-        intent_kwargs: dict[str, Any] = {
-            "kind": f"heartbeat_{kind}",
-            "source_event_id": source,
-            "idempotency_key": idempotency_key,
-            "epoch_id": epoch,
-            "content_sha256": content_sha256,
-            "content_length": content_length,
-            "expires_at": now + self.effect_ttl,
-            "created_at": now,
-        }
-        if planned is not None:
-            if (
-                planned["kind"] != f"heartbeat_{kind}"
-                or planned["source_event_id"] != source
-                or planned["epoch_id"] != epoch
-                or planned["idempotency_key"] != idempotency_key
-                or planned["content_sha256"] != content_sha256
-                or planned["content_length"] != content_length
-            ):
-                raise StateError("heartbeat effect plan identity conflict")
-            intent_kwargs["effect_id"] = planned["effect_id"]
-        record = self.effect_ledger.begin_intent(**intent_kwargs)
-        if planned is not None:
-            self._validate_plan_record(record, planned)
-        remember = getattr(self.cadence, "remember_effect_ref", None)
-        if callable(remember):
-            ref_kwargs = (
-                {"epoch_id": public_epoch}
-                if _accepts_keyword(remember, "epoch_id")
-                else {}
-            )
-            remember(source, f"heartbeat_{kind}", record.effect_id, **ref_kwargs)
-        return record
 
     def _candidate_existing_effects(
         self, candidate: HeartbeatCandidate, now: datetime
