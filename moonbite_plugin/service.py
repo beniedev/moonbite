@@ -147,6 +147,20 @@ class MoonbiteRuntime:
     pass
 
 
+def _install_method_group(method_group) -> None:
+    for method_name, descriptor in method_group.__dict__.items():
+        if not isinstance(
+            descriptor,
+            (_FunctionType, classmethod, staticmethod, property),
+        ):
+            continue
+        setattr(
+            MoonbiteRuntime,
+            method_name,
+            _facade_descriptor(method_name, descriptor),
+        )
+
+
 for _method_group in (
     _ComponentAssemblyMethods,
     _SessionLifecycleMethods,
@@ -155,13 +169,6 @@ for _method_group in (
     _MemoryUseCaseMethods,
     _DiaryUseCaseMethods,
 ):
-    for _method_name, _descriptor in _method_group.__dict__.items():
-        if _method_name in {"__module__", "__dict__", "__weakref__", "__doc__"}:
-            continue
-        setattr(
-            MoonbiteRuntime,
-            _method_name,
-            _facade_descriptor(_method_name, _descriptor),
-        )
+    _install_method_group(_method_group)
 
-del _descriptor, _method_group, _method_name
+del _method_group

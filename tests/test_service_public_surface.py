@@ -188,3 +188,16 @@ def test_runtime_facade_keeps_historical_module_global_dispatch(monkeypatch):
         "logger"
     ] is (service.logger)
     assert service.logger.name == "moonbite_plugin.service"
+
+
+def test_runtime_facade_ignores_non_method_group_metadata():
+    before = dict(vars(service.MoonbiteRuntime))
+
+    class FutureRuntimeMetadata:
+        __firstlineno__ = 100
+        __static_attributes__ = ("future_field",)
+        future_metadata = object()
+
+    service._install_method_group(FutureRuntimeMetadata)
+
+    assert dict(vars(service.MoonbiteRuntime)) == before
