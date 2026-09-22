@@ -5,6 +5,7 @@ import typing
 
 from moonbite_plugin import memory_orchestration
 from moonbite_plugin._memory_orchestration import contracts
+from moonbite_plugin._memory_orchestration import engine
 from moonbite_plugin._memory_orchestration import exposure
 from moonbite_plugin._memory_orchestration import maintenance
 from moonbite_plugin._memory_orchestration import sources
@@ -92,6 +93,11 @@ def test_public_exports_and_moved_type_identity_remain_stable() -> None:
         assert public.__module__ == "moonbite_plugin.memory_orchestration"
         assert public.__qualname__ == name
     assert memory_orchestration.WRITER_OPERATIONS is writer.WRITER_OPERATIONS
+    assert memory_orchestration.MemoryOrchestrator is engine.MemoryOrchestrator
+    assert memory_orchestration.MemoryOrchestrator.__module__ == (
+        "moonbite_plugin.memory_orchestration"
+    )
+    assert memory_orchestration.MemoryOrchestrator.__qualname__ == "MemoryOrchestrator"
 
 
 def test_moved_contract_signatures_and_type_hints_remain_resolvable() -> None:
@@ -198,6 +204,33 @@ def test_moved_contract_signatures_and_type_hints_remain_resolvable() -> None:
             "(self, effect_id: 'str', receipt: 'EffectReceipt') -> 'WriterHandoff'"
         ),
         "WriterCoordinator.observer_status": (
+            "(self, *, target_date: 'date', now: 'datetime') "
+            "-> 'tuple[ObservationFact, ...]'"
+        ),
+        "MemoryOrchestrator.retrieve": (
+            "(self, query: 'str', *, context: 'ExposureContext | Any', "
+            "limit: 'int | None' = None) -> 'tuple[SourceCandidate, ...]'"
+        ),
+        "MemoryOrchestrator.plan": (
+            "(self, candidates: 'Iterable[SourceCandidate]', *, "
+            "context: 'ExposureContext | Any', first_turn: 'bool | None' = None, "
+            "now: 'datetime | None' = None) -> 'ExposurePlan'"
+        ),
+        "MemoryOrchestrator.expose_candidates": (
+            "(self, candidates: 'Iterable[SourceCandidate]', *, "
+            "context: 'ExposureContext | Any', first_turn: 'bool | None' = None, "
+            "now: 'datetime | None' = None) -> 'tuple[ExposedSource, ...]'"
+        ),
+        "MemoryOrchestrator.open_selected": (
+            "(self, exposure_id: 'str', *, candidate: 'SourceCandidate | None' = None, "
+            "opener: 'Any' = None, max_bytes: 'int' = 65536, "
+            "context: 'ExposureContext | Any | None' = None, "
+            "now: 'datetime | None' = None) -> 'SourceMaterial'"
+        ),
+        "MemoryOrchestrator.mark_used": (
+            "(self, *args: 'Any', **kwargs: 'Any') -> 'ExposureRecord'"
+        ),
+        "MemoryOrchestrator.observer_status": (
             "(self, *, target_date: 'date', now: 'datetime') "
             "-> 'tuple[ObservationFact, ...]'"
         ),
