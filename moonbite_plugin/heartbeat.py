@@ -59,6 +59,15 @@ from ._heartbeat.observation import (
     cadence_observer_status as _cadence_observer_status,
     engine_observer_status as _engine_observer_status,
 )
+from ._heartbeat.outcomes import (
+    delegated_completion_result as _outcomes_delegated_completion_result,
+    effect_result as _outcomes_effect_result,
+    fail_effect as _outcomes_fail_effect,
+    reconcile_delivery as _outcomes_reconcile_delivery,
+    reconcile_wake as _outcomes_reconcile_wake,
+    record_settled_occurrence_terminal as _outcomes_record_settled_terminal,
+    validate_receipt_time as _outcomes_validate_receipt_time,
+)
 from ._heartbeat.execution import (
     invoke as _execution_invoke,
     prepare_effect_intent as _execution_prepare_effect_intent,
@@ -1918,162 +1927,36 @@ class HeartbeatEngine:
         *,
         audit_terminal: bool = False,
     ) -> EffectResult:
-        projection_errors: list[str] = []
-        if record.state == "verified" and record.receipt is not None:
-            if record.kind == "heartbeat_delivery":
-                try:
-                    self.cadence.record_verified_visible_contact(record, record.receipt)
-                except Exception as exc:
-                    projection_errors.append(
-                        f"visible_contact_write:{type(exc).__name__}"
-                    )
-            result = EffectResult(
-                True,
-                status or "verified",
-                record.receipt,
-                True,
-                record.effect_id,
-                "verified",
-                code,
-                bool(projection_errors),
-                tuple(projection_errors),
-            )
-        elif record.state == "failed":
-            terminal = (
-                "intentional_silence"
-                if record.reason == "intentional_silence"
-                else "failed"
-            )
-            result = EffectResult(
-                False,
-                status or "failed",
-                effect_id=record.effect_id,
-                terminal=terminal,
-                reason_code=code or HeartbeatReasonCode.EFFECT_ERROR,
-            )
-        elif record.state == "requeued":
-            result = EffectResult(
-                True,
-                status or "requeued",
-                effect_id=record.effect_id,
-                terminal="requeued",
-                reason_code=code or HeartbeatReasonCode.EFFECT_EXPIRED,
-            )
-        else:
-            result = EffectResult(
-                True,
-                status or "queued_unverified",
-                effect_id=record.effect_id,
-                terminal=record.state,
-                reason_code=code,
-            )
-        try:
-            self.cadence.record_effect_terminal(
-                record.effect_id, record.state, observed_at=self._clock()
-            )
-        except Exception as exc:
-            projection_errors.append(f"effect_terminal_write:{type(exc).__name__}")
-        if audit_terminal and record.state in {"verified", "failed"}:
-            try:
-                self._record_settled_occurrence_terminal(record)
-            except StateError:
-                raise
-            except Exception as exc:
-                projection_errors.append(f"audit_write:{type(exc).__name__}")
-        if projection_errors:
-            result = replace(
-                result,
-                degraded=True,
-                projection_errors=tuple(dict.fromkeys(projection_errors)),
-            )
-        return result
+        return _outcomes_effect_result(
+            record,
+            status,
+            code,
+            audit_terminal=audit_terminal,
+            cadence=self.cadence,
+            clock=self._clock,
+            record_settled_occurrence_terminal=(
+                self._record_settled_occurrence_terminal
+            ),
+            result_type=EffectResult,
+            effect_error_code=HeartbeatReasonCode.EFFECT_ERROR,
+            effect_expired_code=HeartbeatReasonCode.EFFECT_EXPIRED,
+        )
 
     def _record_settled_occurrence_terminal(self, record: EffectRecord) -> None:
         """Project a terminal only after every sibling effect is settled."""
-
-        if self.effect_ledger is None:
-            raise StateError("effect ledger is unavailable")
-        plan = self._effect_plan(
-            record.source_event_id, self._public_epoch_from_effect(record)
+        _outcomes_record_settled_terminal(
+            record,
+            effect_ledger=self.effect_ledger,
+            find_plan=self._effect_plan,
+            public_epoch=self._public_epoch_from_effect,
+            validate_plan_record=self._validate_plan_record,
+            find_existing_terminal=self._existing_terminal_result,
+            bus=self.bus,
+            accepts_keyword=_accepts_keyword,
+            allowed_code=HeartbeatReasonCode.ALLOWED,
+            denied_code=HeartbeatReasonCode.DENIED,
+            effect_error_code=HeartbeatReasonCode.EFFECT_ERROR,
         )
-        if plan is not None:
-            siblings_list: list[EffectRecord] = []
-            for expected in plan["effects"]:
-                candidate = self.effect_ledger.get(expected["effect_id"])
-                if candidate is None:
-                    return
-                self._validate_plan_record(candidate, expected)
-                siblings_list.append(candidate)
-            siblings = tuple(siblings_list)
-            if record.effect_id not in {candidate.effect_id for candidate in siblings}:
-                raise StateError("heartbeat occurrence effect is outside its plan")
-            occurrence_id = plan["candidate_id"]
-        else:
-            # A pre-plan history cannot prove that the current effect is the
-            # complete occurrence.  An already-written canonical audit may be
-            # replayed by the validator, but reconciliation must not create a
-            # new aggregate from a singleton or an arbitrary sibling set.
-            existing = self._existing_terminal_result(
-                record.source_event_id,
-                epoch_id=self._public_epoch_from_effect(record),
-            )
-            if existing is None:
-                return
-            return
-        if any(candidate.state not in {"verified", "failed"} for candidate in siblings):
-            return
-        # A real failed sibling must remain visible even when another sibling
-        # intentionally silenced delivery.  Silence is only the aggregate
-        # terminal when no sibling failed.
-        real_failure = any(
-            candidate.state == "failed" and candidate.reason != "intentional_silence"
-            for candidate in siblings
-        )
-        intentional_silence = any(
-            candidate.state == "failed" and candidate.reason == "intentional_silence"
-            for candidate in siblings
-        )
-        terminal = (
-            "failed"
-            if real_failure
-            else "intentional_silence"
-            if intentional_silence
-            else "verified"
-        )
-        effect_ids = sorted(candidate.effect_id for candidate in siblings)
-        details: dict[str, Any] = {
-            "effect_ids": effect_ids,
-            "source_event_id": record.source_event_id,
-            "reason_code": (
-                HeartbeatReasonCode.ALLOWED.value
-                if terminal == "verified"
-                else HeartbeatReasonCode.DENIED.value
-                if terminal == "intentional_silence"
-                else HeartbeatReasonCode.EFFECT_ERROR.value
-            ),
-        }
-        if len(effect_ids) == 1:
-            details["effect_id"] = effect_ids[0]
-        record_terminal = self.bus.record_audit_terminal
-        terminal_kwargs = {
-            "occurrence_id": occurrence_id,
-            "terminal": terminal,
-            "status": (
-                "intentional_silence"
-                if terminal == "intentional_silence"
-                else "failed"
-                if terminal == "failed"
-                else "completed"
-            ),
-            "source": "heartbeat",
-            "details": details,
-        }
-        public_epoch = self._public_epoch_from_effect(record)
-        if _accepts_keyword(record_terminal, "epoch_id"):
-            terminal_kwargs["epoch_id"] = public_epoch
-        elif public_epoch is not None:
-            raise StateError("heartbeat audit epoch is unsupported")
-        record_terminal("heartbeat", **terminal_kwargs)
 
     def _fail_effect(
         self,
@@ -2083,28 +1966,17 @@ class HeartbeatEngine:
         code: HeartbeatReasonCode,
         retryable: bool,
     ) -> EffectResult:
-        projection_errors: list[str] = []
-        effective_code = code
-        failed = record
-        try:
-            failed = self.effect_ledger.fail(record.effect_id, reason, retryable)
-        except Exception as exc:
-            projection_errors.append(f"effect_failure_write:{type(exc).__name__}")
-            effective_code = HeartbeatReasonCode.EFFECT_REPLAY_ERROR
-        try:
-            self.cadence.record_effect_terminal(
-                record.effect_id, "failed", observed_at=self._clock()
-            )
-        except Exception as exc:
-            projection_errors.append(f"effect_terminal_write:{type(exc).__name__}")
-        return EffectResult(
-            False,
+        return _outcomes_fail_effect(
+            record,
             status,
-            effect_id=record.effect_id,
-            terminal=getattr(failed, "state", "failed"),
-            reason_code=effective_code,
-            degraded=bool(projection_errors),
-            projection_errors=tuple(dict.fromkeys(projection_errors)),
+            reason,
+            code,
+            retryable,
+            effect_ledger=self.effect_ledger,
+            cadence=self.cadence,
+            clock=self._clock,
+            result_type=EffectResult,
+            replay_error_code=HeartbeatReasonCode.EFFECT_REPLAY_ERROR,
         )
 
     def _delegated_completion_result(
@@ -2116,34 +1988,22 @@ class HeartbeatEngine:
         reason_code: HeartbeatReasonCode,
     ) -> EffectResult:
         """Project a delegated host terminal without claiming visible delivery."""
-
-        projection_errors: list[str] = []
-        try:
-            self.cadence.record_effect_terminal(
-                record.effect_id, terminal, observed_at=self._clock()
-            )
-        except Exception as exc:
-            projection_errors.append(f"effect_terminal_write:{type(exc).__name__}")
-        try:
-            self._record_settled_occurrence_terminal(record)
-        except StateError:
-            raise
-        except Exception as exc:
-            projection_errors.append(f"audit_write:{type(exc).__name__}")
-        return EffectResult(
-            False,
-            status,
-            effect_id=record.effect_id,
+        return _outcomes_delegated_completion_result(
+            record,
+            status=status,
             terminal=terminal,
             reason_code=reason_code,
-            degraded=bool(projection_errors),
-            projection_errors=tuple(projection_errors),
+            cadence=self.cadence,
+            clock=self._clock,
+            record_settled_occurrence_terminal=(
+                self._record_settled_occurrence_terminal
+            ),
+            result_type=EffectResult,
         )
 
     @staticmethod
     def _validate_receipt_time(record: EffectRecord, receipt: EffectReceipt) -> None:
-        if not record.created_at <= receipt.observed_at < record.expires_at:
-            raise ValueError("heartbeat receipt is outside the effect lifetime")
+        _outcomes_validate_receipt_time(record, receipt)
 
     def reconcile_heartbeat_delivery(
         self,
@@ -2159,102 +2019,19 @@ class HeartbeatEngine:
         accepts only delegated delivery intents and never treats a queue
         acknowledgement as visible contact.
         """
-
-        selected_status = status if status is not None else terminal
-        if type(selected_status) is not str or selected_status not in {
-            "verified",
-            "intentional_silence",
-            "unknown",
-            "failed",
-        }:
-            raise ValueError("delegated delivery status is unsupported")
-        if status is not None and terminal is not None and status != terminal:
-            raise ValueError("delegated delivery status aliases conflict")
-        if self.effect_ledger is None:
-            raise RuntimeError("effect ledger is unavailable")
-        record = self.effect_ledger.get(effect_id)
-        if record is None:
-            raise ValueError("heartbeat delivery effect is unknown")
-        if record.kind != "heartbeat_delivery":
-            raise ValueError("effect is not a heartbeat delivery")
-        if not _is_delegated_delivery(record):
-            raise ValueError("effect is not a delegated heartbeat delivery")
-        if selected_status == "verified":
-            if not isinstance(receipt, EffectReceipt):
-                raise TypeError("verified delegated delivery requires EffectReceipt")
-            self._validate_receipt_time(record, receipt)
-            if record.state == "verified":
-                if record.receipt != receipt:
-                    raise ValueError("conflicting delegated delivery receipt")
-                return self._effect_result(record, "verified", audit_terminal=True)
-            if record.state not in {"pending", "executed_unverified"}:
-                raise ValueError("delegated delivery is not awaiting settlement")
-            try:
-                verified = self.effect_ledger.verify(effect_id, receipt)
-            except Exception as exc:
-                raise ValueError("delegated delivery receipt mismatch") from exc
-            return self._effect_result(verified, "verified", audit_terminal=True)
-        if receipt is not None:
-            raise ValueError("non-verified delegated delivery cannot carry receipt")
-        if selected_status == "unknown":
-            if record.state not in {"pending", "executed_unverified"}:
-                raise ValueError("unknown delegated delivery is not pending")
-            result = self._effect_result(
-                record, "unknown", HeartbeatReasonCode.EFFECT_PENDING
-            )
-            return replace(result, terminal=record.state)
-        if selected_status == "intentional_silence":
-            if record.state == "failed":
-                if (
-                    record.reason != "intentional_silence"
-                    or record.retryable is not False
-                ):
-                    raise ValueError("conflicting delegated delivery completion")
-                return self._delegated_completion_result(
-                    record,
-                    status="intentional_silence",
-                    terminal="intentional_silence",
-                    reason_code=HeartbeatReasonCode.EFFECT_ERROR,
-                )
-            if record.state not in {"pending", "executed_unverified"}:
-                raise ValueError("delegated delivery is not awaiting settlement")
-            try:
-                failed = self.effect_ledger.fail(
-                    effect_id, "intentional_silence", retryable=False
-                )
-            except Exception as exc:
-                raise ValueError("delegated silence completion failed") from exc
-            return self._delegated_completion_result(
-                failed,
-                status="intentional_silence",
-                terminal="intentional_silence",
-                reason_code=HeartbeatReasonCode.EFFECT_ERROR,
-            )
-        if record.state == "failed":
-            if (
-                record.reason != _DELEGATED_FAILURE_REASON
-                or record.retryable is not False
-            ):
-                raise ValueError("conflicting delegated delivery completion")
-            return self._delegated_completion_result(
-                record,
-                status="failed",
-                terminal="failed",
-                reason_code=HeartbeatReasonCode.EFFECT_ERROR,
-            )
-        if record.state not in {"pending", "executed_unverified"}:
-            raise ValueError("delegated delivery is not awaiting settlement")
-        try:
-            failed = self.effect_ledger.fail(
-                effect_id, _DELEGATED_FAILURE_REASON, retryable=False
-            )
-        except Exception as exc:
-            raise ValueError("delegated delivery failure completion failed") from exc
-        return self._delegated_completion_result(
-            failed,
-            status="failed",
-            terminal="failed",
-            reason_code=HeartbeatReasonCode.EFFECT_ERROR,
+        return _outcomes_reconcile_delivery(
+            effect_id,
+            status,
+            receipt,
+            terminal=terminal,
+            effect_ledger=self.effect_ledger,
+            is_delegated_delivery=_is_delegated_delivery,
+            validate_receipt=self._validate_receipt_time,
+            project_effect_result=self._effect_result,
+            project_completion=self._delegated_completion_result,
+            pending_code=HeartbeatReasonCode.EFFECT_PENDING,
+            effect_error_code=HeartbeatReasonCode.EFFECT_ERROR,
+            delegated_failure_reason=_DELEGATED_FAILURE_REASON,
         )
 
     def reconcile_heartbeat_wake(
@@ -2269,28 +2046,13 @@ class HeartbeatEngine:
         the exact receipt for a ``heartbeat_wake`` intent and projects its
         terminal state into cadence.
         """
-
-        if self.effect_ledger is None:
-            raise RuntimeError("effect ledger is unavailable")
-        record = self.effect_ledger.get(effect_id)
-        if record is None:
-            raise ValueError("heartbeat wake effect is unknown")
-        if record.kind != "heartbeat_wake":
-            raise ValueError("effect is not a heartbeat wake")
-        if not isinstance(receipt, EffectReceipt):
-            raise TypeError("verified heartbeat wake requires EffectReceipt")
-        self._validate_receipt_time(record, receipt)
-        if record.state == "verified":
-            if record.receipt != receipt:
-                raise ValueError("conflicting heartbeat wake receipt")
-            return self._effect_result(record, "verified", audit_terminal=True)
-        if record.state not in {"pending", "executed_unverified"}:
-            raise ValueError("heartbeat wake is not awaiting settlement")
-        try:
-            verified = self.effect_ledger.verify(effect_id, receipt)
-        except Exception as exc:
-            raise ValueError("heartbeat wake receipt mismatch") from exc
-        return self._effect_result(verified, "verified", audit_terminal=True)
+        return _outcomes_reconcile_wake(
+            effect_id,
+            receipt,
+            effect_ledger=self.effect_ledger,
+            validate_receipt=self._validate_receipt_time,
+            project_effect_result=self._effect_result,
+        )
 
     def _existing_effect(
         self, record: EffectRecord, now: datetime
