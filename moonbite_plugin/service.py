@@ -13,6 +13,7 @@ from collections.abc import Callable, Iterable, Mapping
 from copy import deepcopy
 from datetime import date, datetime, timedelta
 from pathlib import Path
+from types import FunctionType as _FunctionType
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -81,14 +82,64 @@ from ._service.contracts import (
 from ._service.diary import DiaryUseCaseMethods as _DiaryUseCaseMethods
 from ._service.health import (
     HealthObservationMethods as _HealthObservationMethods,
-    _health_context,
-    _raise_observer_error,
-    _unavailable_observer_fact,
+    _health_context as _health_context_impl,
+    _raise_observer_error as _raise_observer_error_impl,
+    _unavailable_observer_fact as _unavailable_observer_fact_impl,
 )
 from ._service.memory_use_cases import MemoryUseCaseMethods as _MemoryUseCaseMethods
 from ._service.operations import RuntimeOperationMethods as _RuntimeOperationMethods
 from ._service.session_lifecycle import (
     SessionLifecycleMethods as _SessionLifecycleMethods,
+)
+
+
+def _facade_function(function, qualname: str):
+    """Bind extracted code to this module's historical runtime globals."""
+
+    rebound = _FunctionType(
+        function.__code__,
+        globals(),
+        function.__name__,
+        function.__defaults__,
+        function.__closure__,
+    )
+    rebound.__kwdefaults__ = function.__kwdefaults__
+    rebound.__annotations__ = dict(function.__annotations__)
+    rebound.__dict__.update(function.__dict__)
+    rebound.__doc__ = function.__doc__
+    rebound.__module__ = __name__
+    rebound.__qualname__ = qualname
+    return rebound
+
+
+def _facade_descriptor(name: str, descriptor):
+    qualname = f"MoonbiteRuntime.{name}"
+    if isinstance(descriptor, classmethod):
+        return classmethod(_facade_function(descriptor.__func__, qualname))
+    if isinstance(descriptor, staticmethod):
+        return staticmethod(_facade_function(descriptor.__func__, qualname))
+    if isinstance(descriptor, property):
+        return property(
+            None
+            if descriptor.fget is None
+            else _facade_function(descriptor.fget, qualname),
+            None
+            if descriptor.fset is None
+            else _facade_function(descriptor.fset, qualname),
+            None
+            if descriptor.fdel is None
+            else _facade_function(descriptor.fdel, qualname),
+            descriptor.__doc__,
+        )
+    return _facade_function(descriptor, qualname)
+
+
+_health_context = _facade_function(_health_context_impl, "_health_context")
+_raise_observer_error = _facade_function(
+    _raise_observer_error_impl, "_raise_observer_error"
+)
+_unavailable_observer_fact = _facade_function(
+    _unavailable_observer_fact_impl, "_unavailable_observer_fact"
 )
 
 
@@ -107,15 +158,10 @@ for _method_group in (
     for _method_name, _descriptor in _method_group.__dict__.items():
         if _method_name in {"__module__", "__dict__", "__weakref__", "__doc__"}:
             continue
-        setattr(MoonbiteRuntime, _method_name, _descriptor)
-        if isinstance(_descriptor, (classmethod, staticmethod)):
-            _function = _descriptor.__func__
-        elif isinstance(_descriptor, property):
-            _function = _descriptor.fget
-        else:
-            _function = _descriptor
-        if _function is not None and hasattr(_function, "__module__"):
-            _function.__module__ = __name__
-            _function.__qualname__ = f"MoonbiteRuntime.{_method_name}"
+        setattr(
+            MoonbiteRuntime,
+            _method_name,
+            _facade_descriptor(_method_name, _descriptor),
+        )
 
-del _descriptor, _function, _method_group, _method_name
+del _descriptor, _method_group, _method_name

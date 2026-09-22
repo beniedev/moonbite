@@ -119,10 +119,13 @@ def test_runtime_facade_preserves_descriptors_and_reflection():
             if name in {"__module__", "__dict__", "__weakref__", "__doc__"}:
                 continue
             public_descriptor = inspect.getattr_static(service.MoonbiteRuntime, name)
-            assert public_descriptor is descriptor
+            assert type(public_descriptor) is type(descriptor)
             implementation = _implementation(public_descriptor)
+            extracted_implementation = _implementation(descriptor)
+            assert implementation.__code__ is extracted_implementation.__code__
             assert implementation.__module__ == "moonbite_plugin.service"
             assert implementation.__qualname__ == f"MoonbiteRuntime.{name}"
+            assert implementation.__globals__ is vars(service)
             typing.get_type_hints(implementation)
             installed.add(name)
 
@@ -132,6 +135,7 @@ def test_runtime_facade_preserves_descriptors_and_reflection():
         if name not in {"__module__", "__dict__", "__weakref__", "__doc__"}
     }
     assert runtime_names == installed
+    assert service.MoonbiteRuntime.__mro__ == (service.MoonbiteRuntime, object)
     assert (
         inspect.signature(service.MoonbiteRuntime.__init__)
         .parameters["resolution_raw_config"]
@@ -161,3 +165,26 @@ def test_runtime_facade_keeps_cross_group_dynamic_dispatch(monkeypatch):
         "context": "panel context\n\nmemory context"
     }
     assert calls == [("panel", runtime), ("memory", runtime, "hello", None)]
+
+
+def test_runtime_facade_keeps_historical_module_global_dispatch(monkeypatch):
+    sentinel = service.datetime(2026, 9, 22, tzinfo=service.ZoneInfo("UTC"))
+    observed = []
+
+    class Panel:
+        def record_sensor(self, name, value, **kwargs):
+            observed.append((name, value, kwargs))
+
+    runtime = object.__new__(service.MoonbiteRuntime)
+    runtime.config = {"modules": {"panel": True}}
+    runtime.panel = Panel()
+    monkeypatch.setattr(service, "utc_now", lambda: sentinel)
+
+    runtime.observe_chat_turn()
+
+    assert observed[0][0] == "chat_rhythm"
+    assert observed[0][1] == {"last_turn_at": sentinel.isoformat()}
+    assert service.MoonbiteRuntime._project_autonomy_afterglow.__globals__[
+        "logger"
+    ] is (service.logger)
+    assert service.logger.name == "moonbite_plugin.service"
