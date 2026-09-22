@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import json
 import threading
 from contextlib import contextmanager
@@ -2400,6 +2401,12 @@ def test_projection_failures_are_degraded_without_erasing_verified_truth(tmp_pat
     assert any("audit_write" in item for item in audit_failure.projection_errors)
 
 
+def test_cadence_observer_status_retains_public_read_only_contract():
+    assert inspect.getdoc(HeartbeatCadence.observer_status) == (
+        "Project cadence state without normalising, pruning, or locking."
+    )
+
+
 def test_observer_status_pristine_and_corrupt_cadence_are_read_only(tmp_path):
     cadence = HeartbeatCadence(tmp_path, clock=lambda: NOW)
 
@@ -2465,9 +2472,19 @@ def test_engine_observer_separates_visible_delivery_from_internal_wake(tmp_path)
     runtime._reconcile_pending = lambda *args, **kwargs: (_ for _ in ()).throw(
         AssertionError("observer must not reconcile heartbeat")
     )
+    before = {
+        path.name: (path.read_bytes(), path.stat().st_mtime_ns)
+        for path in tmp_path.iterdir()
+        if path.is_file()
+    }
 
     facts = runtime.observer_status(target_date=NOW.date(), now=NOW)
     by_key = {fact.key: fact for fact in facts}
+    after = {
+        path.name: (path.read_bytes(), path.stat().st_mtime_ns)
+        for path in tmp_path.iterdir()
+        if path.is_file()
+    }
 
     assert by_key["heartbeat:contact:verified_visible"].state == "neutral"
     assert "heartbeat:contact:wake" not in by_key
@@ -2475,6 +2492,7 @@ def test_engine_observer_separates_visible_delivery_from_internal_wake(tmp_path)
     assert all(
         "expected" not in fact.code and "missed" not in fact.code for fact in facts
     )
+    assert after == before
 
 
 @pytest.mark.parametrize("port_kind", ("mapping", "string", "non_iterable", "mixed"))
