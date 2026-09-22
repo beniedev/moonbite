@@ -5,6 +5,7 @@ import typing
 
 from moonbite_plugin import memory_orchestration
 from moonbite_plugin._memory_orchestration import contracts
+from moonbite_plugin._memory_orchestration import exposure
 from moonbite_plugin._memory_orchestration import sources
 
 
@@ -73,6 +74,11 @@ def test_public_exports_and_moved_type_identity_remain_stable() -> None:
         "moonbite_plugin.memory_orchestration"
     )
     assert memory_orchestration.SourceRegistry.__qualname__ == "SourceRegistry"
+    for name in ("ExposureLedger", "ExposurePlan", "ExposurePolicy"):
+        public = getattr(memory_orchestration, name)
+        assert public is getattr(exposure, name)
+        assert public.__module__ == "moonbite_plugin.memory_orchestration"
+        assert public.__qualname__ == name
 
 
 def test_moved_contract_signatures_and_type_hints_remain_resolvable() -> None:
@@ -114,6 +120,22 @@ def test_moved_contract_signatures_and_type_hints_remain_resolvable() -> None:
         "SourceRegistry.exact_open": (
             "(self, candidate: 'SourceCandidate', *, max_bytes: 'int' = 65536) "
             "-> 'SourceMaterial | None'"
+        ),
+        "ExposureLedger.record_selected": (
+            "(self, candidate: 'SourceCandidate', *, context: 'ExposureContext', "
+            "exposure_id: 'str | None' = None, event_id: 'str | None' = None, "
+            "now: 'datetime | None' = None) -> 'ExposureRecord'"
+        ),
+        "ExposureLedger.observer_status": (
+            "(self, *, target_date: 'date', now: 'datetime') "
+            "-> 'tuple[ObservationFact, ...]'"
+        ),
+        "ExposurePolicy.choose": (
+            "(self, candidates: 'Iterable[SourceCandidate]', *, "
+            "context: 'ExposureContext', ledger: 'ExposureLedger', "
+            "now: 'datetime', continuity_policy: "
+            "'Callable[[str, str], bool] | None' = None, "
+            "first_turn: 'bool | None' = None) -> \"'ExposurePlan'\""
         ),
     }
     for path, signature in expected.items():
