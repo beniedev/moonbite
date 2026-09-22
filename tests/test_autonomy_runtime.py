@@ -12,6 +12,7 @@ from moonbite_plugin.autonomy import (
     ActivityResult,
     ActivityProvider,
     AllowAutonomyJudge,
+    AutonomyContext,
     AutonomyDecision,
     AutonomyEngine,
     AutonomyExecutionRequest,
@@ -1338,6 +1339,38 @@ def test_cooldown_and_daily_limit_use_eventbus_audit(tmp_path):
     assert second.reason == "no_eligible_provider"
     assert len(calls) == 1
     assert len(engine.bus.read_audit()) == 2
+
+
+def test_eligibility_keeps_dynamic_record_time_dispatch(tmp_path, monkeypatch):
+    provider = ActivityProvider(
+        "chosen",
+        lambda _request: None,
+        cooldown=3600,
+    )
+    engine, _controls = make_engine(tmp_path, [provider])
+    record = object()
+    monkeypatch.setattr(
+        engine,
+        "_provider_history",
+        lambda _name, exclude_effect_id=None: [record],
+    )
+    seen = []
+
+    def recent(value):
+        seen.append(value)
+        return NOW
+
+    monkeypatch.setattr(AutonomyEngine, "_record_time", staticmethod(recent))
+    assert engine._eligible_reason(provider, {}, AutonomyContext(NOW, {})) == "cooldown"
+    assert seen == [record]
+
+    def old(value):
+        seen.append(value)
+        return NOW - timedelta(hours=2)
+
+    monkeypatch.setattr(AutonomyEngine, "_record_time", staticmethod(old))
+    assert engine._eligible_reason(provider, {}, AutonomyContext(NOW, {})) is None
+    assert seen == [record, record]
 
 
 def test_repeat_and_cost_limits_are_bounded(tmp_path):

@@ -23,6 +23,15 @@ from types import MappingProxyType
 from typing import Any, Callable, Protocol
 from urllib.parse import quote, unquote
 
+from ._autonomy.admission import (
+    audit_history as _admission_audit_history,
+    eligible as _admission_eligible,
+    eligible_reason as _admission_eligible_reason,
+    eligible_with_reasons as _admission_eligible_with_reasons,
+    provider_history as _admission_provider_history,
+    validate_provider_settings as _admission_validate_provider_settings,
+    weighted_selection as _admission_weighted_selection,
+)
 from ._autonomy.observation import (
     _autonomy_fact,
     _autonomy_integrity,
@@ -809,65 +818,16 @@ class AutonomyEngine:
         cannot be bypassed by a failed audit write.
         """
 
-        rows: list[dict[str, Any]] = []
-        seen_effect_ids: set[str] = set()
-        try:
-            events = self.bus.read_audit()
-        except Exception:
-            events = ()
-        for event in events:
-            if getattr(event, "kind", None) != "audit.autonomy":
-                continue
-            payload = getattr(event, "payload", {})
-            if not isinstance(payload, Mapping):
-                continue
-            if payload.get("status") not in {
-                "completed",
-                "executed_unverified",
-                "failed",
-            }:
-                continue
-            provider = payload.get("provider")
-            if not isinstance(provider, str) or not provider:
-                continue
-            row = dict(payload)
-            row["created_at"] = getattr(event, "created_at", None)
-            rows.append(row)
-
-            effect_id = payload.get("effect_id")
-            if isinstance(effect_id, str) and effect_id:
-                seen_effect_ids.add(effect_id)
-
-        try:
-            records = self.effect_ledger.records()
-        except Exception:
-            if rows:
-                return rows
-            raise
-        record_iter = records.values() if isinstance(records, Mapping) else records
-        for record in record_iter:
-            if self._record_value(record, "kind") != AUTONOMY_EFFECT_KIND:
-                continue
-            effect_id = self._record_value(record, "effect_id")
-            if not isinstance(effect_id, str) or not effect_id:
-                continue
-            if effect_id in seen_effect_ids:
-                continue
-            provider = self._record_provider(record)
-            if not provider:
-                continue
-            state = self._record_state(record)
-            rows.append(
-                {
-                    "provider": provider,
-                    "status": "completed" if state == "verified" else state,
-                    "effect_id": effect_id,
-                    "source_event_id": self._record_value(record, "source_event_id"),
-                    "idempotency_key": self._record_value(record, "idempotency_key"),
-                    "created_at": self._record_value(record, "created_at"),
-                }
-            )
-        return rows
+        return _admission_audit_history(
+            bus=self.bus,
+            effect_ledger=self.effect_ledger,
+            effect_kind=AUTONOMY_EFFECT_KIND,
+            record_value=lambda record, key, default=None: self._record_value(
+                record, key, default
+            ),
+            record_provider=lambda record: self._record_provider(record),
+            record_state=lambda record: self._record_state(record),
+        )
 
     @staticmethod
     def _record_provider(record: Any) -> str | None:
@@ -894,28 +854,15 @@ class AutonomyEngine:
     def _provider_history(
         self, name: str, *, exclude_effect_id: str | None = None
     ) -> list[Any]:
-        def is_excluded(record: Any) -> bool:
-            return (
-                exclude_effect_id is not None
-                and self._record_value(record, "effect_id") == exclude_effect_id
-            )
-
-        rows = [
-            record
-            for record in self._audit_history()
-            if self._record_provider(record) == name and not is_excluded(record)
-        ]
-        latest_by_effect: dict[str, Any] = {}
-        without_effect: list[Any] = []
-        for record in rows:
-            effect_id = self._record_value(record, "effect_id")
-            if is_excluded(record):
-                continue
-            if isinstance(effect_id, str) and effect_id:
-                latest_by_effect[effect_id] = record
-            else:
-                without_effect.append(record)
-        return without_effect + list(latest_by_effect.values())
+        return _admission_provider_history(
+            name,
+            exclude_effect_id=exclude_effect_id,
+            audit_history=lambda: self._audit_history(),
+            record_value=lambda record, key, default=None: self._record_value(
+                record, key, default
+            ),
+            record_provider=lambda record: self._record_provider(record),
+        )
 
     def _bound_control_id(self, effect_id: str) -> str | None:
         for row in self._audit_history():
@@ -955,88 +902,15 @@ class AutonomyEngine:
     def _validate_provider_settings(
         settings: Mapping[str, Mapping[str, Any]],
     ) -> None:
-        if not isinstance(settings, Mapping):
-            raise _ProviderSettingsError(None, "settings")
-        for name, provider_settings in settings.items():
-            try:
-                provider_name = _bounded(name, "provider name", max_bytes=128)
-            except (TypeError, ValueError) as exc:
-                raise _ProviderSettingsError(None, "provider_name") from exc
-            if not isinstance(provider_settings, Mapping):
-                raise _ProviderSettingsError(provider_name, "settings")
-
-            known_fields = {
-                "enabled",
-                "weight",
-                "allowed_sources",
-                "allowed_channels",
-                "cooldown",
-                "effect_ttl",
-                "daily_limit",
-                "repeat_limit",
-                "cost_budget",
-                "cost",
-                "cost_class",
-            }
-            if any(field not in known_fields for field in provider_settings):
-                raise _ProviderSettingsError(provider_name, "unknown")
-
-            if (
-                "enabled" in provider_settings
-                and type(provider_settings["enabled"]) is not bool
-            ):
-                raise _ProviderSettingsError(provider_name, "enabled")
-            if "weight" in provider_settings:
-                weight = provider_settings["weight"]
-                if type(weight) is not int or not 1 <= weight <= 100:
-                    raise _ProviderSettingsError(provider_name, "weight")
-            for field_name in ("allowed_sources", "allowed_channels"):
-                if field_name in provider_settings:
-                    try:
-                        _optional_gate_set(provider_settings[field_name], field_name)
-                    except (TypeError, ValueError) as exc:
-                        raise _ProviderSettingsError(provider_name, field_name) from exc
-
-            for field_name in ("cooldown", "effect_ttl"):
-                if field_name not in provider_settings:
-                    continue
-                value = provider_settings[field_name]
-                if value is None:
-                    continue
-                try:
-                    seconds = (
-                        value.total_seconds()
-                        if isinstance(value, timedelta)
-                        else _nonnegative_number(value, field_name)
-                    )
-                except (TypeError, ValueError) as exc:
-                    raise _ProviderSettingsError(provider_name, field_name) from exc
-                if (
-                    seconds is None
-                    or seconds < 0
-                    or seconds > 31 * 24 * 60 * 60
-                    or field_name == "effect_ttl"
-                    and seconds <= 0
-                ):
-                    raise _ProviderSettingsError(provider_name, field_name)
-
-            for field_name in (
-                "daily_limit",
-                "repeat_limit",
-                "cost_budget",
-                "cost",
-            ):
-                if field_name not in provider_settings:
-                    continue
-                try:
-                    _positive_limit(provider_settings[field_name], field_name)
-                except (TypeError, ValueError) as exc:
-                    raise _ProviderSettingsError(provider_name, field_name) from exc
-
-            if "cost_class" in provider_settings:
-                cost_class = provider_settings["cost_class"]
-                if type(cost_class) is not str or cost_class not in _COST_UNITS:
-                    raise _ProviderSettingsError(provider_name, "cost_class")
+        return _admission_validate_provider_settings(
+            settings,
+            bounded=_bounded,
+            optional_gate_set=_optional_gate_set,
+            nonnegative_number=_nonnegative_number,
+            positive_limit=_positive_limit,
+            settings_error=_ProviderSettingsError,
+            cost_units=_COST_UNITS,
+        )
 
     def _eligible_reason(
         self,
@@ -1046,158 +920,55 @@ class AutonomyEngine:
         *,
         exclude_effect_id: str | None = None,
     ) -> str | None:
-        facts = context.facts
-        source = facts.get("source", facts.get("source_kind"))
-        channel = facts.get("channel")
-        allowed_sources = _optional_gate_set(
-            self._setting(
-                provider, provider_settings, "allowed_sources", provider.allowed_sources
+        return _admission_eligible_reason(
+            provider,
+            provider_settings,
+            context,
+            exclude_effect_id=exclude_effect_id,
+            optional_gate_set=_optional_gate_set,
+            setting=lambda selected, values, name, default: self._setting(
+                selected, values, name, default
             ),
-            "allowed_sources",
-        )
-        allowed_channels = _optional_gate_set(
-            self._setting(
-                provider,
-                provider_settings,
-                "allowed_channels",
-                provider.allowed_channels,
+            provider_history=lambda name, exclude_effect_id=None: (
+                self._provider_history(name, exclude_effect_id=exclude_effect_id)
             ),
-            "allowed_channels",
+            eligibility_error=ProviderEligibilityError,
+            cooldown_seconds=lambda value: self._cooldown_seconds(value),
+            record_time=lambda record: self._record_time(record),
+            positive_limit=_positive_limit,
+            record_value=lambda record, key, default=None: self._record_value(
+                record, key, default
+            ),
+            cost_units=_COST_UNITS,
         )
-        if allowed_sources and source not in allowed_sources:
-            return "source_not_allowed"
-        if allowed_channels and channel not in allowed_channels:
-            return "channel_not_allowed"
-
-        try:
-            history = self._provider_history(
-                provider.name, exclude_effect_id=exclude_effect_id
-            )
-        except Exception as exc:
-            raise ProviderEligibilityError(provider.name, exc) from exc
-        now = context.now
-        cooldown = self._setting(
-            provider, provider_settings, "cooldown", provider.cooldown
-        )
-        if cooldown is not None:
-            seconds = self._cooldown_seconds(cooldown)
-            recent = [self._record_time(record) for record in history]
-            recent = [item for item in recent if item is not None]
-            if recent and (now - max(recent)).total_seconds() < seconds:
-                return "cooldown"
-
-        daily_limit = self._setting(
-            provider, provider_settings, "daily_limit", provider.daily_limit
-        )
-        if daily_limit is not None:
-            daily_limit = _positive_limit(daily_limit, "daily_limit")
-            count = sum(
-                1
-                for record in history
-                if self._record_time(record) is not None
-                and self._record_time(record).date() == now.date()
-            )
-            if count >= daily_limit:
-                return "daily_limit"
-
-        repeat_limit = self._setting(
-            provider, provider_settings, "repeat_limit", provider.repeat_limit
-        )
-        if repeat_limit is not None:
-            repeat_limit = _positive_limit(repeat_limit, "repeat_limit")
-            repeat_key = facts.get("repeat_key", facts.get("source_event_id"))
-            if repeat_key is not None:
-                repeated = sum(
-                    1
-                    for record in history
-                    if self._record_value(record, "source_event_id") == repeat_key
-                )
-                if repeated >= repeat_limit:
-                    return "repeat_limit"
-
-        cost_class = self._setting(
-            provider, provider_settings, "cost_class", provider.cost_class
-        )
-        units = _COST_UNITS.get(str(cost_class).casefold(), 1)
-        cost = self._setting(provider, provider_settings, "cost", units)
-        try:
-            units = max(1, int(cost))
-        except (TypeError, ValueError):
-            units = 1
-        remaining = facts.get("cost_budget_remaining", facts.get("cost_budget"))
-        if remaining is not None:
-            try:
-                if float(remaining) < units:
-                    return "cost_budget"
-            except (TypeError, ValueError):
-                return "cost_budget"
-        budget = self._setting(
-            provider, provider_settings, "cost_budget", provider.cost_budget
-        )
-        if budget is not None:
-            budget = _positive_limit(budget, "cost_budget")
-            spent = 0
-            for record in history:
-                when = self._record_time(record)
-                if when is not None and when.date() == now.date():
-                    spent += units
-            if spent + units > budget:
-                return "cost_budget"
-
-        try:
-            if not provider.eligible(context):
-                return "provider_ineligible"
-        except Exception as exc:
-            raise ProviderEligibilityError(provider.name, exc) from exc
-        return None
 
     def _eligible(
         self,
         settings: Mapping[str, Mapping[str, Any]],
         context: AutonomyContext,
     ) -> list[tuple[str, int]]:
-        result: list[tuple[str, int]] = []
-        for name, provider_settings in sorted(settings.items()):
-            if provider_settings.get("enabled") is not True:
-                continue
-            provider = self.registry.get(name)
-            if provider is None:
-                continue
-            reason = self._eligible_reason(provider, provider_settings, context)
-            if reason is not None:
-                continue
-            try:
-                weight = int(provider_settings.get("weight", 1))
-            except (TypeError, ValueError):
-                weight = 1
-            result.append((name, max(1, min(weight, 100))))
-        return result
+        return _admission_eligible(
+            settings,
+            context,
+            registry_get=lambda name: self.registry.get(name),
+            eligible_reason=lambda provider, provider_settings, selected_context: (
+                self._eligible_reason(provider, provider_settings, selected_context)
+            ),
+        )
 
     def _eligible_with_reasons(
         self,
         settings: Mapping[str, Mapping[str, Any]],
         context: AutonomyContext,
     ) -> tuple[list[tuple[str, int]], dict[str, str]]:
-        candidates: list[tuple[str, int]] = []
-        reasons: dict[str, str] = {}
-        for name, provider_settings in sorted(settings.items()):
-            if provider_settings.get("enabled") is not True:
-                reasons[name] = "disabled"
-                continue
-            provider = self.registry.get(name)
-            if provider is None:
-                reasons[name] = "provider_not_registered"
-                continue
-            reason = self._eligible_reason(provider, provider_settings, context)
-            if reason is not None:
-                reasons[name] = reason
-                continue
-            try:
-                weight = int(provider_settings.get("weight", 1))
-            except (TypeError, ValueError):
-                weight = 1
-            candidates.append((name, max(1, min(weight, 100))))
-        return candidates, reasons
+        return _admission_eligible_with_reasons(
+            settings,
+            context,
+            registry_get=lambda name: self.registry.get(name),
+            eligible_reason=lambda provider, provider_settings, selected_context: (
+                self._eligible_reason(provider, provider_settings, selected_context)
+            ),
+        )
 
     @staticmethod
     def _record_state(record: Any) -> str:
@@ -1521,25 +1292,7 @@ class AutonomyEngine:
     ) -> str:
         """Choose reproducibly from bounded weights for one occurrence."""
 
-        ordered = sorted(candidates)
-        identity = json.dumps(
-            {
-                "candidates": ordered,
-                "occurrence": occurrence_identity,
-                "selection_contract": "moon.autonomy.weighted.v1",
-            },
-            ensure_ascii=True,
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode("utf-8")
-        slot = int.from_bytes(hashlib.sha256(identity).digest()[:8], "big") % sum(
-            weight for _name, weight in ordered
-        )
-        for name, weight in ordered:
-            if slot < weight:
-                return name
-            slot -= weight
-        raise AssertionError("bounded weighted selection exhausted")
+        return _admission_weighted_selection(candidates, occurrence_identity)
 
     @staticmethod
     def _receipt_from_output(output: Any) -> tuple[EffectReceipt | None, str | None]:
