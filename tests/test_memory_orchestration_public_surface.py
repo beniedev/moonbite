@@ -8,6 +8,7 @@ from moonbite_plugin._memory_orchestration import contracts
 from moonbite_plugin._memory_orchestration import exposure
 from moonbite_plugin._memory_orchestration import maintenance
 from moonbite_plugin._memory_orchestration import sources
+from moonbite_plugin._memory_orchestration import writer
 
 
 EXPECTED_EXPORTS = (
@@ -85,6 +86,12 @@ def test_public_exports_and_moved_type_identity_remain_stable() -> None:
         assert public is getattr(maintenance, name)
         assert public.__module__ == "moonbite_plugin.memory_orchestration"
         assert public.__qualname__ == name
+    for name in ("WriterCoordinator", "WriterHandoff", "WriterRequest"):
+        public = getattr(memory_orchestration, name)
+        assert public is getattr(writer, name)
+        assert public.__module__ == "moonbite_plugin.memory_orchestration"
+        assert public.__qualname__ == name
+    assert memory_orchestration.WRITER_OPERATIONS is writer.WRITER_OPERATIONS
 
 
 def test_moved_contract_signatures_and_type_hints_remain_resolvable() -> None:
@@ -163,6 +170,34 @@ def test_moved_contract_signatures_and_type_hints_remain_resolvable() -> None:
             "-> 'Mapping[str, Any]'"
         ),
         "MemoryMaintenanceFacade.observer_status": (
+            "(self, *, target_date: 'date', now: 'datetime') "
+            "-> 'tuple[ObservationFact, ...]'"
+        ),
+        "WriterRequest": (
+            "(effect_id: 'str', operation: 'str', source_event_id: 'str', "
+            "idempotency_key: 'str', epoch_id: 'str', content_sha256: 'str', "
+            "content_length: 'int', attempt: 'int', content: 'Any') -> None"
+        ),
+        "WriterHandoff": (
+            "(operation: 'str', effect_id: 'str', record: 'Any', "
+            "error_type: 'str | None' = None, request: 'WriterRequest | None' = None) "
+            "-> None"
+        ),
+        "WriterCoordinator.create_intent": (
+            "(self, operation: 'str', *, source_event_id: 'str', "
+            "idempotency_key: 'str', epoch_id: 'str', content: 'Any', "
+            "expires_at: 'datetime | None' = None, ttl: 'timedelta' = "
+            "datetime.timedelta(seconds=300), effect_id: 'str | None' = None) "
+            "-> 'EffectRecord'"
+        ),
+        "WriterCoordinator.handoff": (
+            "(self, effect_id: 'str', writer: 'Any', *, content: 'Any' = None, "
+            "operation: 'str | None' = None) -> 'WriterHandoff'"
+        ),
+        "WriterCoordinator.verify": (
+            "(self, effect_id: 'str', receipt: 'EffectReceipt') -> 'WriterHandoff'"
+        ),
+        "WriterCoordinator.observer_status": (
             "(self, *, target_date: 'date', now: 'datetime') "
             "-> 'tuple[ObservationFact, ...]'"
         ),
