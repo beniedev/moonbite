@@ -188,13 +188,17 @@ def effect_plan_rows(
 
 def plan_public_epoch_candidates(
     value: Mapping[str, Any],
+    *,
+    effect_key_matches: Callable[[Mapping[str, Any], str | None], bool] | None = None,
 ) -> frozenset[str | None]:
+    if effect_key_matches is None:
+        effect_key_matches = plan_effect_key_matches
     internal_epoch = value["epoch_id"]
     candidates = {
         public_epoch
         for public_epoch in (None, internal_epoch)
         if internal_epoch == (public_epoch or "heartbeat")
-        and plan_effect_key_matches(value, public_epoch)
+        and effect_key_matches(value, public_epoch)
     }
     return frozenset(candidates)
 

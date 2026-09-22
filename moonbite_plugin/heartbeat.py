@@ -1083,7 +1083,10 @@ class HeartbeatEngine:
     def _plan_public_epoch_candidates(
         value: Mapping[str, Any],
     ) -> frozenset[str | None]:
-        return _plans_plan_public_epoch_candidates(value)
+        return _plans_plan_public_epoch_candidates(
+            value,
+            effect_key_matches=HeartbeatEngine._plan_effect_key_matches,
+        )
 
     @classmethod
     def _infer_legacy_plan_public_epoch(
