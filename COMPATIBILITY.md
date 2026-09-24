@@ -92,6 +92,20 @@ The current host-injected ownership contract is
 bundle contract is rejected rather than treated as a partial compatibility
 match; session ledgers remain append-only and are not rewritten.
 
+### Public Python facade compatibility
+
+The Memory orchestration and Conversation modularization keeps documented
+imports from `moonbite_plugin.memory_orchestration` and
+`moonbite_plugin.conversation`, along with pickle identity, callable
+signatures, and resolvable type annotations. These are separate compatibility
+contracts from source-file reflection.
+
+The concrete class definitions live in private implementation modules. As a
+result, class-level `inspect.getsource()` on a class re-exported by a public
+facade may not find a class definition in that facade file. Moonbite does not
+promise complete reflection compatibility, and consumers must not use facade
+source layout as a runtime API.
+
 ---
 
 ### Wake registration and settlement

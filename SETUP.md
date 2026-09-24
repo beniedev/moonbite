@@ -5,11 +5,11 @@ persistent runtime plugin for [Hermes Agent](https://github.com/NousResearch/her
 as well as how to set up a local development and testing environment.
 
 > [!NOTE]
-> **0.1.0 Alpha 1 source preview:**
+> **0.1.0 Alpha 2 source preview:**
 > Moonbite is not published to a package registry. Install from source through
-> Hermes, pin a full 40-character Git commit SHA, and validate within an isolated
-> `HERMES_HOME` before touching a live profile. Do not use floating `main` as a
-> stable target.
+> Hermes, pin the immutable `v0.1.0a2` tag after publication or a reviewed full
+> 40-character Git commit SHA, and validate within an isolated `HERMES_HOME`
+> before touching a live profile. Do not use floating `main` as a stable target.
 
 ---
 
@@ -40,7 +40,17 @@ To operate Moonbite safely, understand that the runtime distinguishes five indep
 
 ### 2.2 Install pinned commit in disabled state
 
-Install Moonbite into your Hermes environment pinned to an immutable 40-character Git commit using `--no-enable`:
+Install Moonbite into your Hermes environment using `--no-enable`. After the
+GitHub prerelease is published, pin its immutable tag:
+
+```bash
+hermes plugins install beniedev/moonbite \
+  --ref "v0.1.0a2" \
+  --no-enable
+```
+
+Before publication or when reviewing an exact candidate, pin the approved
+40-character Git commit instead:
 
 ```bash
 export MOONBITE_COMMIT="<40-character-commit-sha>"
@@ -54,7 +64,10 @@ If the security scan returns `caution`, inspect and present its findings. Add
 installers must not infer consent, and `dangerous` findings remain blocking.
 
 > [!IMPORTANT]
-> Replace `<40-character-commit-sha>` with a maintainer-reviewed commit that contains the version you intend to install. The recorded historical baseline is not an install recommendation.
+> Replace `<40-character-commit-sha>` with a maintainer-reviewed commit that
+> contains the version you intend to install. Before using a tag, verify that it
+> resolves to the approved release commit. A recorded historical baseline or a
+> floating branch is not an install recommendation.
 
 ### 2.3 Run pre-enable manifest doctor
 
@@ -281,17 +294,37 @@ done
 
 ### 5.1 Rollback
 
-To revert configuration changes, restore the previous Moonbite entry, restart any
-long-running Hermes process, and run `hermes moonbite doctor`. To return to an
-earlier plugin revision, reinstall its reviewed full SHA with `--force --ref`,
-then repeat the same restart and diagnostic steps. Keep the previous SHA and
-configuration backup before each preview upgrade.
+Before each preview upgrade, stop or pause every process that can write the
+Moonbite state directory and take one consistent snapshot of the complete
+state directory plus the matching Moonbite configuration. Keep that snapshot
+and the previous reviewed commit SHA until the upgraded deployment completes
+its own natural validation cycle.
+
+To revert configuration without changing the state reader, restore the
+previous Moonbite entry while writers are stopped, restart long-running Hermes
+processes, and run `hermes moonbite doctor`. To return to an earlier plugin
+revision, first disable Moonbite, then reinstall the reviewed full SHA in a
+disabled state:
+
+```bash
+hermes plugins disable moonbite
+hermes plugins install beniedev/moonbite \
+  --force \
+  --ref "<previous-40-character-commit-sha>" \
+  --no-enable
+```
+
+Restore state only when the older reader requires it, then repeat the normal
+doctor, enablement, fresh-process restart, and status checks. Do not restore a
+snapshot while any Moonbite writer is running.
 
 This change adds `moon.session.turn_terminal.v1` rows to the existing session
-lifecycle ledger. Moonbite `0.1.0a1` cannot read those rows. Take a state
-snapshot before upgrading, and do not run an older binary against state that
-contains the new terminal schema. A code rollback must either retain the new
-reader or restore the pre-upgrade state snapshot.
+lifecycle ledger and may upgrade valid Heartbeat cadence state to schema v4.
+Moonbite `0.1.0a1` cannot read those terminal rows and must not be pointed at
+cadence state after a v4 write. A code-only rollback is not sufficient: either
+retain the Alpha 2 reader, or stop all Moonbite writers and restore the
+consistent pre-upgrade state and configuration snapshot before starting the
+Alpha 1 code.
 
 ### 5.2 Disabling or removing the plugin
 

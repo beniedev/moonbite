@@ -7,8 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.0a2]
+
 ### Added
 
+- **Scenario pack resolver foundation:** packaged data-only overlays can be
+  validated and merged as `defaults < selected pack < user overrides`, with
+  per-leaf provenance and fail-closed rejection of unknown or host-owned
+  fields. The bundled catalog remains empty in this release; no scenario pack
+  is selected or enabled by default.
+- **CJK memory search:** lexical recall now falls back to CJK bigrams when text
+  has no useful whitespace-delimited terms.
+- **Per-kind daily anchors:** Heartbeat cadence records daily anchors by kind,
+  so one daily candidate cannot consume another kind's occurrence.
 - **Host wake composition:** an offline registration example uses the loaded plugin's own types, submits through an injected `WakeSink`, and reconciles synthetic completion evidence. Setup and contract checks distinguish same-process Gateway injection, current-CLI queues, and host-owned cross-process relays.
 - **Session recovery:** `hermes moonbite session status` lists exact open turns, and `session repair` appends an idempotent `abandoned` terminal for the specified current turn without fabricating a successful model response.
 - **HermesHostAdapter:** the public integration boundary now consumes Hermes `on_session_end` and normalizes successful, failed, interrupted, incomplete, session-rotation, and shutdown exits into canonical lifecycle evidence. The pinned Hermes 0.20.5 commit and official v0.21.0 release share the same tested contract.
@@ -30,11 +41,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Multi-effect Heartbeat settlement:** the complete expected effect set is persisted and its intents are created before the first adapter action. An early receipt cannot settle the whole occurrence while another required effect is missing or pending.
 - **Receipt replay identity:** synchronous completion and later reconciliation use the same public occurrence identity, including explicit epochs that match internal defaults. Audit replay checks the complete stored effect set and rejects contradictory nested receipts or terminal statuses. A verified effect claim requires durable effect evidence. Legitimate outcomes without effects, including Heartbeat completion and Autonomy skips or early failures, remain supported.
 
+### Changed
+
+- **Focused internal modules:** Heartbeat cadence, planning, recovery,
+  execution, outcomes, and observation; Autonomy admission, execution,
+  recovery, outcomes, and observation; Memory orchestration; Conversation;
+  and runtime service responsibilities now live in smaller private modules.
+  The existing public modules remain the supported import facades.
+- **Public facade compatibility:** the Memory orchestration and Conversation
+  refactors preserve their documented public imports, pickle identities,
+  callable signatures, and resolvable type annotations. The concrete class
+  definitions now live in private implementation modules, so class-level
+  `inspect.getsource()` through a public facade is not guaranteed.
+
 ### Compatibility
 
+- The package version and plugin version are both `0.1.0a2`. The separate
+  installer manifest schema remains `manifest_version: 1`; runtime state
+  schema identifiers keep their own independent versioning.
 - Injected pathless cadence owners no longer admit delivery or wake effects without a durable plan root. They fail before cadence consumption; no-effect decisions remain supported.
 - Recovery does not rewrite historical audit or effect rows. Legacy Heartbeat occurrences without evidence of a complete effect set remain pending; legacy Autonomy identities that cannot be distinguished from an explicit epoch fail closed. These outcomes must not be interpreted as completed work or retried under a new occurrence identity.
 - Session ledgers may now contain additive `moon.session.turn_terminal.v1` rows. Moonbite `0.1.0a1` cannot read upgraded state; take a state snapshot before upgrading and retain the new reader or restore that snapshot when rolling back.
+- Heartbeat cadence writes upgrade valid legacy cadence state to schema v4.
+  Moonbite `0.1.0a1` must not be pointed at a state directory after a v4 write;
+  rolling code back to Alpha 1 also requires restoring the consistent
+  pre-upgrade state snapshot.
 
 ## [0.1.0a1] - 2026-08-28
 

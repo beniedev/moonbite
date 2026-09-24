@@ -205,7 +205,7 @@ See [docs/features/PANEL.md](docs/features/PANEL.md).
 ## Project status
 
 ```text
-Status: 0.1.0 Alpha 1 public preview
+Package version: 0.1.0a2
 Supported host: Hermes Agent only
 Distribution: source-only GitHub prerelease
 Support: best effort
