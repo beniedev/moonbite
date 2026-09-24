@@ -53,6 +53,22 @@ The compatibility fixtures also mark behavior that a generic plugin must not fak
 Moonbite exposes ports for these concerns. It must not replace a deployment's
 dispatcher, cadence ledger, or delivery path with a parallel control plane.
 
+## Alpha 1 to Alpha 2 state boundary
+
+Before upgrading an established deployment from `0.1.0a1`, stop or pause every
+process that can write the Moonbite state directory and take one consistent
+snapshot of that complete directory plus the matching Moonbite configuration.
+Retain the snapshot until the upgraded deployment has passed its own natural
+validation cycle.
+
+Alpha 2 may append `moon.session.turn_terminal.v1` rows and upgrade valid
+Heartbeat cadence state to schema v4. Alpha 1 cannot read the new terminal rows
+and must not be pointed at cadence state after a v4 write. Reinstalling Alpha 1
+code alone is therefore not a valid rollback. A rollback to the Alpha 1 reader
+requires all Moonbite writers to be stopped and the pre-upgrade state and
+configuration snapshot to be restored together before the older code starts.
+Disabling or uninstalling the plugin does not delete or downgrade state.
+
 ---
 
 ## Deployment validation gate

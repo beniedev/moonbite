@@ -192,7 +192,7 @@ API 保证。
 ## 项目状态
 
 ```text
-Status: 0.1.0 Alpha 1 public preview
+Package version: 0.1.0a2
 Supported host: Hermes Agent only
 Distribution: source-only GitHub prerelease
 Support: best effort
