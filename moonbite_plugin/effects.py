@@ -879,6 +879,7 @@ class EffectLedger:
                 int,
                 dict[str, EffectRecord],
                 dict[str, str],
+                bytes,
             ]
             | None
         ) = None
@@ -955,6 +956,7 @@ class EffectLedger:
             len(lines),
             row_number,
             boundary + 1 < len(data),
+            data[max(0, boundary - 4095) : boundary + 1],
         )
 
     def _fold_appended_rows(
@@ -965,33 +967,36 @@ class EffectLedger:
             int,
             dict[str, EffectRecord],
             dict[str, str],
+            bytes,
         ],
-    ) -> tuple[dict[str, EffectRecord], dict[str, str], int, int, bool] | None:
+    ) -> tuple[dict[str, EffectRecord], dict[str, str], int, int, bool, bytes] | None:
         """Fold complete appended lines onto copies of the cached maps.
 
-        Decode errors propagate with locked-read wording and line numbering.
-        A replay-check failure means the cached prefix may no longer match the
-        file, so the caller performs a full lock-free read instead, which
-        reports the canonical error.
+        The cached prefix is proven intact by re-reading its last bytes at the
+        cached offset and requiring equality; a same-inode rewrite that grew
+        the file therefore falls back to a full read.  Decode and replay-check
+        failures also fall back so the full read reports the canonical error
+        and numbering regardless of cache state.
         """
 
-        _, line_count, row_count, records_map, idempotency_map = cached
+        _, line_count, row_count, records_map, idempotency_map, prefix = cached
+        cached_size = cached[0][2]
         try:
             with self.ledger.path.open("rb") as handle:
-                handle.seek(cached[0][2])
+                handle.seek(cached_size - len(prefix))
+                if handle.read(len(prefix)) != prefix:
+                    return None
+                handle.seek(cached_size)
                 tail = handle.read()
         except FileNotFoundError:
             return None
         boundary = tail.rfind(b"\n")
         lines = tail[: boundary + 1].splitlines()
-        decoded = [
-            _decode_ledger_line(raw, line_number=line_count + index)
-            for index, raw in enumerate(lines, start=1)
-        ]
         records = dict(records_map)
         idempotency = dict(idempotency_map)
         try:
-            for value in decoded:
+            for index, raw in enumerate(lines, start=1):
+                value = _decode_ledger_line(raw, line_number=line_count + index)
                 if value is None:
                     continue
                 row_count += 1
@@ -1009,6 +1014,7 @@ class EffectLedger:
             line_count + len(lines),
             row_count,
             boundary + 1 < len(tail),
+            (prefix + tail[: boundary + 1])[-4096:],
         )
 
     def _read_only_records(self) -> dict[str, EffectRecord]:
@@ -1040,7 +1046,7 @@ class EffectLedger:
                 merged = self._read_lock_free()
             except FileNotFoundError:
                 return {}
-        records, idempotency, line_count, row_count, partial = merged
+        records, idempotency, line_count, row_count, partial, prefix = merged
         if not partial and self._read_signature() == signature:
             self._read_projection_cache = (
                 signature,
@@ -1048,6 +1054,7 @@ class EffectLedger:
                 row_count,
                 records,
                 idempotency,
+                prefix,
             )
         return records
 

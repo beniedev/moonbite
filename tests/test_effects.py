@@ -897,6 +897,37 @@ def test_read_only_reads_replay_after_replacement_or_shrink(tmp_path):
     assert [record.state for record in ledger.records(read_only=True)] == ["intent"]
 
 
+def test_read_only_reads_detect_an_in_place_rewrite_of_the_same_inode(tmp_path):
+    ledger = EffectLedger(tmp_path, clock=lambda: NOW)
+    begin(ledger)
+    ledger.mark_pending("effect-1")
+    assert len(ledger.records(read_only=True)) == 1
+
+    before = ledger.ledger.path.stat()
+    other = tmp_path / "other"
+    other_ledger = EffectLedger(other, clock=lambda: NOW)
+    expected_ids = []
+    for index in range(8):
+        expected_ids.append(f"effect-9{index}")
+        begin(
+            other_ledger,
+            effect_id=expected_ids[-1],
+            idempotency_key=f"idem-9{index}",
+            source_event_id=f"event-9{index}",
+        )
+    rewritten = (other / "effects.jsonl").read_bytes()
+    assert len(rewritten) > before.st_size
+    ledger.ledger.path.write_bytes(rewritten)
+    after = ledger.ledger.path.stat()
+    assert after.st_ino == before.st_ino
+    assert after.st_size > before.st_size
+
+    assert ledger.records(read_only=True) == ledger.records()
+    assert {record.effect_id for record in ledger.records(read_only=True)} == set(
+        expected_ids
+    )
+
+
 def test_read_only_flag_must_be_a_boolean(tmp_path):
     ledger = EffectLedger(tmp_path, clock=lambda: NOW)
     begin(ledger)
