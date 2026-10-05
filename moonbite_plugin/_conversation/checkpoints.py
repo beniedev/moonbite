@@ -95,7 +95,7 @@ class _CheckpointMixin:
 
     def _effect_record(self, checkpoint: _CheckpointState) -> Any:
         try:
-            effect = self.effect_ledger.get(checkpoint.effect_id)
+            effect = self.effect_ledger.get(checkpoint.effect_id, read_only=True)
         except (ConversationBridgeError, StateError):
             raise
         except Exception as exc:
