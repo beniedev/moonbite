@@ -8,6 +8,7 @@ receipt can move an effect to ``verified``.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from collections.abc import Callable, Mapping
@@ -807,6 +808,57 @@ def _transition_error(effect_id: str, state: str, operation: str) -> ValueError:
     return ValueError(f"effect {effect_id} cannot {operation} from {state}")
 
 
+def _fold_effect_row(
+    row: Mapping[str, Any],
+    *,
+    row_number: int,
+    records: dict[str, EffectRecord],
+    idempotency: dict[str, str],
+) -> None:
+    """Fold one decoded ledger row into the replay maps.
+
+    This is the per-row check of :meth:`EffectLedger._replay`; messages and
+    ordering are identical for locked replays and lock-free reads.
+    """
+
+    record = _record_from_row(row, row_number=row_number)
+    operation = row["operation"]
+    previous = records.get(record.effect_id)
+    if previous is None:
+        if operation != "begin_intent" or record.state != "intent":
+            raise StateError(f"effects.jsonl row {row_number} is out of order")
+        if record.attempt != 1:
+            raise StateError(
+                f"effects.jsonl row {row_number} has an invalid initial attempt"
+            )
+    else:
+        if not _same_identity(previous, record):
+            raise StateError(
+                f"effects.jsonl row {row_number} changes immutable effect identity"
+            )
+        if not _valid_transition(previous, record, operation):
+            raise StateError(f"effects.jsonl row {row_number} is out of order")
+    prior_id = idempotency.get(record.idempotency_key)
+    if prior_id is not None and prior_id != record.effect_id:
+        raise StateError(f"effects.jsonl row {row_number} reuses an idempotency key")
+    idempotency[record.idempotency_key] = record.effect_id
+    records[record.effect_id] = record
+
+
+def _decode_ledger_line(raw: bytes, *, line_number: int) -> dict[str, Any] | None:
+    """Decode one complete ledger line with ``JsonlLedger`` error semantics."""
+
+    if not raw.strip():
+        return None
+    try:
+        value = json.loads(raw.decode("utf-8"))
+    except json.JSONDecodeError as exc:
+        raise StateError(f"ledger row {line_number} contains invalid JSON") from exc
+    if not isinstance(value, dict):
+        raise StateError(f"ledger row {line_number} must contain an object")
+    return value
+
+
 class EffectLedger:
     """Concurrent-safe append-only effect state ledger."""
 
@@ -821,6 +873,17 @@ class EffectLedger:
         self.mutation_lock = self.root / "effects.mutation.lock"
         self.mutation_lock_path = self.mutation_lock
         self.clock = clock
+        self._read_projection_cache: (
+            tuple[
+                tuple[Any, ...],
+                int,
+                int,
+                dict[str, EffectRecord],
+                dict[str, str],
+                Any,
+            ]
+            | None
+        ) = None
 
     def _append(self, operation: str, record: EffectRecord) -> None:
         row = record.to_dict()
@@ -833,28 +896,12 @@ class EffectLedger:
         records: dict[str, EffectRecord] = {}
         idempotency: dict[str, str] = {}
         for index, row in enumerate(self.ledger.rows(), start=1):
-            record = _record_from_row(row, row_number=index)
-            operation = row["operation"]
-            previous = records.get(record.effect_id)
-            if previous is None:
-                if operation != "begin_intent" or record.state != "intent":
-                    raise StateError(f"effects.jsonl row {index} is out of order")
-                if record.attempt != 1:
-                    raise StateError(
-                        f"effects.jsonl row {index} has an invalid initial attempt"
-                    )
-            else:
-                if not _same_identity(previous, record):
-                    raise StateError(
-                        f"effects.jsonl row {index} changes immutable effect identity"
-                    )
-                if not _valid_transition(previous, record, operation):
-                    raise StateError(f"effects.jsonl row {index} is out of order")
-            prior_id = idempotency.get(record.idempotency_key)
-            if prior_id is not None and prior_id != record.effect_id:
-                raise StateError(f"effects.jsonl row {index} reuses an idempotency key")
-            idempotency[record.idempotency_key] = record.effect_id
-            records[record.effect_id] = record
+            _fold_effect_row(
+                row,
+                row_number=index,
+                records=records,
+                idempotency=idempotency,
+            )
         return records
 
     def _snapshot(self) -> dict[str, EffectRecord]:
@@ -864,6 +911,165 @@ class EffectLedger:
             if not self.ledger.path.exists():
                 return {}
             return self._replay()
+
+    def _read_signature(self) -> tuple[Any, ...] | None:
+        """Append-only stat signature; never creates files or locks."""
+
+        try:
+            stat = self.ledger.path.stat()
+        except FileNotFoundError:
+            return None
+        except OSError:
+            # An unreadable stat must re-read on every call.
+            return (None, None, None, object())
+        return (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns)
+
+    def _read_lock_free(
+        self,
+    ) -> tuple[dict[str, EffectRecord], dict[str, str], int, int, bool]:
+        """Strict lock-free replay; never creates files, dirs, or locks.
+
+        Mirrors ``JsonlLedger._rows_unlocked`` line numbering, but folds only
+        complete lines: bytes after the last newline are ignored so a torn
+        concurrent append cannot fail the read.  Also returns a SHA-256
+        hasher covering the consumed complete prefix so later reads can prove
+        the prefix intact by digest instead of re-decoding it.
+        """
+
+        data = self.ledger.path.read_bytes()
+        boundary = data.rfind(b"\n")
+        lines = data[: boundary + 1].splitlines()
+        records: dict[str, EffectRecord] = {}
+        idempotency: dict[str, str] = {}
+        row_number = 0
+        for line_number, raw in enumerate(lines, start=1):
+            value = _decode_ledger_line(raw, line_number=line_number)
+            if value is None:
+                continue
+            row_number += 1
+            _fold_effect_row(
+                value,
+                row_number=row_number,
+                records=records,
+                idempotency=idempotency,
+            )
+        return (
+            records,
+            idempotency,
+            len(lines),
+            row_number,
+            boundary + 1 < len(data),
+            hashlib.sha256(data[: boundary + 1]),
+        )
+
+    def _fold_appended_rows(
+        self,
+        cached: tuple[
+            tuple[Any, ...],
+            int,
+            int,
+            dict[str, EffectRecord],
+            dict[str, str],
+            Any,
+        ],
+    ) -> tuple[dict[str, EffectRecord], dict[str, str], int, int, bool, Any] | None:
+        """Fold complete appended lines onto copies of the cached maps.
+
+        The whole cached prefix is proven intact by streaming bytes
+        [0, cached_size) through a SHA-256 hasher and comparing the digest —
+        an O(size) read and hash, but no re-decode.  A same-inode rewrite or
+        in-place edit therefore falls back to a full read.  Decode and
+        replay-check failures also fall back so the full read reports the
+        canonical error and numbering regardless of cache state.
+        """
+
+        _, line_count, row_count, records_map, idempotency_map, hasher = cached
+        cached_size = cached[0][2]
+        try:
+            with self.ledger.path.open("rb") as handle:
+                verifier = hashlib.sha256()
+                remaining = cached_size
+                while remaining:
+                    chunk = handle.read(min(remaining, 1 << 20))
+                    if not chunk:
+                        break
+                    verifier.update(chunk)
+                    remaining -= len(chunk)
+                if remaining or verifier.digest() != hasher.digest():
+                    return None
+                tail = handle.read()
+        except FileNotFoundError:
+            return None
+        boundary = tail.rfind(b"\n")
+        lines = tail[: boundary + 1].splitlines()
+        records = dict(records_map)
+        idempotency = dict(idempotency_map)
+        try:
+            for index, raw in enumerate(lines, start=1):
+                value = _decode_ledger_line(raw, line_number=line_count + index)
+                if value is None:
+                    continue
+                row_count += 1
+                _fold_effect_row(
+                    value,
+                    row_number=row_count,
+                    records=records,
+                    idempotency=idempotency,
+                )
+        except StateError:
+            return None
+        verifier.update(tail[: boundary + 1])
+        return (
+            records,
+            idempotency,
+            line_count + len(lines),
+            row_count,
+            boundary + 1 < len(tail),
+            verifier,
+        )
+
+    def _read_only_records(self) -> dict[str, EffectRecord]:
+        """Replay the ledger without the mutation lock or any writes.
+
+        The projection is cached per instance on the ledger's
+        (dev, ino, size, mtime_ns) signature.  Append-only growth re-reads the
+        cached prefix once to prove it by SHA-256 digest, then decodes and
+        validates just the new bytes; any other change replays the whole
+        file.
+        A result is cached only when the signature is identical before and
+        after decoding, so a mid-read append is never attributed to the wrong
+        key, and an unread trailing partial line is never cached at all.
+        """
+
+        signature = self._read_signature()
+        if signature is None:
+            return {}
+        cached = self._read_projection_cache
+        if cached is not None and cached[0] == signature:
+            return cached[3]
+        merged = None
+        if (
+            cached is not None
+            and signature[:2] == cached[0][:2]
+            and signature[2] > cached[0][2]
+        ):
+            merged = self._fold_appended_rows(cached)
+        if merged is None:
+            try:
+                merged = self._read_lock_free()
+            except FileNotFoundError:
+                return {}
+        records, idempotency, line_count, row_count, partial, prefix = merged
+        if not partial and self._read_signature() == signature:
+            self._read_projection_cache = (
+                signature,
+                line_count,
+                row_count,
+                records,
+                idempotency,
+                prefix,
+            )
+        return records
 
     def begin_intent(
         self,
@@ -1067,8 +1273,12 @@ class EffectLedger:
             self._append("requeue", candidate)
             return candidate
 
-    def get(self, effect_id: str) -> EffectRecord | None:
+    def get(self, effect_id: str, *, read_only: bool = False) -> EffectRecord | None:
         _nonempty_text(effect_id, "effect_id")
+        if type(read_only) is not bool:
+            raise TypeError("read_only must be a boolean")
+        if read_only:
+            return self._read_only_records().get(effect_id)
         return self._snapshot().get(effect_id)
 
     def find_by_idempotency(self, key: str) -> EffectRecord | None:
@@ -1107,15 +1317,21 @@ class EffectLedger:
         ]
         return sorted(pending, key=lambda record: (record.created_at, record.effect_id))
 
-    def records(self) -> tuple[EffectRecord, ...]:
+    def records(self, *, read_only: bool = False) -> tuple[EffectRecord, ...]:
         """Return the latest replayed record for every effect.
 
         An absent ledger is an empty read-only state.  Once the ledger exists,
         replay occurs under the mutation lock so corrupt or out-of-order state
-        fails closed and readers cannot observe a partial transition.
+        fails closed and readers cannot observe a partial transition.  With
+        ``read_only=True`` the projection is served from a lock-free cached
+        read instead: same fail-closed checks, no lock, no writes, and a
+        signature check that cannot attribute a mid-read append to the wrong
+        ledger state.
         """
 
-        records = self._snapshot()
+        if type(read_only) is not bool:
+            raise TypeError("read_only must be a boolean")
+        records = self._read_only_records() if read_only else self._snapshot()
         return tuple(
             sorted(
                 records.values(),

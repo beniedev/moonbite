@@ -1067,3 +1067,69 @@ def test_conversation_observer_checkpoint_pending_and_verified_recovery(tmp_path
     assert recovered.recovery.ref == "observer-receipt"
     assert recovered.target_date == date(2026, 8, 24)
     assert recovered.event_time == NOW + timedelta(minutes=2)
+
+
+def test_requested_checkpoint_refreshes_the_cached_effect_projection(tmp_path):
+    sessions, effects, bridge = stores(tmp_path)
+    private_lifecycle(sessions, bridge)
+    settle_lifecycle(sessions, bridge)
+    # Prime the read projection before any intent row exists.
+    assert effects.records(read_only=True) == ()
+
+    result = request(bridge)
+
+    assert result.snapshot.checkpoint_pending is True
+    assert result.snapshot.checkpoint_effect_id == result.effect_id
+    refreshed = bridge.snapshot("lifecycle-1")
+    assert refreshed.checkpoint_pending is True
+
+
+def test_snapshots_project_checkpoint_effects_without_locked_replay(
+    tmp_path, monkeypatch
+):
+    sessions, effects, bridge = stores(tmp_path)
+    private_lifecycle(sessions, bridge)
+    settle_lifecycle(sessions, bridge)
+    for index in range(20):
+        turn_id = f"turn-{index + 2}"
+        base = NOW + timedelta(minutes=10 + index * 10)
+        pre = sessions.record_hook(
+            context(
+                f"private-{index + 2}",
+                turn_id=turn_id,
+                observed_at=base,
+            ),
+            "pre_llm_call",
+        )
+        bridge.observe(pre)
+        post = sessions.record_hook(
+            context(
+                f"assistant-{index + 2}",
+                source_kind="assistant_response",
+                turn_id=turn_id,
+                observed_at=base + timedelta(minutes=1),
+            ),
+            "post_llm_call",
+            settled=True,
+        )
+        bridge.observe(post)
+        result = request_values(
+            bridge,
+            source_event_id=f"checkpoint-source-{index}",
+            idempotency_key=f"checkpoint-idem-{index}",
+            now=base + timedelta(minutes=6),
+            expires_at=base + timedelta(hours=1),
+        )
+        verify_effect(effects, result.effect_id, f"checkpoint-source-{index}")
+
+    expected = bridge.snapshots()
+    replays = []
+    original = EffectLedger._replay
+
+    def counted(self):
+        replays.append(None)
+        return original(self)
+
+    monkeypatch.setattr(EffectLedger, "_replay", counted)
+    assert bridge.snapshots() == expected
+    assert replays == []

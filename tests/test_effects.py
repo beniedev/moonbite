@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import os
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 
@@ -729,3 +731,291 @@ def test_observer_status_corrupt_ledger_is_current_integrity(tmp_path):
     assert facts[0].state == "current"
     assert "integrity" in facts[0].code
     assert facts[0].to_dict()["recovery"] is None
+
+
+def test_read_only_reads_match_locked_reads_across_transitions(tmp_path):
+    ledger = EffectLedger(tmp_path, clock=lambda: NOW)
+    begin(ledger)
+    begin(
+        ledger,
+        effect_id="effect-2",
+        idempotency_key="idem-2",
+        source_event_id="event-2",
+    )
+    begin(
+        ledger,
+        effect_id="effect-3",
+        idempotency_key="idem-3",
+        source_event_id="event-3",
+        created_at=NOW - timedelta(minutes=2),
+        expires_at=NOW - timedelta(minutes=1),
+    )
+    ledger.mark_pending("effect-1")
+    ledger.mark_queue_accepted("effect-1")
+    ledger.verify("effect-1", receipt())
+    ledger.fail("effect-2", "transport rejected", retryable=True)
+    ledger.mark_pending("effect-3")
+    ledger.expire("effect-3", NOW)
+    ledger.requeue("effect-3", expires_at=NOW + timedelta(minutes=5))
+
+    assert ledger.records(read_only=True) == ledger.records()
+    for effect_id in ("effect-1", "effect-2", "effect-3", "missing"):
+        assert ledger.get(effect_id, read_only=True) == ledger.get(effect_id)
+
+
+def test_read_only_reads_reuse_the_cache_and_fold_only_appended_rows(
+    tmp_path, monkeypatch
+):
+    import moonbite_plugin.effects as effects_module
+
+    ledger = EffectLedger(tmp_path, clock=lambda: NOW)
+    begin(ledger)
+    ledger.mark_pending("effect-1")
+
+    decodes = []
+    original = effects_module._record_from_row
+
+    def counted(row, *, row_number):
+        decodes.append(row_number)
+        return original(row, row_number=row_number)
+
+    monkeypatch.setattr(effects_module, "_record_from_row", counted)
+    assert len(ledger.records(read_only=True)) == 1
+    assert len(decodes) == 2
+
+    decodes.clear()
+    assert len(ledger.records(read_only=True)) == 1
+    assert ledger.get("effect-1", read_only=True).state == "pending"
+    assert decodes == []
+
+    ledger.mark_queue_accepted("effect-1")
+    decodes.clear()
+    assert ledger.get("effect-1", read_only=True).state == "executed_unverified"
+    assert len(decodes) == 1
+
+
+def test_read_only_reads_never_lock_or_create_state(tmp_path, monkeypatch):
+    import moonbite_plugin.effects as effects_module
+
+    def boom(_path):
+        raise AssertionError("read-only projection must not take file_lock")
+
+    monkeypatch.setattr(effects_module, "file_lock", boom)
+    missing = tmp_path / "deep" / "missing"
+    ledger = EffectLedger(missing, clock=lambda: NOW)
+    assert ledger.records(read_only=True) == ()
+    assert ledger.get("missing", read_only=True) is None
+    assert not (tmp_path / "deep").exists()
+
+    monkeypatch.undo()
+    begin(ledger)
+    ledger.mark_pending("effect-1")
+    names = {path.name for path in missing.iterdir()}
+    monkeypatch.setattr(effects_module, "file_lock", boom)
+    assert ledger.get("effect-1", read_only=True).state == "pending"
+    assert [row.state for row in ledger.records(read_only=True)] == ["pending"]
+    assert {path.name for path in missing.iterdir()} == names
+
+
+def test_read_only_reads_fail_closed_on_a_corrupt_append(tmp_path):
+    ledger = EffectLedger(tmp_path, clock=lambda: NOW)
+    begin(ledger)
+    ledger.mark_pending("effect-1")
+    assert len(ledger.records(read_only=True)) == 1
+
+    with ledger.ledger.path.open("a", encoding="utf-8") as handle:
+        handle.write("{not json\n")
+
+    with pytest.raises(StateError, match="invalid JSON"):
+        ledger.records(read_only=True)
+    with pytest.raises(StateError, match="invalid JSON"):
+        ledger.get("effect-1", read_only=True)
+    with pytest.raises(StateError, match="invalid JSON"):
+        ledger.records()
+
+
+def test_read_only_append_validation_matches_locked_replay(tmp_path):
+    ledger = EffectLedger(tmp_path, clock=lambda: NOW)
+    begin(ledger)
+    ledger.mark_pending("effect-1")
+    assert len(ledger.records(read_only=True)) == 1
+
+    row = dict(ledger.ledger.rows()[-1])
+    row["attempt"] = 2
+    JsonlLedger(tmp_path / "effects.jsonl").append(row)
+
+    with pytest.raises(StateError) as locked_error:
+        ledger.records()
+    with pytest.raises(StateError) as read_only_error:
+        ledger.records(read_only=True)
+    assert str(read_only_error.value) == str(locked_error.value)
+
+
+def test_read_only_reads_ignore_a_partial_trailing_line_until_complete(tmp_path):
+    ledger = EffectLedger(tmp_path, clock=lambda: NOW)
+    begin(ledger)
+    ledger.mark_pending("effect-1")
+    assert len(ledger.records(read_only=True)) == 1
+
+    row = dict(ledger.ledger.rows()[-1])
+    row["state"] = "executed_unverified"
+    row["operation"] = "mark_queue_accepted"
+    line = json.dumps(row, ensure_ascii=False, sort_keys=True)
+    with ledger.ledger.path.open("a", encoding="utf-8") as handle:
+        handle.write(line)
+
+    assert [record.state for record in ledger.records(read_only=True)] == ["pending"]
+
+    with ledger.ledger.path.open("a", encoding="utf-8") as handle:
+        handle.write("\n")
+    assert [record.state for record in ledger.records(read_only=True)] == [
+        "executed_unverified"
+    ]
+
+
+def test_read_only_reads_replay_after_replacement_or_shrink(tmp_path):
+    ledger = EffectLedger(tmp_path, clock=lambda: NOW)
+    begin(ledger)
+    ledger.mark_pending("effect-1")
+    assert len(ledger.records(read_only=True)) == 1
+
+    other = tmp_path / "other"
+    other_ledger = EffectLedger(other, clock=lambda: NOW)
+    begin(
+        other_ledger,
+        effect_id="effect-9",
+        idempotency_key="idem-9",
+        source_event_id="event-9",
+    )
+    os.replace(other / "effects.jsonl", ledger.ledger.path)
+    assert [record.effect_id for record in ledger.records(read_only=True)] == [
+        "effect-9"
+    ]
+
+    first_line = ledger.ledger.path.read_bytes().split(b"\n")[0] + b"\n"
+    ledger.ledger.path.write_bytes(first_line)
+    assert [record.state for record in ledger.records(read_only=True)] == ["intent"]
+
+
+def test_read_only_reads_detect_an_in_place_rewrite_of_the_same_inode(tmp_path):
+    ledger = EffectLedger(tmp_path, clock=lambda: NOW)
+    begin(ledger)
+    ledger.mark_pending("effect-1")
+    assert len(ledger.records(read_only=True)) == 1
+
+    before = ledger.ledger.path.stat()
+    other = tmp_path / "other"
+    other_ledger = EffectLedger(other, clock=lambda: NOW)
+    expected_ids = []
+    for index in range(8):
+        expected_ids.append(f"effect-9{index}")
+        begin(
+            other_ledger,
+            effect_id=expected_ids[-1],
+            idempotency_key=f"idem-9{index}",
+            source_event_id=f"event-9{index}",
+        )
+    rewritten = (other / "effects.jsonl").read_bytes()
+    assert len(rewritten) > before.st_size
+    ledger.ledger.path.write_bytes(rewritten)
+    after = ledger.ledger.path.stat()
+    assert after.st_ino == before.st_ino
+    assert after.st_size > before.st_size
+
+    assert ledger.records(read_only=True) == ledger.records()
+    assert {record.effect_id for record in ledger.records(read_only=True)} == set(
+        expected_ids
+    )
+
+
+def test_read_only_flag_must_be_a_boolean(tmp_path):
+    ledger = EffectLedger(tmp_path, clock=lambda: NOW)
+    begin(ledger)
+
+    with pytest.raises(TypeError):
+        ledger.records(read_only=1)
+    with pytest.raises(TypeError):
+        ledger.get("effect-1", read_only="yes")
+    assert ledger.get("effect-1") is not None
+    assert ledger.records(read_only=False) == ledger.records()
+
+
+def _wide_ledger(ledger: EffectLedger, rows: int = 30) -> bytes:
+    for index in range(rows):
+        begin(
+            ledger,
+            effect_id=f"effect-{index:03d}",
+            idempotency_key=f"idem-{index:03d}",
+            source_event_id=f"event-{index:03d}",
+        )
+    return ledger.ledger.path.read_bytes()
+
+
+def _generated_begin_line(tmp_path, suffix: str) -> bytes:
+    other = tmp_path / f"gen-{suffix}"
+    other_ledger = EffectLedger(other, clock=lambda: NOW)
+    begin(
+        other_ledger,
+        effect_id=f"effect-{suffix}",
+        idempotency_key=f"idem-{suffix}",
+        source_event_id=f"event-{suffix}",
+    )
+    return (other / "effects.jsonl").read_bytes()
+
+
+def test_read_only_detects_in_place_corruption_before_a_later_append(tmp_path):
+    ledger = EffectLedger(tmp_path, clock=lambda: NOW)
+    before_bytes = _wide_ledger(ledger)
+    assert len(before_bytes) > 4096
+    assert len(ledger.records(read_only=True)) == 30
+
+    path = ledger.ledger.path
+    before_stat = path.stat()
+    first_line = before_bytes.split(b"\n", 1)[0]
+    with path.open("r+b") as handle:
+        handle.write(b"!" * len(first_line))
+    with path.open("ab") as handle:
+        handle.write(_generated_begin_line(tmp_path, "appended"))
+    after_stat = path.stat()
+    assert after_stat.st_ino == before_stat.st_ino
+    assert after_stat.st_size > before_stat.st_size
+    assert path.read_bytes()[: len(before_bytes)][-4096:] == before_bytes[-4096:]
+
+    with pytest.raises(StateError):
+        ledger.records(read_only=True)
+    with pytest.raises(StateError):
+        ledger.records(read_only=True)
+    with pytest.raises(StateError):
+        ledger.records()
+    cold = EffectLedger(tmp_path, clock=lambda: NOW)
+    with pytest.raises(StateError):
+        cold.records(read_only=True)
+
+
+def test_read_only_detects_in_place_edit_before_a_later_append(tmp_path):
+    ledger = EffectLedger(tmp_path, clock=lambda: NOW)
+    before_bytes = _wide_ledger(ledger)
+    assert b'"source_event_id": "event-000"' in before_bytes.split(b"\n", 1)[0]
+    assert len(ledger.records(read_only=True)) == 30
+
+    path = ledger.ledger.path
+    before_stat = path.stat()
+    edited = before_bytes.replace(
+        b'"source_event_id": "event-000"',
+        b'"source_event_id": "event-999"',
+        1,
+    )
+    assert len(edited) == len(before_bytes)
+    with path.open("r+b") as handle:
+        handle.write(edited)
+    with path.open("ab") as handle:
+        handle.write(_generated_begin_line(tmp_path, "appended"))
+    after_stat = path.stat()
+    assert after_stat.st_ino == before_stat.st_ino
+
+    warm = ledger.records(read_only=True)
+    expected = ledger.records()
+    cold = EffectLedger(tmp_path, clock=lambda: NOW)
+    assert warm == expected == cold.records(read_only=True)
+    edited_record = next(r for r in warm if r.effect_id == "effect-000")
+    assert edited_record.source_event_id == "event-999"
