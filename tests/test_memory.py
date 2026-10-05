@@ -821,3 +821,128 @@ def test_memory_observer_status_is_neutral_without_opening_card_or_diary_body(
     assert before == after
     assert not (tmp_path / "memory_cards.jsonl.lock").exists()
     assert not (tmp_path / "diary.jsonl.lock").exists()
+
+
+def _view_fixture(memory: MemoryStore, index: int) -> str:
+    card = memory.add_card(
+        f"shared token card number {index}",
+        provenance="user_explicit",
+        source_ref="event:fixture",
+        card_id=f"card-{index:03d}",
+    )
+    return card.open_ref
+
+
+def test_lexical_recall_computes_card_views_once(tmp_path, monkeypatch):
+    memory = MemoryStore(tmp_path, clock=lambda: NOW)
+    refs = [_view_fixture(memory, index) for index in range(6)]
+
+    calls = []
+    original_rows = MemoryStore._card_rows
+    original_history = MemoryStore._history_rows
+
+    def counted_rows(self):
+        calls.append("cards")
+        return original_rows(self)
+
+    def counted_history(self):
+        calls.append("history")
+        return original_history(self)
+
+    monkeypatch.setattr(MemoryStore, "_card_rows", counted_rows)
+    monkeypatch.setattr(MemoryStore, "_history_rows", counted_history)
+    candidates = memory.lexical_recall("shared token", limit=8)
+
+    assert {candidate.open_ref for candidate in candidates} == set(refs)
+    assert calls.count("cards") == 1
+
+
+def test_open_and_card_views_return_isolated_copies(tmp_path):
+    memory = MemoryStore(tmp_path, clock=lambda: NOW)
+    ref = _view_fixture(memory, 0)
+
+    view = memory.open(ref)
+    assert view is not None
+    view["summary"] = "tampered summary"
+    view["tags"].append("tampered-tag")
+    view["metadata"]["tampered"] = True
+
+    reread = memory.open(ref)
+    assert reread["summary"] != "tampered summary"
+    assert "tampered-tag" not in reread["tags"]
+    assert "tampered" not in reread["metadata"]
+
+    views = memory._card_views()
+    views[0]["summary"] = "tampered again"
+    views[0]["tags"].append("tampered-tag")
+    assert memory._card_views()[0]["summary"] == reread["summary"]
+    assert "tampered-tag" not in memory._card_views()[0]["tags"]
+
+
+def test_card_view_index_reflects_writes_and_applied_maintenance(tmp_path):
+    memory = MemoryStore(tmp_path, clock=lambda: NOW)
+    first_ref = _view_fixture(memory, 0)
+    assert [view["card_id"] for view in memory._card_views()] == ["card-000"]
+
+    second = memory.add_card(
+        "shared token card added later",
+        provenance="agent_observation",
+        source_ref="event:fixture",
+        card_id="card-001",
+    )
+    assert memory.open(second.open_ref)["card_id"] == "card-001"
+
+    proposal = memory.propose_maintenance(
+        request_id="request:fixture-retire",
+        operation="retire",
+        evidence_refs=[first_ref],
+        reason="fixture retire",
+    )
+    memory.apply_maintenance(
+        proposal["proposal_id"], activity="tidy", permission="reporting"
+    )
+    archived = memory.open(first_ref)
+    assert archived["lifecycle_status"] == "archived"
+    assert memory.open(second.open_ref)["lifecycle_status"] == "active"
+
+
+def test_corrupt_cards_row_raises_state_error_on_every_read(tmp_path):
+    memory = MemoryStore(tmp_path, clock=lambda: NOW)
+    ref = _view_fixture(memory, 0)
+    assert memory.open(ref) is not None
+
+    with memory.cards.path.open("a", encoding="utf-8") as handle:
+        handle.write("not-json\n")
+
+    for _ in range(2):
+        with pytest.raises(StateError):
+            memory.open(ref)
+        with pytest.raises(StateError):
+            memory._card_views()
+
+
+def test_card_view_index_matches_uncached_computation(tmp_path):
+    memory = MemoryStore(tmp_path, clock=lambda: NOW)
+    refs = [_view_fixture(memory, index) for index in range(4)]
+    proposal = memory.propose_maintenance(
+        request_id="request:fixture-retire",
+        operation="retire",
+        evidence_refs=[refs[0]],
+        reason="fixture retire",
+    )
+    memory.apply_maintenance(
+        proposal["proposal_id"], activity="tidy", permission="reporting"
+    )
+
+    reference = memory._compute_card_views()
+    assert memory._card_views() == reference
+    assert memory._card_views() is not reference
+    for index in range(4):
+        opened = memory.open(f"card:card-{index:03d}")
+        expected = next(v for v in reference if v["card_id"] == f"card-{index:03d}")
+        assert opened == expected
+
+    fresh = MemoryStore(tmp_path, clock=lambda: NOW)
+    assert memory.search("shared token") == fresh.search("shared token")
+    assert memory.lexical_recall("shared token") == fresh.lexical_recall("shared token")
+    assert memory.history_chain(refs[1]) == fresh.history_chain(refs[1])
