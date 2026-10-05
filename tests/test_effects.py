@@ -938,3 +938,84 @@ def test_read_only_flag_must_be_a_boolean(tmp_path):
         ledger.get("effect-1", read_only="yes")
     assert ledger.get("effect-1") is not None
     assert ledger.records(read_only=False) == ledger.records()
+
+
+def _wide_ledger(ledger: EffectLedger, rows: int = 30) -> bytes:
+    for index in range(rows):
+        begin(
+            ledger,
+            effect_id=f"effect-{index:03d}",
+            idempotency_key=f"idem-{index:03d}",
+            source_event_id=f"event-{index:03d}",
+        )
+    return ledger.ledger.path.read_bytes()
+
+
+def _generated_begin_line(tmp_path, suffix: str) -> bytes:
+    other = tmp_path / f"gen-{suffix}"
+    other_ledger = EffectLedger(other, clock=lambda: NOW)
+    begin(
+        other_ledger,
+        effect_id=f"effect-{suffix}",
+        idempotency_key=f"idem-{suffix}",
+        source_event_id=f"event-{suffix}",
+    )
+    return (other / "effects.jsonl").read_bytes()
+
+
+def test_read_only_detects_in_place_corruption_before_a_later_append(tmp_path):
+    ledger = EffectLedger(tmp_path, clock=lambda: NOW)
+    before_bytes = _wide_ledger(ledger)
+    assert len(before_bytes) > 4096
+    assert len(ledger.records(read_only=True)) == 30
+
+    path = ledger.ledger.path
+    before_stat = path.stat()
+    first_line = before_bytes.split(b"\n", 1)[0]
+    with path.open("r+b") as handle:
+        handle.write(b"!" * len(first_line))
+    with path.open("ab") as handle:
+        handle.write(_generated_begin_line(tmp_path, "appended"))
+    after_stat = path.stat()
+    assert after_stat.st_ino == before_stat.st_ino
+    assert after_stat.st_size > before_stat.st_size
+    assert path.read_bytes()[: len(before_bytes)][-4096:] == before_bytes[-4096:]
+
+    with pytest.raises(StateError):
+        ledger.records(read_only=True)
+    with pytest.raises(StateError):
+        ledger.records(read_only=True)
+    with pytest.raises(StateError):
+        ledger.records()
+    cold = EffectLedger(tmp_path, clock=lambda: NOW)
+    with pytest.raises(StateError):
+        cold.records(read_only=True)
+
+
+def test_read_only_detects_in_place_edit_before_a_later_append(tmp_path):
+    ledger = EffectLedger(tmp_path, clock=lambda: NOW)
+    before_bytes = _wide_ledger(ledger)
+    assert b'"source_event_id": "event-000"' in before_bytes.split(b"\n", 1)[0]
+    assert len(ledger.records(read_only=True)) == 30
+
+    path = ledger.ledger.path
+    before_stat = path.stat()
+    edited = before_bytes.replace(
+        b'"source_event_id": "event-000"',
+        b'"source_event_id": "event-999"',
+        1,
+    )
+    assert len(edited) == len(before_bytes)
+    with path.open("r+b") as handle:
+        handle.write(edited)
+    with path.open("ab") as handle:
+        handle.write(_generated_begin_line(tmp_path, "appended"))
+    after_stat = path.stat()
+    assert after_stat.st_ino == before_stat.st_ino
+
+    warm = ledger.records(read_only=True)
+    expected = ledger.records()
+    cold = EffectLedger(tmp_path, clock=lambda: NOW)
+    assert warm == expected == cold.records(read_only=True)
+    edited_record = next(r for r in warm if r.effect_id == "effect-000")
+    assert edited_record.source_event_id == "event-999"

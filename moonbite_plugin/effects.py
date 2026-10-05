@@ -8,6 +8,7 @@ receipt can move an effect to ``verified``.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from collections.abc import Callable, Mapping
@@ -879,7 +880,7 @@ class EffectLedger:
                 int,
                 dict[str, EffectRecord],
                 dict[str, str],
-                bytes,
+                Any,
             ]
             | None
         ) = None
@@ -930,7 +931,9 @@ class EffectLedger:
 
         Mirrors ``JsonlLedger._rows_unlocked`` line numbering, but folds only
         complete lines: bytes after the last newline are ignored so a torn
-        concurrent append cannot fail the read.
+        concurrent append cannot fail the read.  Also returns a SHA-256
+        hasher covering the consumed complete prefix so later reads can prove
+        the prefix intact by digest instead of re-decoding it.
         """
 
         data = self.ledger.path.read_bytes()
@@ -956,7 +959,7 @@ class EffectLedger:
             len(lines),
             row_number,
             boundary + 1 < len(data),
-            data[max(0, boundary - 4095) : boundary + 1],
+            hashlib.sha256(data[: boundary + 1]),
         )
 
     def _fold_appended_rows(
@@ -967,26 +970,33 @@ class EffectLedger:
             int,
             dict[str, EffectRecord],
             dict[str, str],
-            bytes,
+            Any,
         ],
-    ) -> tuple[dict[str, EffectRecord], dict[str, str], int, int, bool, bytes] | None:
+    ) -> tuple[dict[str, EffectRecord], dict[str, str], int, int, bool, Any] | None:
         """Fold complete appended lines onto copies of the cached maps.
 
-        The cached prefix is proven intact by re-reading its last bytes at the
-        cached offset and requiring equality; a same-inode rewrite that grew
-        the file therefore falls back to a full read.  Decode and replay-check
-        failures also fall back so the full read reports the canonical error
-        and numbering regardless of cache state.
+        The whole cached prefix is proven intact by streaming bytes
+        [0, cached_size) through a SHA-256 hasher and comparing the digest —
+        an O(size) read and hash, but no re-decode.  A same-inode rewrite or
+        in-place edit therefore falls back to a full read.  Decode and
+        replay-check failures also fall back so the full read reports the
+        canonical error and numbering regardless of cache state.
         """
 
-        _, line_count, row_count, records_map, idempotency_map, prefix = cached
+        _, line_count, row_count, records_map, idempotency_map, hasher = cached
         cached_size = cached[0][2]
         try:
             with self.ledger.path.open("rb") as handle:
-                handle.seek(cached_size - len(prefix))
-                if handle.read(len(prefix)) != prefix:
+                verifier = hashlib.sha256()
+                remaining = cached_size
+                while remaining:
+                    chunk = handle.read(min(remaining, 1 << 20))
+                    if not chunk:
+                        break
+                    verifier.update(chunk)
+                    remaining -= len(chunk)
+                if remaining or verifier.digest() != hasher.digest():
                     return None
-                handle.seek(cached_size)
                 tail = handle.read()
         except FileNotFoundError:
             return None
@@ -1008,21 +1018,24 @@ class EffectLedger:
                 )
         except StateError:
             return None
+        verifier.update(tail[: boundary + 1])
         return (
             records,
             idempotency,
             line_count + len(lines),
             row_count,
             boundary + 1 < len(tail),
-            (prefix + tail[: boundary + 1])[-4096:],
+            verifier,
         )
 
     def _read_only_records(self) -> dict[str, EffectRecord]:
         """Replay the ledger without the mutation lock or any writes.
 
         The projection is cached per instance on the ledger's
-        (dev, ino, size, mtime_ns) signature.  Append-only growth decodes and
-        validates just the new bytes; any other change replays the whole file.
+        (dev, ino, size, mtime_ns) signature.  Append-only growth re-reads the
+        cached prefix once to prove it by SHA-256 digest, then decodes and
+        validates just the new bytes; any other change replays the whole
+        file.
         A result is cached only when the signature is identical before and
         after decoding, so a mid-read append is never attributed to the wrong
         key, and an unread trailing partial line is never cached at all.
